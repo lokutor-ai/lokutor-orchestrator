@@ -141,3 +141,37 @@ func (o *Orchestrator) GetProviders() map[string]string {
 		"tts": o.tts.Name(),
 	}
 }
+
+// NewSessionWithDefaults creates a new conversation session with orchestrator's default config
+// This automatically applies the orchestrator's configured defaults to the session
+func (o *Orchestrator) NewSessionWithDefaults(userID string) *ConversationSession {
+	session := NewConversationSession(userID)
+	session.MaxMessages = o.config.MaxContextMessages
+	session.CurrentVoice = o.config.VoiceStyle
+	session.CurrentLanguage = o.config.Language
+	return session
+}
+
+// SetSystemPrompt adds a system prompt message to a session
+// This is a convenience method - equivalent to session.AddMessage("system", prompt)
+func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt string) {
+	session.AddMessage("system", prompt)
+}
+
+// SetVoice changes the voice for a session
+// This is a convenience method - equivalent to setting session.CurrentVoice directly
+func (o *Orchestrator) SetVoice(session *ConversationSession, voice Voice) {
+	session.CurrentVoice = voice
+}
+
+// SetLanguage changes the language for a session
+// This is a convenience method - equivalent to setting session.CurrentLanguage directly
+func (o *Orchestrator) SetLanguage(session *ConversationSession, lang Language) {
+	session.CurrentLanguage = lang
+}
+
+// ResetSession clears the conversation history for a session
+// This is a convenience method - equivalent to session.ClearContext()
+func (o *Orchestrator) ResetSession(session *ConversationSession) {
+	session.ClearContext()
+}
