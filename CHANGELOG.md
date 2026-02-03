@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Repository Migration Notice
+
+**As of v1.2.1**, the repository has moved from:
+- **Old**: `github.com/team-hashing/lokutor-orchestrator`
+- **New**: `github.com/lokutor-ai/lokutor-orchestrator`
+
+Please update your imports and `go.mod` files accordingly:
+```bash
+go get github.com/lokutor-ai/lokutor-orchestrator
+```
+
+## [1.2.1] - 2026-02-03
+
+### Changed
+- Migrated repository to new GitHub organization (lokutor-ai)
+- Updated module path: `github.com/lokutor-ai/lokutor-orchestrator`
+- Updated all documentation and badges
+- No code changes; v1.2.1 has identical functionality to v1.2.0
+
 ## [1.2.0] - 2026-02-03
 
 ### Added
@@ -84,4 +103,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for 10 voice styles (F1-F5, M1-M5)
 - Support for 8 languages (en, es, fr, de, it, pt, ja, zh)
 
-[1.0.0]: https://github.com/team-hashing/go-voice-agent/releases/tag/v1.0.0
+[1.0.0]: https://github.com/lokutor-ai/lokutor-orchestrator/releases/tag/v1.0.0
