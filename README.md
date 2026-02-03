@@ -194,8 +194,99 @@ sessionID := conv.GetSessionID()
 // Get provider information
 providers := conv.GetProviders() // {"stt": "...", "llm": "...", "tts": "..."}
 
-// Get current configuration
-config := conv.GetConfig()
+config := config.GetConfig()
+```
+
+## Error Handling
+
+The library uses custom error types to allow precise error handling:
+
+```go
+import "errors"
+
+transcript, response, err := conv.ProcessAudio(ctx, audioBytes, onAudioChunk)
+if err != nil {
+	// Check for specific error types
+	if errors.Is(err, orchestrator.ErrEmptyTranscription) {
+		// Handle empty transcription (user didn't speak)
+		return "User said nothing, please try again"
+	}
+	
+	if errors.Is(err, orchestrator.ErrLLMFailed) {
+		// Handle LLM failures (API down, rate limited, etc.)
+		return "Unable to generate response, please try again"
+	}
+	
+	if errors.Is(err, orchestrator.ErrTTSFailed) {
+		// Handle TTS failures (voice synthesis failed)
+		return "Audio synthesis failed"
+	}
+	
+	// Generic error handling
+	log.Fatalf("Unexpected error: %v", err)
+}
+```
+
+### Available Error Types
+
+- `ErrEmptyTranscription`: Transcription produced empty text
+- `ErrTranscriptionFailed`: STT provider failed
+- `ErrLLMFailed`: LLM provider failed
+- `ErrTTSFailed`: TTS provider failed
+- `ErrNilProvider`: Required provider is nil
+- `ErrContextCancelled`: Operation cancelled by context
+
+## Structured Logging
+
+For production deployments, provide a custom logger for observability and monitoring:
+
+```go
+import "log"
+
+// Example: Simple structured logger
+type SimpleLogger struct{}
+
+func (l *SimpleLogger) Debug(msg string, args ...interface{}) {
+	log.Printf("[DEBUG] %s %v", msg, args)
+}
+
+func (l *SimpleLogger) Info(msg string, args ...interface{}) {
+	log.Printf("[INFO] %s %v", msg, args)
+}
+
+func (l *SimpleLogger) Warn(msg string, args ...interface{}) {
+	log.Printf("[WARN] %s %v", msg, args)
+}
+
+func (l *SimpleLogger) Error(msg string, args ...interface{}) {
+	log.Printf("[ERROR] %s %v", msg, args)
+}
+
+// Create orchestrator with custom logger
+logger := &SimpleLogger{}
+orch := orchestrator.NewWithLogger(stt, llm, tts, config, logger)
+```
+
+### Default Behavior
+
+If no logger is provided, a no-op logger is used by default (zero overhead):
+
+```go
+// This uses the default no-op logger
+orch := orchestrator.New(stt, llm, tts, config)
+```
+
+### Logger Interface
+
+The `Logger` interface allows integration with any logging framework:
+
+```go
+type Logger interface {
+	Debug(msg string, args ...interface{})
+	Info(msg string, args ...interface{})
+	Warn(msg string, args ...interface{})
+	Error(msg string, args ...interface{})
+}
 ```
 
 ## Creating Custom Providers

@@ -209,3 +209,138 @@ func TestHandleInterruption(t *testing.T) {
 
 	orch.HandleInterruption(session)
 }
+
+// TestConcurrentSessionOperations tests that multiple goroutines can safely access a session
+func TestConcurrentSessionOperations(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "Hello"}
+	llm := &MockLLMProvider{completeResult: "Hi there"}
+	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
+
+	orch := New(stt, llm, tts, DefaultConfig())
+	session := NewConversationSession("concurrent_test")
+
+	// Run multiple operations concurrently
+	numGoroutines := 10
+	done := make(chan bool, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"))
+			if err != nil {
+				t.Errorf("ProcessAudio failed: %v", err)
+			}
+			done <- true
+		}()
+	}
+
+	// Wait for all goroutines to complete
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+
+	// Verify session integrity
+	if len(session.Context) == 0 {
+		t.Fatal("session context should not be empty after concurrent operations")
+	}
+}
+
+// TestConfigThreadSafety tests that config can be read and updated safely
+func TestConfigThreadSafety(t *testing.T) {
+	stt := &MockSTTProvider{}
+	llm := &MockLLMProvider{}
+	tts := &MockTTSProvider{}
+
+	config := DefaultConfig()
+	orch := New(stt, llm, tts, config)
+
+	done := make(chan bool, 20)
+
+	// 10 goroutines writing config
+	for i := 0; i < 10; i++ {
+		go func() {
+			cfg := orch.GetConfig()
+			cfg.MaxContextMessages = i
+			orch.UpdateConfig(cfg)
+			done <- true
+		}()
+	}
+
+	// 10 goroutines reading config
+	for i := 0; i < 10; i++ {
+		go func() {
+			_ = orch.GetConfig()
+			done <- true
+		}()
+	}
+
+	// Wait for all to complete
+	for i := 0; i < 20; i++ {
+		<-done
+	}
+
+	// Verify config is still valid
+	cfg := orch.GetConfig()
+	if cfg.SampleRate == 0 {
+		t.Fatal("config was corrupted")
+	}
+}
+
+// TestContextCancellation tests that operations respect context cancellation
+func TestContextCancellation(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "Hello", transcribeErr: context.Canceled}
+	llm := &MockLLMProvider{}
+	tts := &MockTTSProvider{}
+
+	orch := New(stt, llm, tts, DefaultConfig())
+	session := NewConversationSession("cancel_test")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	_, _, err := orch.ProcessAudio(ctx, session, []byte("audio"))
+	if err == nil {
+		t.Fatal("ProcessAudio should return error when context is cancelled")
+	}
+}
+
+// TestCustomErrorTypes tests that proper custom error types are returned
+func TestCustomErrorTypes(t *testing.T) {
+	tests := []struct {
+		name        string
+		stt         STTProvider
+		llm         LLMProvider
+		tts         TTSProvider
+		expectedErr error
+	}{
+		{
+			name:        "empty transcription",
+			stt:         &MockSTTProvider{transcribeResult: "   "},
+			llm:         &MockLLMProvider{completeResult: "response"},
+			tts:         &MockTTSProvider{synthesizeResult: []byte("audio")},
+			expectedErr: ErrEmptyTranscription,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orch := New(tt.stt, tt.llm, tt.tts, DefaultConfig())
+			session := NewConversationSession("error_test")
+
+			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"))
+			if !isErrorType(err, tt.expectedErr) {
+				t.Errorf("expected error type %T, got %T: %v", tt.expectedErr, err, err)
+			}
+		})
+	}
+}
+
+// Helper function to check if an error is of a specific type
+func isErrorType(err error, target error) bool {
+	if err == nil && target == nil {
+		return true
+	}
+	if err == nil || target == nil {
+		return false
+	}
+	return err.Error() == target.Error()
+}

@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-02-03
+
+### Added
+- Custom error types for better error discrimination:
+  - `ErrEmptyTranscription`: Returned when transcription produces empty text
+  - `ErrTranscriptionFailed`: Returned when STT provider fails
+  - `ErrLLMFailed`: Returned when LLM provider fails
+  - `ErrTTSFailed`: Returned when TTS provider fails
+  - `ErrNilProvider`: Returned when a required provider is nil
+  - `ErrContextCancelled`: Returned when operation is cancelled via context
+- Structured logging interface (`Logger`) for production deployments
+- `NewWithLogger()` method for creating Orchestrator with custom logger
+- `NoOpLogger` default implementation for zero-overhead logging
+- Support for structured logging in all pipeline operations
+- Logging of operation timing and completion (sessionID, message length, audio size, etc.)
+
+### Changed
+- Orchestrator now uses structured logging instead of standard log package
+- `New()` constructor now creates Orchestrator with no-op logger by default
+- Error messages now include wrapped context with custom error types
+- Improved observability with structured log fields (sessionID, messageLen, audioSize, duration)
+
+### Fixed
+- Better error propagation with distinct error types for each pipeline stage
+- Clearer error messages with context about what failed
+
+## [1.1.1] - 2026-02-03
+
+### Added
+- Helper methods on Orchestrator for better ergonomics:
+  - `NewSessionWithDefaults()`: Create session with orchestrator's default config
+  - `SetSystemPrompt()`: Convenience method to add system prompt
+  - `SetVoice()`: Convenience method to change session voice
+  - `SetLanguage()`: Convenience method to change session language
+  - `ResetSession()`: Convenience method to clear session context
+
+## [1.1.0] - 2026-02-03
+
+### Added
+- High-level `Conversation` API for simplified voice conversation patterns
+- `Chat()` method: Send text, get voice response with TTS streaming
+- `ProcessAudio()` method: Send audio, get transcript and voice response
+- `TextOnly()` method: Send text, get text response (no TTS)
+- Conversation configuration methods:
+  - `SetVoice()` / `SetVoiceByString()`
+  - `SetLanguage()` / `SetLanguageByString()`
+  - `SetSystemPrompt()`
+- Conversation context management:
+  - `GetContext()`: Full conversation history
+  - `GetLastUserMessage()`: Get last user message
+  - `GetLastAssistantMessage()`: Get last assistant response
+  - `ClearContext()`: Clear history but keep system prompt
+  - `Reset()`: Clear everything
+- Session introspection methods:
+  - `GetSessionID()`
+  - `GetProviders()`
+  - `GetConfig()`
+- Dual API design for flexibility:
+  - High-level `Conversation` for common patterns
+  - Low-level `Orchestrator` for advanced use cases
+
 ## [1.0.0] - 2026-02-03
 
 ### Added

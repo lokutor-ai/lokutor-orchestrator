@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 )
 
@@ -124,8 +123,7 @@ func (c *Conversation) ProcessAudio(ctx context.Context, audioBytes []byte, onAu
 	}
 
 	response := c.session.LastAssistant
-	log.Printf("[%s] User: %s", c.session.ID, transcript)
-	log.Printf("[%s] Assistant: %s", c.session.ID, response)
+	c.orch.logger.Info("audio processed", "sessionID", c.session.ID, "transcriptLen", len(transcript), "responseLen", len(response))
 
 	return transcript, response, nil
 }
@@ -139,20 +137,22 @@ func (c *Conversation) ProcessAudio(ctx context.Context, audioBytes []byte, onAu
 //		return sendToSpeaker(chunk)
 //	})
 func (c *Conversation) Chat(ctx context.Context, text string, onAudioChunk func([]byte) error) (string, error) {
-	log.Printf("[%s] User: %s", c.session.ID, text)
+	c.orch.logger.Info("chat message received", "sessionID", c.session.ID, "messageLen", len(text))
 	c.session.AddMessage("user", text)
 
 	response, err := c.orch.GenerateResponse(ctx, c.session)
 	if err != nil {
+		c.orch.logger.Error("chat response generation failed", "sessionID", c.session.ID, "error", err)
 		return "", err
 	}
 
 	c.session.AddMessage("assistant", response)
-	log.Printf("[%s] Assistant: %s", c.session.ID, response)
+	c.orch.logger.Info("chat response generated", "sessionID", c.session.ID, "responseLen", len(response))
 
 	// Stream TTS
 	err = c.orch.SynthesizeStream(ctx, response, c.session.CurrentVoice, onAudioChunk)
 	if err != nil {
+		c.orch.logger.Error("TTS streaming failed in chat", "sessionID", c.session.ID, "error", err)
 		return "", err
 	}
 
@@ -166,16 +166,17 @@ func (c *Conversation) Chat(ctx context.Context, text string, onAudioChunk func(
 //
 //	response, err := conv.TextOnly(ctx, "What's the capital of France?")
 func (c *Conversation) TextOnly(ctx context.Context, text string) (string, error) {
-	log.Printf("[%s] User: %s", c.session.ID, text)
+	c.orch.logger.Info("text-only message received", "sessionID", c.session.ID, "messageLen", len(text))
 	c.session.AddMessage("user", text)
 
 	response, err := c.orch.GenerateResponse(ctx, c.session)
 	if err != nil {
+		c.orch.logger.Error("text-only response generation failed", "sessionID", c.session.ID, "error", err)
 		return "", err
 	}
 
 	c.session.AddMessage("assistant", response)
-	log.Printf("[%s] Assistant: %s", c.session.ID, response)
+	c.orch.logger.Info("text-only response generated", "sessionID", c.session.ID, "responseLen", len(response))
 
 	return response, nil
 }

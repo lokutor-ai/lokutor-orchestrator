@@ -2,6 +2,27 @@ package orchestrator
 
 import "context"
 
+// Logger interface allows custom logging implementations
+// Implementations can use structured logging, slog, logrus, zap, or any custom logger
+type Logger interface {
+	// Debug logs a debug message
+	Debug(msg string, args ...interface{})
+	// Info logs an info message
+	Info(msg string, args ...interface{})
+	// Warn logs a warning message
+	Warn(msg string, args ...interface{})
+	// Error logs an error message
+	Error(msg string, args ...interface{})
+}
+
+// NoOpLogger is a Logger that discards all messages
+type NoOpLogger struct{}
+
+func (n *NoOpLogger) Debug(msg string, args ...interface{}) {}
+func (n *NoOpLogger) Info(msg string, args ...interface{})  {}
+func (n *NoOpLogger) Warn(msg string, args ...interface{})  {}
+func (n *NoOpLogger) Error(msg string, args ...interface{}) {}
+
 // STTProvider is the interface for Speech-to-Text implementations
 type STTProvider interface {
 	Transcribe(ctx context.Context, audio []byte) (string, error)

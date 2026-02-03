@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 )
@@ -14,16 +13,27 @@ type Orchestrator struct {
 	llm    LLMProvider
 	tts    TTSProvider
 	config Config
+	logger Logger
 	mu     sync.RWMutex
 }
 
 // New creates a new orchestrator with the given providers
+// If logger is nil, a no-op logger is used
 func New(stt STTProvider, llm LLMProvider, tts TTSProvider, config Config) *Orchestrator {
+	return NewWithLogger(stt, llm, tts, config, &NoOpLogger{})
+}
+
+// NewWithLogger creates a new orchestrator with a custom logger
+func NewWithLogger(stt STTProvider, llm LLMProvider, tts TTSProvider, config Config, logger Logger) *Orchestrator {
+	if logger == nil {
+		logger = &NoOpLogger{}
+	}
 	return &Orchestrator{
 		stt:    stt,
 		llm:    llm,
 		tts:    tts,
 		config: config,
+		logger: logger,
 	}
 }
 
@@ -36,27 +46,31 @@ func (o *Orchestrator) ProcessAudio(ctx context.Context, session *ConversationSe
 	}
 
 	if strings.TrimSpace(transcript) == "" {
-		return "", nil, fmt.Errorf("empty transcription")
+		o.logger.Warn("empty transcription received", "sessionID", session.ID)
+		return "", nil, ErrEmptyTranscription
 	}
 
-	log.Printf("[%s] Transcribed: %s", session.ID, transcript)
+	o.logger.Info("transcription completed", "sessionID", session.ID, "length", len(transcript))
 	session.AddMessage("user", transcript)
 
 	// 2. Get LLM response
 	response, err := o.GenerateResponse(ctx, session)
 	if err != nil {
-		return transcript, nil, fmt.Errorf("LLM failed: %w", err)
+		o.logger.Error("LLM generation failed", "sessionID", session.ID, "error", err)
+		return transcript, nil, fmt.Errorf("%w: %v", ErrLLMFailed, err)
 	}
 
-	log.Printf("[%s] Response: %s", session.ID, response)
+	o.logger.Info("LLM response generated", "sessionID", session.ID, "length", len(response))
 	session.AddMessage("assistant", response)
 
 	// 3. Synthesize response to audio
 	audioBytes, err := o.Synthesize(ctx, response, session.CurrentVoice)
 	if err != nil {
-		return transcript, nil, fmt.Errorf("TTS failed: %w", err)
+		o.logger.Error("TTS synthesis failed", "sessionID", session.ID, "error", err)
+		return transcript, nil, fmt.Errorf("%w: %v", ErrTTSFailed, err)
 	}
 
+	o.logger.Info("TTS synthesis completed", "sessionID", session.ID, "audioSize", len(audioBytes))
 	return transcript, audioBytes, nil
 }
 
@@ -69,27 +83,31 @@ func (o *Orchestrator) ProcessAudioStream(ctx context.Context, session *Conversa
 	}
 
 	if strings.TrimSpace(transcript) == "" {
-		return "", fmt.Errorf("empty transcription")
+		o.logger.Warn("empty transcription received", "sessionID", session.ID)
+		return "", ErrEmptyTranscription
 	}
 
-	log.Printf("[%s] Transcribed: %s", session.ID, transcript)
+	o.logger.Info("transcription completed", "sessionID", session.ID, "length", len(transcript))
 	session.AddMessage("user", transcript)
 
 	// 2. Get LLM response
 	response, err := o.GenerateResponse(ctx, session)
 	if err != nil {
-		return transcript, fmt.Errorf("LLM failed: %w", err)
+		o.logger.Error("LLM generation failed", "sessionID", session.ID, "error", err)
+		return transcript, fmt.Errorf("%w: %v", ErrLLMFailed, err)
 	}
 
-	log.Printf("[%s] Response: %s", session.ID, response)
+	o.logger.Info("LLM response generated", "sessionID", session.ID, "length", len(response))
 	session.AddMessage("assistant", response)
 
 	// 3. Stream TTS output
 	err = o.SynthesizeStream(ctx, response, session.CurrentVoice, onAudioChunk)
 	if err != nil {
-		return transcript, fmt.Errorf("TTS stream failed: %w", err)
+		o.logger.Error("TTS streaming failed", "sessionID", session.ID, "error", err)
+		return transcript, fmt.Errorf("%w: %v", ErrTTSFailed, err)
 	}
 
+	o.logger.Info("TTS streaming completed", "sessionID", session.ID)
 	return transcript, nil
 }
 
@@ -115,7 +133,7 @@ func (o *Orchestrator) SynthesizeStream(ctx context.Context, text string, voice 
 
 // HandleInterruption processes an interruption in the conversation
 func (o *Orchestrator) HandleInterruption(session *ConversationSession) {
-	log.Printf("[%s] Conversation interrupted", session.ID)
+	o.logger.Info("conversation interrupted", "sessionID", session.ID)
 	// Can be extended for custom interruption handling
 }
 
