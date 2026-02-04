@@ -1,6 +1,9 @@
 package orchestrator
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // Logger interface allows custom logging implementations
 // Implementations can use structured logging, slog, logrus, zap, or any custom logger
@@ -108,6 +111,7 @@ func DefaultConfig() Config {
 
 // ConversationSession represents an ongoing conversation
 type ConversationSession struct {
+	mu              sync.RWMutex
 	ID              string
 	Context         []Message
 	LastUser        string
@@ -130,6 +134,8 @@ func NewConversationSession(userID string) *ConversationSession {
 
 // AddMessage adds a message to the conversation context
 func (s *ConversationSession) AddMessage(role, content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Context = append(s.Context, Message{Role: role, Content: content})
 	if len(s.Context) > s.MaxMessages {
 		s.Context = s.Context[len(s.Context)-s.MaxMessages:]
@@ -143,7 +149,27 @@ func (s *ConversationSession) AddMessage(role, content string) {
 
 // ClearContext clears the conversation history
 func (s *ConversationSession) ClearContext() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Context = []Message{}
 	s.LastUser = ""
 	s.LastAssistant = ""
+}
+
+// GetContextCopy returns a thread-safe copy of the conversation context
+func (s *ConversationSession) GetContextCopy() []Message {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	contextCopy := make([]Message, len(s.Context))
+	for i := range s.Context {
+		contextCopy[i] = s.Context[i]
+	}
+	return contextCopy
+}
+
+// GetCurrentVoice returns the current voice setting thread-safely
+func (s *ConversationSession) GetCurrentVoice() Voice {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CurrentVoice
 }

@@ -52,6 +52,8 @@ func NewConversationWithConfig(stt STTProvider, llm LLMProvider, tts TTSProvider
 //
 //	conv.SetVoice(orchestrator.VoiceM1)
 func (c *Conversation) SetVoice(voice Voice) {
+	c.session.mu.Lock()
+	defer c.session.mu.Unlock()
 	c.session.CurrentVoice = voice
 }
 
@@ -66,12 +68,16 @@ func (c *Conversation) SetVoiceByString(voice string) error {
 	if !validVoices[v] {
 		return fmt.Errorf("invalid voice: %s (must be F1-F5 or M1-M5)", voice)
 	}
+	c.session.mu.Lock()
+	defer c.session.mu.Unlock()
 	c.session.CurrentVoice = v
 	return nil
 }
 
 // SetLanguage changes the language for responses.
 func (c *Conversation) SetLanguage(language Language) {
+	c.session.mu.Lock()
+	defer c.session.mu.Unlock()
 	c.session.CurrentLanguage = language
 }
 
@@ -86,6 +92,8 @@ func (c *Conversation) SetLanguageByString(language string) error {
 	if !validLanguages[lang] {
 		return fmt.Errorf("invalid language: %s", language)
 	}
+	c.session.mu.Lock()
+	defer c.session.mu.Unlock()
 	c.session.CurrentLanguage = lang
 	return nil
 }
@@ -183,16 +191,20 @@ func (c *Conversation) TextOnly(ctx context.Context, text string) (string, error
 
 // GetContext returns the full conversation history as a slice of messages.
 func (c *Conversation) GetContext() []Message {
-	return c.session.Context
+	return c.session.GetContextCopy()
 }
 
 // GetLastUserMessage returns the user's last message.
 func (c *Conversation) GetLastUserMessage() string {
+	c.session.mu.RLock()
+	defer c.session.mu.RUnlock()
 	return c.session.LastUser
 }
 
 // GetLastAssistantMessage returns the assistant's last message.
 func (c *Conversation) GetLastAssistantMessage() string {
+	c.session.mu.RLock()
+	defer c.session.mu.RUnlock()
 	return c.session.LastAssistant
 }
 
@@ -203,6 +215,8 @@ func (c *Conversation) GetLastAssistantMessage() string {
 //
 //	conv.ClearContext() // Keep system prompt, reset conversation
 func (c *Conversation) ClearContext() {
+	c.session.mu.Lock()
+	defer c.session.mu.Unlock()
 	// Keep system messages
 	system := []Message{}
 	for _, msg := range c.session.Context {
@@ -218,7 +232,11 @@ func (c *Conversation) ClearContext() {
 // Reset clears everything including system prompts and settings.
 // Returns the conversation to a fresh state.
 func (c *Conversation) Reset() {
-	c.session.ClearContext()
+	c.session.mu.Lock()
+	defer c.session.mu.Unlock()
+	c.session.Context = []Message{}
+	c.session.LastUser = ""
+	c.session.LastAssistant = ""
 	c.session.CurrentVoice = VoiceF1
 	c.session.CurrentLanguage = LanguageEn
 }

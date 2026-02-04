@@ -257,12 +257,12 @@ func TestConfigThreadSafety(t *testing.T) {
 
 	// 10 goroutines writing config
 	for i := 0; i < 10; i++ {
-		go func() {
+		go func(val int) {
 			cfg := orch.GetConfig()
-			cfg.MaxContextMessages = i
+			cfg.MaxContextMessages = val
 			orch.UpdateConfig(cfg)
 			done <- true
-		}()
+		}(i)
 	}
 
 	// 10 goroutines reading config

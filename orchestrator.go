@@ -64,7 +64,7 @@ func (o *Orchestrator) ProcessAudio(ctx context.Context, session *ConversationSe
 	session.AddMessage("assistant", response)
 
 	// 3. Synthesize response to audio
-	audioBytes, err := o.Synthesize(ctx, response, session.CurrentVoice)
+	audioBytes, err := o.Synthesize(ctx, response, session.GetCurrentVoice())
 	if err != nil {
 		o.logger.Error("TTS synthesis failed", "sessionID", session.ID, "error", err)
 		return transcript, nil, fmt.Errorf("%w: %v", ErrTTSFailed, err)
@@ -101,7 +101,7 @@ func (o *Orchestrator) ProcessAudioStream(ctx context.Context, session *Conversa
 	session.AddMessage("assistant", response)
 
 	// 3. Stream TTS output
-	err = o.SynthesizeStream(ctx, response, session.CurrentVoice, onAudioChunk)
+	err = o.SynthesizeStream(ctx, response, session.GetCurrentVoice(), onAudioChunk)
 	if err != nil {
 		o.logger.Error("TTS streaming failed", "sessionID", session.ID, "error", err)
 		return transcript, fmt.Errorf("%w: %v", ErrTTSFailed, err)
@@ -118,7 +118,7 @@ func (o *Orchestrator) Transcribe(ctx context.Context, audioData []byte) (string
 
 // GenerateResponse gets an LLM response based on session context
 func (o *Orchestrator) GenerateResponse(ctx context.Context, session *ConversationSession) (string, error) {
-	return o.llm.Complete(ctx, session.Context)
+	return o.llm.Complete(ctx, session.GetContextCopy())
 }
 
 // Synthesize converts text to speech audio
