@@ -64,10 +64,9 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 	// We temporarily increase the threshold if using RMSVAD.
 	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
 		// If we sent audio in the last 1 second, be much less sensitive
-		if time.Since(ms.lastAudioSentAt) < 1000*time.Millisecond {
-			// Save the original threshold if we haven't already?
-			// Actually, just set it to a high "echo-guard" value
-			rmsVAD.SetThreshold(0.20)
+		if time.Since(ms.lastAudioSentAt) < 1200*time.Millisecond {
+			// Extreme echo-guard threshold for the start of response
+			rmsVAD.SetThreshold(0.35)
 		} else {
 			// Restore to base threshold (configured in NewWithVAD/Orchestrator)
 			if baseVAD, baseOk := ms.orch.vad.(*RMSVAD); baseOk {
@@ -204,6 +203,11 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.mu.Lock()
 	ms.isThinking = false
 	ms.isSpeaking = true
+	// Clear VAD state right before speaking to ensure pre-existing echo/noise 
+	// doesn't trigger a barge-in immediately.
+	if ms.vad != nil {
+		ms.vad.Reset()
+	}
 	ms.mu.Unlock()
 
 	ms.emit(BotSpeaking, nil)

@@ -16,6 +16,13 @@ Please update your imports and `go.mod` files accordingly:
 go get github.com/lokutor-ai/lokutor-orchestrator
 ```
 
+## [1.3.3] - 2026-02-05
+
+### Fixed
+- **Deep Echo Suppression**: Added a `VAD confirmation` requirement (3 consecutive frames) to filter out transient echo pops and spikes.
+- **Interruption Guard Reset**: The VAD now resets its state exactly when the bot begins its response, clearing any residue from "thinking" phase loopback.
+- **Improved Adaptive Thresholding**: Bumped specialized Echo-Guard threshold to `0.35 RMS` for the first 1.2s of playback to handle high-latency delivery.
+
 ## [1.3.1] - 2026-02-05
 
 ### Fixed

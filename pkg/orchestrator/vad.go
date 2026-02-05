@@ -12,6 +12,10 @@ type RMSVAD struct {
 	silenceLimit time.Duration
 	isSpeaking   bool
 	silenceStart time.Time
+
+	// Hysteresis and confirmed speech detection
+	consecutiveFrames int
+	minConfirmed      int
 }
 
 // NewRMSVAD creates a new RMS-based VAD
@@ -19,7 +23,13 @@ func NewRMSVAD(threshold float64, silenceLimit time.Duration) *RMSVAD {
 	return &RMSVAD{
 		threshold:    threshold,
 		silenceLimit: silenceLimit,
+		minConfirmed: 3, // Requires 3 consecutive frames above threshold to trigger "speech start"
 	}
+}
+
+// SetMinConfirmed sets the number of consecutive frames needed to confirm speech start
+func (v *RMSVAD) SetMinConfirmed(count int) {
+	v.minConfirmed = count
 }
 
 // SetThreshold updates the RMS threshold
@@ -37,13 +47,21 @@ func (v *RMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	now := time.Now()
 
 	if rms > v.threshold {
+		v.consecutiveFrames++
 		if !v.isSpeaking {
-			v.isSpeaking = true
-			return &VADEvent{Type: VADSpeechStart, Timestamp: now.UnixMilli()}, nil
+			// Require a sequence of frames above threshold to filter out spikes and echo-onset pops
+			if v.consecutiveFrames >= v.minConfirmed {
+				v.isSpeaking = true
+				return &VADEvent{Type: VADSpeechStart, Timestamp: now.UnixMilli()}, nil
+			}
+			return nil, nil // Still confirming
 		}
 		v.silenceStart = time.Time{} // Reset silence timer
 		return nil, nil
 	}
+
+	// Below threshold
+	v.consecutiveFrames = 0
 
 	if v.isSpeaking {
 		if v.silenceStart.IsZero() {
@@ -60,19 +78,21 @@ func (v *RMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	return &VADEvent{Type: VADSilence, Timestamp: now.UnixMilli()}, nil
 }
 
+func (v *RMSVAD) Name() string {
+	return "rms_vad"
+}
+
 func (v *RMSVAD) Reset() {
 	v.isSpeaking = false
 	v.silenceStart = time.Time{}
-}
-
-func (v *RMSVAD) Name() string {
-	return "rms_vad"
+	v.consecutiveFrames = 0
 }
 
 func (v *RMSVAD) Clone() VADProvider {
 	return &RMSVAD{
 		threshold:    v.threshold,
 		silenceLimit: v.silenceLimit,
+		minConfirmed: v.minConfirmed,
 	}
 }
 
