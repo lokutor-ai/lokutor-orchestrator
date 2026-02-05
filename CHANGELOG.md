@@ -16,6 +16,12 @@ Please update your imports and `go.mod` files accordingly:
 go get github.com/lokutor-ai/lokutor-orchestrator
 ```
 
+## [1.3.1] - 2026-02-05
+
+### Fixed
+- **Adaptive Echo Guard**: Integrated automatic VAD threshold adjustment in `ManagedStream` to prevent self-interruption in high-latency SDK/API environments.
+- **Concurrent Session Isolation**: `ManagedStream` now clones the VAD provider to ensure thread-safe, isolated voice detection for multiple concurrent users.
+
 ## [1.3.0] - 2026-02-05
 
 ### Added

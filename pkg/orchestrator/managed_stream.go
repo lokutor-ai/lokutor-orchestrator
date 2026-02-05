@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // ManagedStream handles full-duplex voice orchestration
@@ -14,21 +15,28 @@ type ManagedStream struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	events  chan OrchestratorEvent
+	vad     VADProvider
 
 	audioBuf *bytes.Buffer
 	mu       sync.Mutex
 
 	// Pipeline control
-	pipelineCtx    context.Context
-	pipelineCancel context.CancelFunc
-	sttChan        chan<- []byte
-	isSpeaking     bool
-	isThinking     bool
+	pipelineCtx     context.Context
+	pipelineCancel  context.CancelFunc
+	sttChan         chan<- []byte
+	isSpeaking      bool
+	isThinking      bool
+	lastAudioSentAt time.Time
 }
 
 // NewManagedStream creates a new managed stream
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
 	mCtx, mCancel := context.WithCancel(ctx)
+
+	var streamVAD VADProvider
+	if o.vad != nil {
+		streamVAD = o.vad.Clone()
+	}
 
 	ms := &ManagedStream{
 		orch:     o,
@@ -37,6 +45,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		cancel:   mCancel,
 		events:   make(chan OrchestratorEvent, 100),
 		audioBuf: new(bytes.Buffer),
+		vad:      streamVAD,
 	}
 
 	return ms
@@ -47,8 +56,28 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 
+	if ms.vad == nil {
+		return fmt.Errorf("VAD not configured for this stream")
+	}
+
+	// Adaptive Echo Guard: If we recently sent audio, we might be hearing our own echo.
+	// We temporarily increase the threshold if using RMSVAD.
+	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
+		// If we sent audio in the last 1 second, be much less sensitive
+		if time.Since(ms.lastAudioSentAt) < 1000*time.Millisecond {
+			// Save the original threshold if we haven't already?
+			// Actually, just set it to a high "echo-guard" value
+			rmsVAD.SetThreshold(0.20)
+		} else {
+			// Restore to base threshold (configured in NewWithVAD/Orchestrator)
+			if baseVAD, baseOk := ms.orch.vad.(*RMSVAD); baseOk {
+				rmsVAD.SetThreshold(baseVAD.Threshold())
+			}
+		}
+	}
+
 	// 1. Process VAD
-	event, err := ms.orch.PushAudio(ms.session.ID, chunk)
+	event, err := ms.vad.Process(chunk)
 	if err != nil {
 		return err
 	}
@@ -184,6 +213,9 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			ms.mu.Lock()
+			ms.lastAudioSentAt = time.Now()
+			ms.mu.Unlock()
 			ms.emit(AudioChunk, chunk)
 			return nil
 		}

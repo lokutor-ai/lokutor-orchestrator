@@ -55,6 +55,7 @@ type TTSProvider interface {
 type VADProvider interface {
 	Process(chunk []byte) (*VADEvent, error)
 	Reset()
+	Clone() VADProvider
 	Name() string
 }
 

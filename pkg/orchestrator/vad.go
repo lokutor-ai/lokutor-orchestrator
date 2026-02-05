@@ -22,6 +22,16 @@ func NewRMSVAD(threshold float64, silenceLimit time.Duration) *RMSVAD {
 	}
 }
 
+// SetThreshold updates the RMS threshold
+func (v *RMSVAD) SetThreshold(threshold float64) {
+	v.threshold = threshold
+}
+
+// Threshold returns the current RMS threshold
+func (v *RMSVAD) Threshold() float64 {
+	return v.threshold
+}
+
 func (v *RMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	rms := v.calculateRMS(chunk)
 	now := time.Now()
@@ -57,6 +67,13 @@ func (v *RMSVAD) Reset() {
 
 func (v *RMSVAD) Name() string {
 	return "rms_vad"
+}
+
+func (v *RMSVAD) Clone() VADProvider {
+	return &RMSVAD{
+		threshold:    v.threshold,
+		silenceLimit: v.silenceLimit,
+	}
 }
 
 func (v *RMSVAD) calculateRMS(chunk []byte) float64 {
