@@ -179,7 +179,8 @@ The v1.3 orchestrator supports **Full-Duplex** mode with internal **VAD (Voice A
 stt := providers.NewGroqSTT(os.Getenv("GROQ_API_KEY"), "whisper-large-v3")
 llm := providers.NewGroqLLM(os.Getenv("GROQ_API_KEY"), "llama-3.3-70b-versatile")
 tts := providers.NewLokutorTTS(os.Getenv("LOKUTOR_API_KEY"))
-vad := orchestrator.NewRMSVAD(0.05, 500*time.Millisecond)
+// Increased base threshold slightly for production SDK environments
+vad := orchestrator.NewRMSVAD(0.04, 600*time.Millisecond) 
 
 // 2. Initialize Orchestrator with VAD
 orch := orchestrator.NewWithVAD(stt, llm, tts, vad, orchestrator.DefaultConfig())

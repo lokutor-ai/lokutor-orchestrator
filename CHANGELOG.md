@@ -16,6 +16,13 @@ Please update your imports and `go.mod` files accordingly:
 go get github.com/lokutor-ai/lokutor-orchestrator
 ```
 
+## [1.3.4] - 2026-02-05
+
+### Fixed
+- **Total Playback Lockdown**: Implemented a secondary "Streaming Lock" that raises the VAD threshold to `0.70 RMS` while audio chunks are actively being pumped to the stream.
+- **Enhanced Acoustic Tail Protection**: Increased grace period to 1.5s with a persistent `0.45 RMS` gate to catch long-reverb room feedback in SDK deployments.
+- **Deep Speech Confirmation**: Increased required consecutive frames to 5 (~100-150ms) to ensure accidental loopback spikes can never trigger an interruption.
+
 ## [1.3.3] - 2026-02-05
 
 ### Fixed

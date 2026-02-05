@@ -63,10 +63,19 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 	// Adaptive Echo Guard: If we recently sent audio, we might be hearing our own echo.
 	// We temporarily increase the threshold if using RMSVAD.
 	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
-		// If we sent audio in the last 1 second, be much less sensitive
-		if time.Since(ms.lastAudioSentAt) < 1200*time.Millisecond {
-			// Extreme echo-guard threshold for the start of response
-			rmsVAD.SetThreshold(0.35)
+		// If the bot is CURRENTLY emitting audio chunks, we lock the threshold to a total-mute level.
+		// If we recently sent audio (within 1.5s), we keep a very high gate.
+		ms.mu.Lock()
+		isStillEmitting := time.Since(ms.lastAudioSentAt) < 200*time.Millisecond
+		isRecentlyEmitted := time.Since(ms.lastAudioSentAt) < 1500*time.Millisecond
+		ms.mu.Unlock()
+
+		if isStillEmitting {
+			// Almost impossible to trigger while the server is pumping data
+			rmsVAD.SetThreshold(0.70)
+		} else if isRecentlyEmitted {
+			// Handling the acoustic tail/latency
+			rmsVAD.SetThreshold(0.45)
 		} else {
 			// Restore to base threshold (configured in NewWithVAD/Orchestrator)
 			if baseVAD, baseOk := ms.orch.vad.(*RMSVAD); baseOk {

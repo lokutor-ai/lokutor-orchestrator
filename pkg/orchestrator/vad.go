@@ -23,7 +23,7 @@ func NewRMSVAD(threshold float64, silenceLimit time.Duration) *RMSVAD {
 	return &RMSVAD{
 		threshold:    threshold,
 		silenceLimit: silenceLimit,
-		minConfirmed: 3, // Requires 3 consecutive frames above threshold to trigger "speech start"
+		minConfirmed: 5, // Increased to ~100-150ms of continuous sound to filter echo-onset
 	}
 }
 
