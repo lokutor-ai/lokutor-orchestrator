@@ -39,6 +39,9 @@ func (t *LokutorTTS) getConn(ctx context.Context) (*websocket.Conn, error) {
 		return nil, fmt.Errorf("failed to connect to lokutor: %w", err)
 	}
 
+	// Increase read limit to 10MB to handle large audio chunks
+	conn.SetReadLimit(10 * 1024 * 1024)
+
 	t.conn = conn
 	return conn, nil
 }
@@ -79,6 +82,11 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 		return fmt.Errorf("failed to send synthesis request: %w", err)
 	}
 
+	// Buffer chunks to reduce event loop pressure and ensure smooth playback.
+	// 2048 bytes is ~23ms of 44.1kHz 16-bit mono audio.
+	const minChunkSize = 2048
+	var buffer []byte
+
 	for {
 		messageType, payload, err := conn.Read(ctx)
 		if err != nil {
@@ -89,12 +97,23 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 
 		switch messageType {
 		case websocket.MessageBinary:
-			if err := onChunk(payload); err != nil {
-				return err
+			buffer = append(buffer, payload...)
+			for len(buffer) >= minChunkSize {
+				chunk := make([]byte, minChunkSize)
+				copy(chunk, buffer[:minChunkSize])
+				if err := onChunk(chunk); err != nil {
+					return err
+				}
+				buffer = buffer[minChunkSize:]
 			}
 		case websocket.MessageText:
 			msg := string(payload)
 			if msg == "EOS" {
+				if len(buffer) > 0 {
+					if err := onChunk(buffer); err != nil {
+						return err
+					}
+				}
 				return nil
 			}
 			if len(msg) >= 4 && msg[:4] == "ERR:" {

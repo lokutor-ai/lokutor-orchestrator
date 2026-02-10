@@ -44,7 +44,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		session:  session,
 		ctx:      mCtx,
 		cancel:   mCancel,
-		events:   make(chan OrchestratorEvent, 100),
+		events:   make(chan OrchestratorEvent, 1024),
 		audioBuf: new(bytes.Buffer),
 		vad:      streamVAD,
 	}
@@ -61,26 +61,20 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 		return fmt.Errorf("VAD not configured for this stream")
 	}
 
-	// 0. Interruption Cool-down
-	// If we just interrupted the bot, ignore audio for a short window to let room echo die.
-	if time.Since(ms.lastInterruptedAt) < 400*time.Millisecond {
-		return nil
-	}
-
 	// Adaptive Echo Guard: If we recently sent audio, we might be hearing our own echo.
 	// We temporarily increase the threshold if using RMSVAD.
 	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
 		// If the bot is CURRENTLY emitting audio chunks, we lock the threshold to a total-mute level.
-		// If we recently sent audio (within 1.5s), we keep a very high gate.
-		isStillEmitting := time.Since(ms.lastAudioSentAt) < 200*time.Millisecond
-		isRecentlyEmitted := time.Since(ms.lastAudioSentAt) < 1500*time.Millisecond
+		// We use a generous 1s window to account for network jitter and buffering.
+		isStillEmitting := time.Since(ms.lastAudioSentAt) < 1000*time.Millisecond
+		isRecentlyEmitted := time.Since(ms.lastAudioSentAt) < 2000*time.Millisecond
 
 		if isStillEmitting {
-			// Almost impossible to trigger while the server is pumping data
-			rmsVAD.SetThreshold(0.85)
+			// Total mute level while bot is actively pushing data
+			rmsVAD.SetThreshold(0.95)
 		} else if isRecentlyEmitted {
-			// Handling the acoustic tail/latency
-			rmsVAD.SetThreshold(0.55)
+			// Handling the acoustic tail/reverb
+			rmsVAD.SetThreshold(0.65)
 		} else {
 			// Restore to base threshold (configured in NewWithVAD/Orchestrator)
 			if baseVAD, baseOk := ms.orch.vad.(*RMSVAD); baseOk {
@@ -106,7 +100,6 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 			ms.emit(UserSpeaking, nil)
 			// Interrupt bot if it was speaking or thinking
 			ms.internalInterrupt()
-			ms.audioBuf.Reset()
 
 			// Start streaming STT if supported
 			if sProvider, ok := ms.orch.stt.(StreamingSTTProvider); ok {
@@ -149,7 +142,18 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 			// Channel full, handle or log
 		}
 	}
+
+	// Buffer management with pre-roll:
+	// If not speaking, keep only the last 500ms of audio as pre-roll lead-in.
+	// 44100Hz * 2 bytes * 0.5s = 44100 bytes.
 	ms.audioBuf.Write(processedChunk)
+	if !isUserSpeaking && ms.audioBuf.Len() > 50000 {
+		// Trim to keep ~500ms
+		data := ms.audioBuf.Bytes()
+		leadIn := data[len(data)-44100:]
+		ms.audioBuf.Reset()
+		ms.audioBuf.Write(leadIn)
+	}
 
 	return nil
 }
@@ -295,8 +299,9 @@ func (ms *ManagedStream) emit(eventType EventType, data interface{}) {
 		return
 	}
 
-	// For AudioChunk, we can drop if the buffer is too full to prevent lag,
-	// or we can just send. Usually dropping audio is better than 2s lag.
+	// For AudioChunk, we drop if the buffer is too full to prevent lag.
+	// We have a 1024 buffer which is ~24s of audio, so if it's full,
+	// the client is severely lagging and we MUST drop to maintain real-time.
 	select {
 	case ms.events <- event:
 	default:

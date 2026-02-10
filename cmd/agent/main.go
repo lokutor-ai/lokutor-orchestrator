@@ -82,7 +82,7 @@ func main() {
 		}
 		groqModel := os.Getenv("GROQ_STT_MODEL")
 		if groqModel == "" {
-			groqModel = "whisper-large-v3-turbo"
+			groqModel = "whisper-large-v3"
 		}
 		stt = sttProvider.NewGroqSTT(groqKey, groqModel)
 	}

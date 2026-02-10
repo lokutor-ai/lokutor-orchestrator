@@ -23,7 +23,7 @@ func NewRMSVAD(threshold float64, silenceLimit time.Duration) *RMSVAD {
 	return &RMSVAD{
 		threshold:    threshold,
 		silenceLimit: silenceLimit,
-		minConfirmed: 5, // Increased to ~100-150ms of continuous sound to filter echo-onset
+		minConfirmed: 7, // Require ~70-100ms of continuous sound to trigger snappier barge-in
 	}
 }
 

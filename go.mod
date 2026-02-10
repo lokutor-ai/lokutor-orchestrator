@@ -2,8 +2,6 @@ module github.com/lokutor-ai/lokutor-orchestrator
 
 go 1.23
 
-toolchain go1.24.5
-
 retract (
 	v1.2.0
 	v1.1.1
