@@ -237,7 +237,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.isSpeaking = true
 	// Initialize lastAudioSentAt to now so the adaptive threshold kicks in immediately
 	ms.lastAudioSentAt = time.Now()
-	// Clear VAD state right before speaking to ensure pre-existing echo/noise 
+	// Clear VAD state right before speaking to ensure pre-existing echo/noise
 	// doesn't trigger a barge-in immediately.
 	if ms.vad != nil {
 		ms.vad.Reset()

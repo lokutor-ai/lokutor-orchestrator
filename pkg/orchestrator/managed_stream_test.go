@@ -26,8 +26,8 @@ func TestManagedStream_Interruption(t *testing.T) {
 		loudChunk[i+1] = 0x7F
 	}
 
-	// Send multiple chunks to satisfy the VAD confirmation requirement (5 chunks)
-	for i := 0; i < 5; i++ {
+	// Send multiple chunks to satisfy the VAD confirmation requirement (needs > minConfirmed)
+	for i := 0; i < 20; i++ {
 		stream.Write(loudChunk)
 	}
 
@@ -70,8 +70,8 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 		loudChunk[i+1] = byte(val >> 8)
 	}
 
-	// Send 5 chunks (satisfies the VAD confirmation)
-	for i := 0; i < 5; i++ {
+	// Send 20 chunks (satisfies the VAD confirmation)
+	for i := 0; i < 20; i++ {
 		stream.Write(loudChunk)
 	}
 
@@ -79,19 +79,19 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 	select {
 	case ev := <-stream.Events():
 		if ev.Type == UserSpeaking {
-			t.Errorf("Echo Guard FAILED: Detected UserSpeaking for audio below 0.35 threshold")
+			t.Errorf("Echo Guard FAILED: Detected UserSpeaking for audio below echo threshold")
 		}
 	case <-time.After(100 * time.Millisecond):
 		// Success - no event emitted
 	}
 
-	// 4. Reset lastAudioSentAt to 2 seconds ago (danger zone passed)
+	// 4. Reset lastAudioSentAt to 5 seconds ago (danger zone passed)
 	stream.mu.Lock()
-	stream.lastAudioSentAt = time.Now().Add(-2 * time.Second)
+	stream.lastAudioSentAt = time.Now().Add(-5 * time.Second)
 	stream.mu.Unlock()
 
 	// 5. Send same audio again - it SHOULD trigger UserSpeaking now (threshold is 0.1)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 20; i++ {
 		stream.Write(loudChunk)
 	}
 
