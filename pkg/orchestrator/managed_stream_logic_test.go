@@ -64,7 +64,7 @@ func TestManagedStream_EchoGuard(t *testing.T) {
 	// Since we can't easily peek into the internal state of vad during Process call,
 	// we rely on the fact that if it WASN'T 0.35, it would trigger speech on a 0.1 RMS chunk.
 
-	// 0.1 RMS chunk (above 0.02, below 0.35)
+	// 0.1 RMS chunk (above 0.02, below 0.25)
 	chunk := make([]byte, 200)
 	for i := 0; i < len(chunk); i += 2 {
 		// ~0.1 amplitude
@@ -79,7 +79,7 @@ func TestManagedStream_EchoGuard(t *testing.T) {
 	}
 
 	if ms.isSpeaking {
-		t.Error("should NOT be speaking due to Echo Guard threshold (0.35)")
+		t.Error("should NOT be speaking due to Echo Guard threshold (0.25)")
 	}
 
 	// Wait for echo guard to expire

@@ -67,9 +67,15 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 	// Dynamic Echo Guard: If we're currently or recently sent audio, increase VAD threshold
 	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
 		originalThreshold := rmsVAD.Threshold()
-		if time.Since(ms.lastAudioSentAt) < 400*time.Millisecond {
-			rmsVAD.SetThreshold(0.35)
-			defer rmsVAD.SetThreshold(originalThreshold)
+		if time.Since(ms.lastAudioSentAt) < 250*time.Millisecond {
+			// Disable adaptive noise tracking while bot is speaking to prevent
+			// the speaker output from "poisoning" our background noise floor estimate.
+			rmsVAD.SetAdaptiveMode(false)
+			rmsVAD.SetThreshold(0.25) // 0.25 is a better balance for interruption
+			defer func() {
+				rmsVAD.SetThreshold(originalThreshold)
+				rmsVAD.SetAdaptiveMode(true)
+			}()
 		}
 	}
 
@@ -79,12 +85,7 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 		return err
 	}
 
-	isUserSpeaking := false
-	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
-		isUserSpeaking = rmsVAD.IsSpeaking()
-	}
-
-	if event != nil {
+	if event != nil && event.Type != VADSilence {
 		switch event.Type {
 		case VADSpeechStart:
 			ms.emit(UserSpeaking, nil)
@@ -122,6 +123,11 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 		default:
 			// Channel full
 		}
+	}
+
+	isUserSpeaking := false
+	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
+		isUserSpeaking = rmsVAD.IsSpeaking()
 	}
 
 	// Buffer management with pre-roll:
@@ -338,6 +344,11 @@ func (ms *ManagedStream) interrupt() {
 
 // internalInterrupt handles the interruption logic without locking (caller must lock)
 func (ms *ManagedStream) internalInterrupt() {
+	// If we are already interrupted or not doing anything, ignore
+	if !ms.isSpeaking && !ms.isThinking {
+		return
+	}
+
 	if ms.pipelineCancel != nil {
 		ms.pipelineCancel()
 		ms.pipelineCancel = nil

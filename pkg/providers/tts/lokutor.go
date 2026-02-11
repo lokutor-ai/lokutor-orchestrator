@@ -84,9 +84,6 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 		return fmt.Errorf("failed to send synthesis request: %w", err)
 	}
 
-	var buffer []byte
-	const flushThreshold = 4096 // 4KB chunks for network efficiency (~50ms of audio)
-
 	for {
 		messageType, payload, err := conn.Read(ctx)
 		if err != nil {
@@ -97,21 +94,14 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 
 		switch messageType {
 		case websocket.MessageBinary:
-			// Buffer small packages to avoid overhead, but flush quickly for latency
-			buffer = append(buffer, payload...)
-			if len(buffer) >= flushThreshold {
-				if err := onChunk(buffer); err != nil {
-					return err
-				}
-				buffer = nil
+			// ZERO-LATENCY PASSTHROUGH:
+			// Send raw payload immediately to avoid any "chunking" or delays between segments.
+			if err := onChunk(payload); err != nil {
+				return err
 			}
 		case websocket.MessageText:
 			msg := string(payload)
 			if msg == "EOS" {
-				// Flush remaining buffer
-				if len(buffer) > 0 {
-					_ = onChunk(buffer)
-				}
 				return nil
 			}
 			if len(msg) >= 4 && msg[:4] == "ERR:" {

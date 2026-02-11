@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"sync"
@@ -126,7 +125,8 @@ func main() {
 
 	tts := ttsProvider.NewLokutorTTS(lokutorKey)
 
-	vad := orchestrator.NewRMSVAD(0.02, 500*time.Millisecond) // Lowered threshold to 0.02 for better sensitivity
+	vad := orchestrator.NewRMSVAD(0.02, 500*time.Millisecond)
+	vad.SetMinConfirmed(3) // Require ~30-50ms to trigger barge-in - very snappy
 
 	config := orchestrator.DefaultConfig()
 	config.Language = lang
@@ -156,47 +156,34 @@ func main() {
 	// Buffer for simple playback coordination
 	var playbackMu sync.Mutex
 	var playbackBytes []byte
-	const minSafetyBuffer = SampleRate * 2 * 0.1 // 100ms safety buffer
-	isInitialBuffering := true
 
 	var rmsMu sync.Mutex
 	lastRMS := 0.0
 
 	onSamples := func(pOutput, pInput []byte, frameCount uint32) {
 		if pInput != nil {
-			// Calculate RMS for telemetry/meter
-			var sum float64
-			for i := 0; i < len(pInput)-1; i += 2 {
-				sample := int16(pInput[i]) | (int16(pInput[i+1]) << 8)
-				f := float64(sample) / 32768.0
-				sum += f * f
-			}
-			rms := math.Sqrt(sum / float64(len(pInput)/2))
-			rmsMu.Lock()
-			lastRMS = rms
-			rmsMu.Unlock()
-
-			// Write to the stream - Echo Guard in pkg/orchestrator handles thresholding
+			// Write to the stream - Echo Guard and VAD are handled internally
 			_ = stream.Write(pInput)
+
+			// Update the mic energy meter RMS data
+			rmsMu.Lock()
+			lastRMS = vad.LastRMS()
+			rmsMu.Unlock()
 		}
 		if pOutput != nil {
 			playbackMu.Lock()
 
-			// Zero-latency playback with 100ms safety cushion to prevent "chunky" audio.
-			// If we play every byte immediately while the network is still delivering the rest
-			// of the packet, we hit frequent micro-silences.
-			if isInitialBuffering {
-				if len(playbackBytes) < int(minSafetyBuffer) {
-					// Play silence while filling cushion
-					for i := range pOutput {
-						pOutput[i] = 0
-					}
-					playbackMu.Unlock()
-					return
+			// Micro-cushion: only start playing if we have enough to fill at least half a frame.
+			// This prevents stuttering when network packets are smaller than the hardware buffer.
+			if len(playbackBytes) < len(pOutput)/2 && len(playbackBytes) < 2048 {
+				for i := range pOutput {
+					pOutput[i] = 0
 				}
-				isInitialBuffering = false
+				playbackMu.Unlock()
+				return
 			}
 
+			// Consume audio from buffer as soon as it arrives
 			bytesToCopy := len(pOutput)
 			if len(playbackBytes) < bytesToCopy {
 				bytesToCopy = len(playbackBytes)
@@ -216,10 +203,6 @@ func main() {
 			if n < len(pOutput) {
 				for i := n; i < len(pOutput); i++ {
 					pOutput[i] = 0
-				}
-				// If we ran dry, go back to buffering the 100ms cushion
-				if len(playbackBytes) < 2 {
-					isInitialBuffering = true
 				}
 			}
 			playbackMu.Unlock()
