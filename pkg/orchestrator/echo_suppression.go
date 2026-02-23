@@ -557,6 +557,14 @@ func (es *EchoSuppressor) SetInputSampleRate(rate int) {
 	es.inputSampleRate = rate
 }
 
+// SetSampleRates is a convenience wrapper that adjusts both playback and input
+// rates together. It is equivalent to calling SetPlaybackSampleRate and
+// SetInputSampleRate sequentially.
+func (es *EchoSuppressor) SetSampleRates(playbackRate, inputRate int) {
+	es.SetPlaybackSampleRate(playbackRate)
+	es.SetInputSampleRate(inputRate)
+}
+
 // SetEnabled enables or disables echo suppression
 func (es *EchoSuppressor) SetEnabled(enabled bool) {
 	es.mu.Lock()
