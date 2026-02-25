@@ -120,6 +120,13 @@ type Message struct {
 	Content string `json:"content"`
 }
 
+type FirstSpeaker string
+
+const (
+	FirstSpeakerUser FirstSpeaker = "user"
+	FirstSpeakerBot  FirstSpeaker = "bot"
+)
+
 type Config struct {
 	SampleRate               int
 	Channels                 int
@@ -134,6 +141,7 @@ type Config struct {
 	BargeInVADThreshold      float64
 	BargeInVADTrailWindow    time.Duration
 	EchoSuppressionThreshold float64
+	FirstSpeaker             FirstSpeaker
 }
 
 func DefaultConfig() Config {
@@ -143,7 +151,7 @@ func DefaultConfig() Config {
 		BytesPerSamp:             2,
 		MaxContextMessages:       20,
 		VoiceStyle:               VoiceF1,
-		MinWordsToInterrupt:      2,
+		MinWordsToInterrupt:      1,
 		Language:                 LanguageEn,
 		STTTimeout:               30,
 		LLMTimeout:               60,
@@ -151,6 +159,7 @@ func DefaultConfig() Config {
 		BargeInVADThreshold:      0.005,
 		BargeInVADTrailWindow:    1500 * time.Millisecond,
 		EchoSuppressionThreshold: 0.82,
+		FirstSpeaker:             FirstSpeakerBot,
 	}
 }
 

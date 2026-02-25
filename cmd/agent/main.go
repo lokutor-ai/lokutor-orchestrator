@@ -119,6 +119,13 @@ func main() {
 	config := orchestrator.DefaultConfig()
 	config.Language = lang
 
+	firstSpeaker := os.Getenv("FIRST_SPEAKER")
+	if firstSpeaker == "bot" {
+		config.FirstSpeaker = orchestrator.FirstSpeakerBot
+	} else if firstSpeaker == "user" {
+		config.FirstSpeaker = orchestrator.FirstSpeakerUser
+	}
+
 	fmt.Printf("Configured: STT=%s | LLM=%s | TTS=Lokutor\n", sttProviderName, llmProviderName)
 	fmt.Printf("VAD Threshold: %.3f | Sample Rate: %dHz | Language: %s\n", config.BargeInVADThreshold, SampleRate, lang)
 	fmt.Println("Voice Agent Started! Listening to microphone...")
@@ -133,9 +140,17 @@ func main() {
 
 	session := orch.NewSessionWithDefaults("user_123")
 
-	systemPrompt := "You are a helpful and concise voice assistant. Use short sentences suitable for speech."
+	systemPrompt := "You are a helpful and concise voice assistant. " +
+		"This is a real-time conversational phone call. " +
+		"Use short sentences suitable for speech. " +
+		"Sound naturally human: as a person would, feel free to use very subtle conversational fillers (like 'umm', 'mhm', or 'well...') and natural pauses only where they feel natural, but avoid overdoing it. " +
+		"The goal is for the conversation to feel fluid, responsive, and less like a scripted AI."
 	if lang == orchestrator.LanguageEs {
-		systemPrompt = "Eres un asistente de voz útil y conciso. Usa frases cortas adecuadas para el habla."
+		systemPrompt = "Eres un asistente de voz útil y conciso. " +
+			"Esta es una llamada telefónica conversacional en tiempo real. " +
+			"Usa frases cortas adecuadas para el habla. " +
+			"Suena naturalmente humano: como lo haría una persona, siéntete libre de usar pequeñas muletillas muy sutiles (como 'ehh', 'bueno', 'ajá') y pausas naturales solo donde se sientan apropiadas, pero sin exagerar. " +
+			"El objetivo es que la conversación se sienta fluida, reactiva y menos como una IA programada."
 	}
 	orch.SetSystemPrompt(session, systemPrompt)
 

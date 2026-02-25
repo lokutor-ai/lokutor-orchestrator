@@ -56,8 +56,13 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 	mCtx, mCancel := context.WithCancel(ctx)
 
 	var streamVAD VADProvider
-	if o.vad != nil {
+	if o != nil && o.vad != nil {
 		streamVAD = o.vad.Clone()
+	}
+
+	config := DefaultConfig()
+	if o != nil {
+		config = o.GetConfig()
 	}
 
 	ms := &ManagedStream{
@@ -68,11 +73,18 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		events:         make(chan OrchestratorEvent, 1024),
 		audioBuf:       new(bytes.Buffer),
 		vad:            streamVAD,
-		echoSuppressor: NewEchoSuppressorWithConfig(o.GetConfig()),
+		echoSuppressor: NewEchoSuppressorWithConfig(config),
 		writeChan:      make(chan []byte, 1024),
 	}
 
 	go ms.processBackgroundAudio()
+
+	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
+		go func() {
+			time.Sleep(500 * time.Millisecond) // Give audio some time to stabilize
+			ms.runLLMAndTTS(ms.ctx, "Hello!")  // Trigger initial greeting
+		}()
+	}
 
 	return ms
 }
@@ -341,11 +353,11 @@ func isLikelyNoise(transcript string, audioDuration time.Duration) bool {
 
 	wordCount := len(strings.Fields(t))
 
-	if wordCount == 1 && audioDuration > 1200*time.Millisecond {
+	if wordCount == 1 && audioDuration > 5000*time.Millisecond {
 		return true
 	}
 
-	if wordCount <= 2 && audioDuration > 3000*time.Millisecond {
+	if wordCount <= 2 && audioDuration > 8000*time.Millisecond {
 		return true
 	}
 
