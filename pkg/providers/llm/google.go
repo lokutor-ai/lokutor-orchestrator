@@ -27,7 +27,7 @@ func NewGoogleLLM(apiKey string, model string) *GoogleLLM {
 	}
 }
 
-func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Message) (string, error) {
+func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	type GoogleMessage struct {
 		Role  string `json:"role"`
 		Parts []struct {

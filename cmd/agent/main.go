@@ -81,7 +81,7 @@ func main() {
 		}
 		groqModel := os.Getenv("GROQ_STT_MODEL")
 		if groqModel == "" {
-			groqModel = "whisper-large-v3"
+			groqModel = "whisper-large-v3-turbo"
 		}
 		stt = sttProvider.NewGroqSTT(groqKey, groqModel)
 	}
@@ -113,7 +113,7 @@ func main() {
 		if groqKey == "" {
 			log.Fatal("Error: GROQ_API_KEY must be set for groq LLM")
 		}
-		llm = llmProvider.NewGroqLLM(groqKey, "llama-3.3-70b-versatile")
+		llm = llmProvider.NewGroqLLM(groqKey, "meta-llama/llama-4-scout-17b-16e-instruct")
 	}
 
 	config := orchestrator.DefaultConfig()
@@ -133,23 +133,49 @@ func main() {
 
 	tts := ttsProvider.NewLokutorTTS(lokutorKey)
 
-	vad := orchestrator.NewRMSVAD(config.BargeInVADThreshold, 800*time.Millisecond)
+	// Aggressive silence limit (250ms) to hit sub-300ms latency. 
+	// The 3-layer logic (Layer 3 LLM) will handle waiting if the thought is actually incomplete.
+	vad := orchestrator.NewRMSVAD(config.BargeInVADThreshold, 250*time.Millisecond)
 	vad.SetMinConfirmed(2)
 
 	orch := orchestrator.NewWithVAD(stt, llm, tts, vad, config)
 
+	// Register an example tool so the agent can check the time
+	orch.RegisterTool("get_time", func(args string) (string, error) {
+		return fmt.Sprintf("The current time is %s", time.Now().Format("15:04:05")), nil
+	})
+
+
 	session := orch.NewSessionWithDefaults("user_123")
+
+	// Let the LLM know the get_time tool is available
+	session.SetTools([]orchestrator.Tool{
+		{
+			Type: "function",
+			Function: map[string]interface{}{
+				"name":        "get_time",
+				"description": "Get the current time in the user's timezone",
+				"parameters": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+	})
+
 
 	systemPrompt := "You are a helpful and concise voice assistant. " +
 		"This is a real-time conversational phone call. " +
 		"Use short sentences suitable for speech. " +
-		"Sound naturally human: as a person would, feel free to use very subtle conversational fillers (like 'umm', 'mhm', or 'well...') and natural pauses only where they feel natural, but avoid overdoing it. " +
+		"If you need to use a tool or check something, FIRST say something very brief like 'One moment' or 'Let me check that' and THEN call the tool. " +
+		"Sound naturally human: feel free to use very subtle conversational fillers (like 'umm', 'mhm', or 'well...') only where they feel natural, but avoid overdoing it. " +
 		"The goal is for the conversation to feel fluid, responsive, and less like a scripted AI."
 	if lang == orchestrator.LanguageEs {
 		systemPrompt = "Eres un asistente de voz útil y conciso. " +
-			"Esta es una llamada telefónica conversacional en tiempo real. " +
+			"Esta is una llamada telefónica conversacional en tiempo real. " +
 			"Usa frases cortas adecuadas para el habla. " +
-			"Suena naturalmente humano: como lo haría una persona, siéntete libre de usar pequeñas muletillas muy sutiles (como 'ehh', 'bueno', 'ajá') y pausas naturales solo donde se sientan apropiadas, pero sin exagerar. " +
+			"Si necesitas usar una herramienta o consultar algo, PRIMERO di algo muy breve como 'Un momento' o 'Déjame consultarlo' y LUEGO usa la herramienta. " +
+			"Suena naturalmente humano: siéntete libre de usar pequeñas muletillas muy sutiles (como 'ehh', 'bueno', 'ajá') solo donde se sientan apropiadas, pero sin exagerar. " +
 			"El objetivo es que la conversación se sienta fluida, reactiva y menos como una IA programada."
 	}
 	orch.SetSystemPrompt(session, systemPrompt)
@@ -171,7 +197,8 @@ func main() {
 	var playbackBytes []byte
 	var e2eLogged bool
 	var preRolling bool = true
-	const preRollSize = 44100 * 2 * 300 / 1000 // 300ms pre-roll
+	var playbackPaused bool
+	const preRollSize = 44100 * 2 * 60 / 1000 // 60ms pre-roll
 
 	chunkPool := sync.Pool{
 		New: func() interface{} {
@@ -179,7 +206,7 @@ func main() {
 		},
 	}
 
-	inputChan := make(chan []byte, 1024)
+	inputChan := make(chan []byte, 512)
 	go func() {
 		for chunk := range inputChan {
 			_ = stream.Write(chunk)
@@ -187,7 +214,7 @@ func main() {
 		}
 	}()
 
-	playedChan := make(chan []byte, 1024)
+	playedChan := make(chan []byte, 64)
 	go func() {
 		for chunk := range playedChan {
 			stream.RecordPlayedOutput(chunk)
@@ -198,12 +225,11 @@ func main() {
 	onSamples := func(pOutput, pInput []byte, frameCount uint32) {
 		if pInput != nil {
 			buf := chunkPool.Get().([]byte)
+			buf = buf[:cap(buf)] // Reset slice to full capacity so copy doesn't truncate data
 			n := copy(buf, pInput)
-			select {
-			case inputChan <- buf[:n]:
-			default:
-				chunkPool.Put(buf)
-			}
+			// Must block channel write to guarantee every sample gets cleanly added
+			// instead of dropping samples and permanently breaking byte-phase
+			inputChan <- buf[:n]
 		}
 
 		if pOutput != nil {
@@ -219,19 +245,17 @@ func main() {
 
 					// Record silence for AEC
 					buf := chunkPool.Get().([]byte)
+					buf = buf[:cap(buf)]
 					nc := copy(buf, pOutput)
-					select {
-					case playedChan <- buf[:nc]:
-					default:
-						chunkPool.Put(buf)
-					}
+					// Block to ensure AEC timeline integrity
+					playedChan <- buf[:nc]
 					return
 				}
 				preRolling = false
 
 			}
 
-			if len(playbackBytes) == 0 {
+			if len(playbackBytes) == 0 || playbackPaused {
 
 				for i := range pOutput {
 					pOutput[i] = 0
@@ -266,12 +290,10 @@ func main() {
 
 			// Record EVERYTHING we play (voice AND silence) so AEC timeline stays perfectly synchronized
 			buf := chunkPool.Get().([]byte)
+			buf = buf[:cap(buf)]
 			nc := copy(buf, pOutput)
-			select {
-			case playedChan <- buf[:nc]:
-			default:
-				chunkPool.Put(buf)
-			}
+			// Block to ensure AEC timeline integrity
+			playedChan <- buf[:nc]
 		}
 	}
 
@@ -300,15 +322,33 @@ func main() {
 		for event := range stream.Events() {
 			switch event.Type {
 			case orchestrator.UserSpeaking:
-				fmt.Printf("\r\033[K🎤 [USER] Speaking...\n")
+				playbackMu.Lock()
+				playbackPaused = true
+				playbackMu.Unlock()
+				e2eLogged = false
+				rms := stream.LastRMS()
+				fmt.Printf("\r\033[K🎤 [USER] Speaking... (RMS: %.4f)\n", rms)
 
 			case orchestrator.Interrupted:
 				playbackMu.Lock()
 				playbackBytes = nil
 				preRolling = true
+				playbackPaused = false
 				currentGeneration = event.Generation
 				playbackMu.Unlock()
 				fmt.Printf("\r\033[K🛑 [INTERRUPTED] User started talking (gen: %d).\n", currentGeneration)
+
+			case orchestrator.BotResumed:
+				playbackMu.Lock()
+				playbackPaused = false
+				playbackMu.Unlock()
+				fmt.Printf("\r\033[K▶️ [RESUMED] Noise detected, continuing...\n")
+
+			case orchestrator.TurnIncomplete:
+				playbackMu.Lock()
+				playbackPaused = false
+				playbackMu.Unlock()
+				fmt.Printf("\r\033[K⏳ [TURN] Incomplete thought detected, waiting...\n")
 
 			case orchestrator.UserStopped:
 				fmt.Printf("\r\033[K⌛ [STT] Processing...\n")
@@ -325,17 +365,40 @@ func main() {
 				}
 
 			case orchestrator.BotThinking:
-				fmt.Printf("\r\033[K🧠 [LLM] Thinking...\n")
+				playbackMu.Lock()
+				playbackBytes = nil
+				playbackPaused = true
+				currentGeneration = event.Generation
+				playbackMu.Unlock()
+				fmt.Printf("\r\033[K🧠 [LLM] Thinking... (gen: %d)\n", currentGeneration)
+
+			case orchestrator.ToolCall:
+				if tc, ok := event.Data.(orchestrator.ToolCallEventData); ok {
+					fmt.Printf("\r\033[K🛠️ [TOOL] Calling %s(%s)...\n", tc.Name, tc.Arguments)
+				}
+
 			case orchestrator.BotResponse:
 				if resp, ok := event.Data.(string); ok {
 					fmt.Printf("\r\033[K💬 [AGENT] %s\n", resp)
 				}
 			case orchestrator.BotSpeaking:
+				playbackMu.Lock()
+				playbackPaused = false
+				playbackMu.Unlock()
 				latency := stream.GetLatency()
 				if latency > 0 {
 					fmt.Printf("\r\033[K🔊 [TTS] Speaking... (latency: %dms)\n", latency)
 				} else {
 					fmt.Printf("\r\033[K🔊 [TTS] Speaking...\n")
+				}
+				// Add latency print here
+				if !e2eLogged {
+					bd := stream.GetLatencyBreakdown()
+					if bd.UserToPlay > 0 || bd.UserToTTSFirstByte > 0 || bd.UserToLLM > 0 || bd.UserToSTT > 0 {
+						fmt.Printf("\r\033[K⏱️ [LATENCY] user→stt=%dms stt=%dms user→llm=%dms llm=%dms user→tts_first=%dms llm→tts_first=%dms tts_total=%dms user→play=%dms\n",
+							bd.UserToSTT, bd.STT, bd.UserToLLM, bd.LLM, bd.UserToTTSFirstByte, bd.LLMToTTSFirstByte, bd.TTSTotal, bd.UserToPlay)
+						e2eLogged = true
+					}
 				}
 			case orchestrator.AudioChunk:
 				if event.Generation < currentGeneration {

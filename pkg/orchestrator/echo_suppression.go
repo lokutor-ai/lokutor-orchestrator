@@ -188,7 +188,7 @@ func (es *EchoSuppressor) isEchoImpl(inputChunk []byte, fast bool) bool {
 	if es.inputSampleRate != es.playbackSampleRate {
 		inputSamples = resample(inputSamples, es.inputSampleRate, es.playbackSampleRate)
 	}
-	correlation := es.maxCorrelationRing(inputSamples, searchSize)
+	correlation := es.maxCorrelationRing(inputSamples, searchSize, fast)
 
 	if correlation > threshold {
 		return true
@@ -198,7 +198,7 @@ func (es *EchoSuppressor) isEchoImpl(inputChunk []byte, fast bool) bool {
 	return envCorr > threshold+0.05
 }
 
-func (es *EchoSuppressor) maxCorrelationRing(inputSamples []float64, searchSize int) float64 {
+func (es *EchoSuppressor) maxCorrelationRing(inputSamples []float64, searchSize int, fast bool) float64 {
 	if len(inputSamples) == 0 || searchSize == 0 {
 		return 0
 	}
@@ -214,9 +214,9 @@ func (es *EchoSuppressor) maxCorrelationRing(inputSamples []float64, searchSize 
 	}
 
 	maxCorr := 0.0
-	stride := compareLen / 8
-	if stride < 16 {
-		stride = 16
+	stride := 64 // Use fixed resolution for better reliability
+	if fast {
+		stride = 128
 	}
 
 	searchRange := searchSize - compareLen + 1
@@ -304,7 +304,7 @@ func (es *EchoSuppressor) maxEnvelopeCorrelationRing(inSamples []float64, search
 	}
 
 	maxCorr := 0.0
-	stride := compareLen / 4
+	stride := 128
 	if stride < 4 {
 		stride = 4
 	}
@@ -417,7 +417,7 @@ func (es *EchoSuppressor) PostProcess(input []byte) []byte {
 			frame = resample(frame, es.inputSampleRate, es.playbackSampleRate)
 		}
 
-		corr := es.maxCorrelationRing(frame, searchSize)
+		corr := es.maxCorrelationRing(frame, searchSize, true)
 		if corr > threshold {
 			for j := i * 2; j < end*2 && j < len(out); j++ {
 				out[j] = 0
@@ -458,7 +458,7 @@ func (es *EchoSuppressor) RemoveEchoRealtime(input []byte) []byte {
 	if es.inputSampleRate != es.playbackSampleRate {
 		inSamples = resample(inSamples, es.inputSampleRate, es.playbackSampleRate)
 	}
-	maxCorr := es.maxCorrelationRing(inSamples, searchSize)
+	maxCorr := es.maxCorrelationRing(inSamples, searchSize, true)
 
 	if maxCorr < threshold {
 		envCorr := es.maxEnvelopeCorrelationRing(inSamples, searchSize, 8)

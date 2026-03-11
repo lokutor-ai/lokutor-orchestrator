@@ -13,7 +13,8 @@ This document provides a comprehensive guide on how to use the **Lokutor Orchest
 6. [Managed Stream API (Recommended)](#managed-stream-api-recommended)
 7. [Event Reference](#event-reference)
 8. [Session Management](#session-management)
-9. [Provider Options](#provider-options)
+9. [Tool Calling](#tool-calling)
+10. [Provider Options](#provider-options)
 
 ---
 
@@ -88,8 +89,8 @@ import (
 )
 
 // 1. Initialize Providers
-stt := sttProv.NewGroqSTT(os.Getenv("GROQ_API_KEY"), "whisper-large-v3")
-llm := llmProv.NewGroqLLM(os.Getenv("GROQ_API_KEY"), "llama-3.3-70b-versatile")
+stt := sttProv.NewGroqSTT(os.Getenv("GROQ_API_KEY"), "whisper-large-v3-turbo")
+llm := llmProv.NewGroqLLM(os.Getenv("GROQ_API_KEY"), "meta-llama/llama-4-scout-17b-16e-instruct")
 tts := ttsProv.NewLokutorTTS(os.Getenv("LOKUTOR_API_KEY"))
 vad := orchestrator.NewRMSVAD(0.02, 500*time.Millisecond)
 
@@ -203,6 +204,19 @@ The orchestrator uses custom error types defined in [pkg/orchestrator/errors.go]
 
 ---
 
+## Tool Calling
+
+The Orchestrator supports first-class function calling. This allows the AI to perform actions like checking a database or calling an external API.
+
+For a full guide on implementing and using tools, see the [Tool Calling Guide](TOOL_CALLING_GUIDE.md).
+
+### Quick Summary:
+1.  **Register a handler** on the Orchestrator: `orch.RegisterTool(name, handler)`.
+2.  **Define tools** on the Session: `session.SetTools(tools)`.
+3.  **Handle Tool Calls**: The Orchestrator automatically executes the handler and updates the conversation history.
+
+---
+
 ## Web & WebSocket Integration
 
 To use the voice agent in a web browser, you must implement a WebSocket server that wraps the orchestrator. The browser sends raw audio chunks (PCM) and receives JSON events or binary audio back.
@@ -299,7 +313,7 @@ const startSession = async () => {
 - **AssemblyAI**: Feature-rich.
 
 ### Large Language Models (LLM)
-- **Groq**: Ultra low-latency (Llama 3, Mixtral).
+- **Groq**: Ultra low-latency (meta-llama/llama-4-scout-17b-16e-instruct).
 - **Anthropic**: High intelligence (Claude 3.5 Sonnet).
 - **OpenAI**: Standard Models (GPT-4o).
 - **Google**: Gemini models.

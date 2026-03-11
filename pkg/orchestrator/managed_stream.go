@@ -28,8 +28,9 @@ type ManagedStream struct {
 	isThinking        bool
 	lastInterruptedAt time.Time
 	lastAudioSentAt   time.Time
-	userSpeechEndTime time.Time
-	botSpeakStartTime time.Time
+	userSpeechStartTime time.Time
+	userSpeechEndTime   time.Time
+	botSpeakStartTime   time.Time
 
 	lastUserAudio []byte
 
@@ -51,6 +52,7 @@ type ManagedStream struct {
 	payloadGen int
 	writeChan  chan []byte
 	isClosed   bool
+	isPaused   bool
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -75,7 +77,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		audioBuf:       new(bytes.Buffer),
 		vad:            streamVAD,
 		echoSuppressor: NewEchoSuppressorWithConfig(config),
-		writeChan:      make(chan []byte, 1024),
+		writeChan:      make(chan []byte, 512),
 	}
 
 	go ms.processBackgroundAudio()
@@ -83,7 +85,13 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
 		go func() {
 			time.Sleep(500 * time.Millisecond) // Give audio some time to stabilize
-			ms.runLLMAndTTS(ms.ctx, "Hello!")  // Trigger initial greeting
+			// Add greeting to context first so LLM knows what it's saying
+			greeting := "Hello!"
+			if o.config.Language == LanguageEs {
+				greeting = "¡Hola!"
+			}
+			ms.session.AddMessage("assistant", greeting)
+			ms.runLLMAndTTS(ms.ctx, greeting) 
 		}()
 	}
 
@@ -145,13 +153,15 @@ func countWords(s string) int {
 const speechEndHold = 150 * time.Millisecond
 
 func (ms *ManagedStream) Write(chunk []byte) error {
-	select {
-	case ms.writeChan <- chunk:
-		return nil
-	default:
-		// Channel full, drop audio or log warning
-		return nil
-	}
+	// We MUST copy the chunk here because the caller (main.go) will recycle the 
+	// underlying buffer into the sync.Pool as soon as this function returns.
+	// Without this copy, doWrite() would be processing memory that is being
+	// simultaneously overwritten by the microphone callback.
+	buf := make([]byte, len(chunk))
+	copy(buf, chunk)
+	
+	ms.writeChan <- buf
+	return nil
 }
 
 func (ms *ManagedStream) doWrite(chunk []byte) error {
@@ -184,16 +194,18 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 		lastEmitted := ms.lastAudioEmittedAt
 		inTrail := time.Since(lastEmitted) < vadTrailWindow
-		if speaking || isThinking || inTrail {
-			// When the bot is active, we are MORE cautious to prevent self-interruption.
-			// We raise the threshold to at least 0.015, unless the base threshold is already higher.
-			target := 0.015
-			if vadThreshold > target {
-				target = vadThreshold
-			}
+		if speaking || isThinking {
+			// When the bot is active, we are cautious to prevent self-interruption.
+			target := vadThreshold * 1.2 // Reduced from 1.5
 			rmsVAD.SetThreshold(target)
-			rmsVAD.SetMinConfirmed(2)
-			rmsVAD.SetAdaptiveMode(false)
+			rmsVAD.SetMinConfirmed(4) // Reduced from 6
+			rmsVAD.SetAdaptiveMode(true)
+		} else if inTrail {
+			// Bot just finished talking.
+			target := vadThreshold * 1.1 // Reduced from 1.2
+			rmsVAD.SetThreshold(target)
+			rmsVAD.SetMinConfirmed(3) // Reduced from 4
+			rmsVAD.SetAdaptiveMode(true)
 		} else {
 			// When idle, we use the base sensitivity (0.005).
 			rmsVAD.SetThreshold(vadThreshold)
@@ -208,15 +220,13 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		}()
 	}
 
-	// Restore passive echo detection solely for debugging/logging purposes.
-	// It does NOT gate VAD events anymore.
 	isEcho := false
 	if ms.echoSuppressor != nil {
 		ms.mu.Lock()
 		lead := ms.audioBuf.Bytes()
 		ms.mu.Unlock()
 
-		leadBytes := 8820
+		leadBytes := 17640 // 200ms
 		if len(lead) > leadBytes {
 			lead = lead[len(lead)-leadBytes:]
 		}
@@ -224,23 +234,37 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		checkBuf = append(checkBuf, lead...)
 		checkBuf = append(checkBuf, chunk...)
 
-		if ms.echoSuppressor.IsEchoFast(checkBuf) {
+		if ms.echoSuppressor.IsEcho(checkBuf) {
 			isEcho = true
 		}
 	}
 
-	event, err := ms.vad.Process(chunk)
+	vadChunk := chunk
+	if isEcho {
+		vadChunk = make([]byte, len(chunk))
+	}
+
+	event, err := ms.vad.Process(vadChunk)
 	if err != nil {
 		return err
 	}
 
 	if event != nil && event.Type != VADSilence {
-
+		// We only guard against STARTING speech if it's echo.
+		// We must ALWAYS allow VADSpeechEnd to pass through, otherwise the 
+		// stream stays "paused" forever waiting for the user to stop.
+		if isEcho && event.Type == VADSpeechStart {
+			return nil
+		}
 		switch event.Type {
 		case VADSpeechStart:
-			if !isEcho {
-				ms.internalInterrupt()
-			}
+			ms.mu.Lock()
+			ms.userSpeechStartTime = time.Now()
+			ms.isPaused = true
+			ms.mu.Unlock()
+
+			// Speculative stop: we don't call internalInterrupt here yet.
+			// Instead, we let the agent "pause" and only stop if speech is confirmed.
 			ms.emit(UserSpeaking, nil)
 
 			ms.mu.Lock()
@@ -318,10 +342,18 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		isUserSpeaking = rmsVAD.IsSpeaking()
 	}
 
+	cleanChunk := chunk
+	// Protect against byte-tearing on S16 PCM chunks
+	if len(cleanChunk)%2 != 0 {
+		cleanChunk = cleanChunk[:len(cleanChunk)-1]
+	}
+
 	ms.mu.Lock()
-	ms.audioBuf.Write(chunk)
+	ms.audioBuf.Write(cleanChunk)
+	// Keep maximum 4 seconds of pristine audio (176400 bytes). Must slice on an EVEN byte boundary (2-byte samples).
 	if !isUserSpeaking && ms.audioBuf.Len() > 176400 {
 		data := ms.audioBuf.Bytes()
+		// Safe lead-in size (3 seconds = 132300 bytes). This is evenly divisible by 2.
 		leadIn := data[len(data)-132300:]
 		ms.audioBuf.Reset()
 		ms.audioBuf.Write(leadIn)
@@ -330,12 +362,14 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 	ms.mu.Lock()
 	sttChan := ms.sttChan
-	ms.lastUserAudio = append(ms.lastUserAudio, chunk...)
+	ms.lastUserAudio = append(ms.lastUserAudio, cleanChunk...)
 	ms.mu.Unlock()
 
 	if sttChan != nil {
+		toSend := make([]byte, len(cleanChunk))
+		copy(toSend, cleanChunk)
 		select {
-		case sttChan <- chunk:
+		case sttChan <- toSend:
 		default:
 		}
 	}
@@ -343,23 +377,60 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 	return nil
 }
 
-func isLikelyNoise(transcript string, audioDuration time.Duration) bool {
+func (ms *ManagedStream) isLikelyNoise(transcript string, audioDuration time.Duration) bool {
+	// Debug logging to help troubleshoot "Noise detected, continuing..." issues
+	ms.mu.Lock()
+	speaking := ms.isSpeaking
+	thinking := ms.isThinking
+	ms.mu.Unlock()
+
+	fmt.Printf("\r\033[K[DEBUG] STT Result: %q | Duration: %v | Speaking: %v | Thinking: %v\n", transcript, audioDuration, speaking, thinking)
+
 	t := strings.TrimSpace(transcript)
 	if t == "" {
 		return true
 	}
 
-	if audioDuration < 100*time.Millisecond {
+	// Filter common Whisper hallucinations on silence/echo
+	lowered := strings.ToLower(strings.Trim(t, " .!?,"))
+	wordCount := countWords(lowered)
+
+	// If we are already speaking, we should be MORE sensitive to interruptions.
+	// Even a single word like "Gracias" or "Stop" should count.
+	if speaking && wordCount >= 1 {
+		return false
+	}
+
+	if audioDuration < 150*time.Millisecond {
 		return true
 	}
 
-	wordCount := len(strings.Fields(t))
+	hallucinations := []string{
+		"gracias", "muchas gracias", "thank you", "thanks",
+		"transcribed by", "ajá", "bueno", "mhm", "umm", "ehh",
+		"subtitles by", "the end", "ciao", "bye", "adiós",
+		"disculpa", "perdona", "está bien", "vale",
+	}
+	for _, h := range hallucinations {
+		if lowered == h {
+			return true
+		}
+	}
 
-	if wordCount == 1 && audioDuration > 5000*time.Millisecond {
+	// Filter case where STT perfectly transcribes the bot's own echo
+	ms.mu.Lock()
+	lastBot := strings.ToLower(ms.session.LastAssistant)
+	ms.mu.Unlock()
+
+	if len(lowered) > 10 && strings.Contains(lastBot, lowered) && len(lowered) > int(float64(len(lastBot))*0.7) {
 		return true
 	}
 
-	if wordCount <= 2 && audioDuration > 8000*time.Millisecond {
+	if wordCount == 1 && audioDuration > 3000*time.Millisecond {
+		return true
+	}
+
+	if wordCount <= 2 && audioDuration > 6000*time.Millisecond {
 		return true
 	}
 
@@ -402,12 +473,12 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 					}
 					return nil
 				}
-				noise := isLikelyNoise(transcript, duration)
+				noise := ms.isLikelyNoise(transcript, duration)
 				if !noise {
 					ms.internalInterrupt()
 				}
 			} else {
-				noise := isLikelyNoise(transcript, duration)
+				noise := ms.isLikelyNoise(transcript, duration)
 				if strings.TrimSpace(transcript) != "" && !noise {
 					ms.internalInterrupt()
 				}
@@ -420,7 +491,11 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 			duration := time.Since(ms.sttStartTime)
 			ms.mu.Unlock()
 
-			if isLikelyNoise(transcript, duration) {
+			if ms.isLikelyNoise(transcript, duration) {
+				ms.mu.Lock()
+				ms.isPaused = false
+				ms.mu.Unlock()
+				ms.emit(BotResumed, nil)
 				return nil
 			}
 
@@ -480,8 +555,6 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 	ms.mu.Unlock()
 	defer cancel()
 
-	ms.emit(BotThinking, nil)
-
 	transcript, err := ms.orch.Transcribe(ctx, audioData, ms.session.GetCurrentLanguage())
 	ms.mu.Lock()
 	if err == nil {
@@ -493,12 +566,30 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 		if ctx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("transcription error: %v", err))
 		}
+		ms.mu.Lock()
+		ms.isPaused = false
+		ms.mu.Unlock()
+		ms.emit(BotResumed, nil)
 		return
 	}
 
-	audioDuration := time.Duration(len(audioData)/2) * time.Second / 44100
+	audioDuration := time.Since(ms.userSpeechStartTime)
+	if !ms.userSpeechEndTime.IsZero() {
+		audioDuration = ms.userSpeechEndTime.Sub(ms.userSpeechStartTime)
+	}
 
-	if transcript == "" || isLikelyNoise(transcript, audioDuration) {
+	if transcript == "" || ms.isLikelyNoise(transcript, audioDuration) {
+		ms.mu.Lock()
+		// If the user started speaking again during STT processing, do NOT resume.
+		// Leave isPaused=true and wait for the next speech segment to finish.
+		if rmsVAD, ok := ms.vad.(*RMSVAD); ok && rmsVAD.IsSpeaking() {
+			ms.mu.Unlock()
+			fmt.Printf("\r\033[K[DEBUG] Noise detected but user is speaking again, staying paused.\n")
+			return
+		}
+		ms.isPaused = false
+		ms.mu.Unlock()
+		ms.emit(BotResumed, nil)
 		return
 	}
 
@@ -513,13 +604,24 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 			minWords = ms.orch.GetConfig().MinWordsToInterrupt
 		}
 		if minWords > 1 && countWords(transcript) < minWords {
+			ms.mu.Lock()
+			if rmsVAD, ok := ms.vad.(*RMSVAD); ok && rmsVAD.IsSpeaking() {
+				ms.mu.Unlock()
+				return
+			}
+			ms.isPaused = false
+			ms.mu.Unlock()
+			ms.emit(BotResumed, nil)
 			return
 		}
 		ms.internalInterrupt()
 	} else if thinking {
 		ms.internalInterrupt()
 	} else {
-		ms.internalInterrupt()
+		// Even if not speaking/thinking, make sure we aren't stuck in isPaused
+		ms.mu.Lock()
+		ms.isPaused = false
+		ms.mu.Unlock()
 	}
 
 	ms.emit(TranscriptFinal, transcript)
@@ -541,16 +643,25 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	rCtx, rCancel := context.WithCancel(ctx)
 	ms.responseCancel = rCancel
 	ms.isThinking = true
+	ms.payloadGen++
+	gen := ms.payloadGen
 	ms.mu.Unlock()
 
 	defer rCancel()
 
-	ms.emit(BotThinking, nil)
+	ms.emitWithGen(BotThinking, nil, gen)
 
 	ms.mu.Lock()
 	ms.llmStartTime = time.Now()
 	ms.mu.Unlock()
 
+	// Try streaming if supported
+	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
+		ms.runStreamingLLMPipeline(rCtx, sProvider)
+		return
+	}
+
+	// Fallback to batch logic
 	response, err := ms.orch.GenerateResponse(rCtx, ms.session)
 	ms.mu.Lock()
 	if err == nil {
@@ -559,6 +670,33 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.mu.Unlock()
 
 	if err != nil {
+		if err == ErrTurnIncompleteWait {
+			ms.mu.Lock()
+			ms.isThinking = false
+			ms.isPaused = false
+			genCtx := ms.sttGeneration
+			ms.mu.Unlock()
+			ms.emit(TurnIncomplete, nil)
+			
+			// Auto-wakeup: faster turnaround
+			go func() {
+				timer := time.NewTimer(1000 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					ms.mu.Lock()
+					stillCurrent := (ms.sttGeneration == genCtx && !ms.isSpeaking && !ms.isThinking)
+					ms.mu.Unlock()
+					if stillCurrent {
+						// Run LLM again but pretend the user was forced to complete by forcing a "yes" transcript
+						ms.runLLMAndTTS(ctx, "")
+					}
+				case <-ctx.Done():
+				}
+			}()
+			
+			return
+		}
 		if rCtx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("LLM error: %v", err))
 		}
@@ -585,10 +723,27 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.mu.Lock()
 	ms.botSpeakStartTime = time.Now()
 	ms.ttsStartTime = ms.botSpeakStartTime
+	ms.audioBuf.Reset()
+	ms.lastUserAudio = nil
 	ms.mu.Unlock()
 	ms.emit(BotSpeaking, nil)
 
 	err = ms.orch.SynthesizeStream(ttsCtx, response, ms.session.GetCurrentVoice(), ms.session.GetCurrentLanguage(), func(chunk []byte) error {
+		for {
+			ms.mu.Lock()
+			paused := ms.isPaused
+			ms.mu.Unlock()
+			if !paused {
+				break
+			}
+			select {
+			case <-ttsCtx.Done():
+				return ttsCtx.Err()
+			case <-time.After(20 * time.Millisecond):
+				continue
+			}
+		}
+
 		select {
 		case <-ttsCtx.Done():
 			return ttsCtx.Err()
@@ -609,7 +764,8 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 				if end > len(chunk) {
 					end = len(chunk)
 				}
-				c := chunk[i:end]
+				c := make([]byte, end-i)
+				copy(c, chunk[i:end])
 
 				ms.emitWithGen(AudioChunk, c, gen)
 			}
@@ -631,6 +787,234 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.isSpeaking = false
 	ms.ttsCancel = nil
 	ms.mu.Unlock()
+}
+
+func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider StreamingLLMProvider) {
+	var fullText strings.Builder
+	var hasToolCalls bool
+	var turnEvaluated bool
+	var responseSuppressed bool
+
+	// We append turn evaluation prompt for the analyzer logic
+	messages := ms.session.GetContextCopy()
+	systemInstruction := "You are a conversational AI. Before you formulate your response, you must evaluate if the user has finished their thought. " +
+		"Output EXACTLY ONE of the following tokens at the very beginning of your response:\n" +
+		"✓ : Respond now\n" +
+		"○ : Wait 5 seconds\n" +
+		"◐ : Wait 10 seconds\n" +
+		"After the token, if you chose ✓, output your response."
+	
+	messages = append([]Message{{Role: "system", Content: systemInstruction}}, messages...)
+
+	type pendingToolResult struct {
+		tc     ToolCallEventData
+		result string
+	}
+	var toolResults []pendingToolResult
+
+	_, err := provider.StreamComplete(ctx, messages, ms.session.GetTools(), func(chunk string) error {
+		fullText.WriteString(chunk)
+
+		if !turnEvaluated && fullText.Len() >= 2 {
+			textSoFar := strings.TrimSpace(fullText.String())
+			if strings.HasPrefix(textSoFar, string(TurnWait5)) || strings.HasPrefix(textSoFar, string(TurnWait10)) {
+				responseSuppressed = true
+				turnEvaluated = true
+				ms.emit(TurnIncomplete, nil)
+				return fmt.Errorf("response suppressed: wait token detected")
+			}
+			if strings.HasPrefix(textSoFar, string(TurnComplete)) {
+				turnEvaluated = true
+			}
+		}
+		return nil
+	}, func(tc ToolCallEventData) error {
+		hasToolCalls = true
+		ms.emit(ToolCall, tc)
+
+		o := ms.orch
+		o.mu.RLock()
+		handler, ok := o.toolHandlers[tc.Name]
+		o.mu.RUnlock()
+
+		result := "Error: tool not found"
+		if ok {
+			var err error
+			result, err = handler(tc.Arguments)
+			if err != nil {
+				result = fmt.Sprintf("Error: %v", err)
+			}
+		}
+		
+		toolResults = append(toolResults, pendingToolResult{tc: tc, result: result})
+		return nil
+	})
+
+	if err != nil && responseSuppressed {
+		ms.mu.Lock()
+		ms.isThinking = false
+		ms.isPaused = false
+		ms.mu.Unlock()
+		return
+	}
+
+	if err != nil {
+		if ctx.Err() == nil {
+			ms.emit(ErrorEvent, fmt.Sprintf("Streaming LLM error: %v", err))
+		}
+		return
+	}
+
+	response := fullText.String()
+	// Strong token stripping: remove any recognized token from the start
+	t := strings.TrimSpace(response)
+	for {
+		changed := false
+		for _, token := range []string{string(TurnComplete), string(TurnWait5), string(TurnWait10), "✓", "○", "◐"} {
+			if strings.HasPrefix(t, token) {
+				t = strings.TrimSpace(strings.TrimPrefix(t, token))
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	response = t
+	// global filter as a safety net
+	for _, token := range []string{"✓", "○", "◐"} {
+		response = strings.ReplaceAll(response, token, "")
+	}
+	response = strings.TrimSpace(response)
+
+	// If the LLM didn't provide any text but we have tool calls, 
+	// we should provide a canned filler so the user isn't in silence.
+	if response == "" && hasToolCalls {
+		// Only provide filler if we haven't just said one in the last 2 messages
+		lastMsg := ""
+		ctxMessages := ms.session.GetContextCopy()
+		if len(ctxMessages) > 0 {
+			lastMsg = ctxMessages[len(ctxMessages)-1].Content
+		}
+
+		if !strings.Contains(lastMsg, "Un momento") && !strings.Contains(lastMsg, "One moment") {
+			if ms.session.GetCurrentLanguage() == LanguageEs {
+				response = "Un momento..."
+			} else {
+				response = "One moment..."
+			}
+		}
+	}
+
+	if response != "" {
+		// Only add to history now if there are NO tool calls.
+		// If there are tool calls, we add it later along with the calls.
+		if !hasToolCalls {
+			ms.session.AddMessage("assistant", response)
+		}
+		ms.emit(BotResponse, response)
+
+		ms.mu.Lock()
+		ms.isThinking = false
+		ms.isSpeaking = true
+		ms.mu.Unlock()
+
+		if ms.vad != nil {
+			ms.vad.Reset()
+		}
+
+		ttsCtx, ttsCancel := context.WithCancel(ctx)
+		defer ttsCancel()
+
+		ms.mu.Lock()
+		ms.ttsCancel = ttsCancel
+		ms.botSpeakStartTime = time.Now()
+		ms.ttsStartTime = ms.botSpeakStartTime
+		ms.audioBuf.Reset()
+		ms.mu.Unlock()
+		
+		ms.emit(BotSpeaking, nil)
+
+		_ = ms.orch.SynthesizeStream(ttsCtx, response, ms.session.GetCurrentVoice(), ms.session.GetCurrentLanguage(), func(chunk []byte) error {
+			for {
+				ms.mu.Lock()
+				paused := ms.isPaused
+				ms.mu.Unlock()
+				if !paused {
+					break
+				}
+				select {
+				case <-ttsCtx.Done():
+					return ttsCtx.Err()
+				case <-time.After(20 * time.Millisecond):
+					continue
+				}
+			}
+			
+			ms.mu.Lock()
+			ms.lastAudioSentAt = time.Now()
+			ms.lastAudioEmittedAt = ms.lastAudioSentAt
+			if ms.ttsFirstChunkTime.IsZero() {
+				ms.ttsFirstChunkTime = time.Now()
+			}
+			gen := ms.payloadGen
+			ms.mu.Unlock()
+
+			frameSize := 1764 // 44100Hz * 0.02s * 2 bytes
+			for i := 0; i < len(chunk); i += frameSize {
+				end := i + frameSize
+				if end > len(chunk) {
+					end = len(chunk)
+				}
+				c := make([]byte, end-i)
+				copy(c, chunk[i:end])
+				ms.emitWithGen(AudioChunk, c, gen)
+			}
+			return nil
+		})
+
+		ms.mu.Lock()
+		ms.isSpeaking = false
+		ms.ttsCancel = nil
+		ms.mu.Unlock()
+	} else {
+		ms.mu.Lock()
+		ms.isThinking = false
+		ms.mu.Unlock()
+	}
+
+	if hasToolCalls {
+		// Add Tool Calls to History in correct sequence
+		var tcData []interface{}
+		for _, tr := range toolResults {
+			tcData = append(tcData, map[string]interface{}{
+				"id":   tr.tc.CallID,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      tr.tc.Name,
+					"arguments": tr.tc.Arguments,
+				},
+			})
+		}
+		
+		// This assistant message includes BOTH any text response and the tool calls
+		ms.session.AddMessageRaw(Message{
+			Role:      "assistant",
+			Content:   response,
+			ToolCalls: tcData,
+		})
+
+		for _, tr := range toolResults {
+			ms.session.AddMessageRaw(Message{
+				Role:       "tool",
+				Content:    tr.result,
+				ToolCallID: tr.tc.CallID,
+			})
+		}
+		
+		// Recurse to handle the tool results
+		go ms.runLLMAndTTS(ms.ctx, "")
+	}
 }
 
 func (ms *ManagedStream) NotifyAudioPlayed() {
@@ -819,10 +1203,18 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		}
 	}()
 
-	select {
-	case ms.events <- event:
-	case <-ms.ctx.Done():
-	default:
+	if eventType == AudioChunk {
+		select {
+		case ms.events <- event:
+		case <-ms.ctx.Done():
+		default:
+			// Only drop AudioChunks if full, but block for other events
+		}
+	} else {
+		select {
+		case ms.events <- event:
+		case <-ms.ctx.Done():
+		}
 	}
 	ms.mu.Unlock()
 }
@@ -849,10 +1241,17 @@ func (ms *ManagedStream) internalInterrupt() {
 	ms.responseCancel = nil
 	ms.ttsCancel = nil
 
+	if ms.userSpeechEndTime.IsZero() {
+		ms.userSpeechEndTime = time.Now()
+	}
+	ms.sttEndTime = ms.userSpeechEndTime // For latency breakdown consistency
+
 	ms.isSpeaking = false
 	ms.isThinking = false
 	ms.userInterrupting = false
-	ms.payloadGen++
+	ms.isPaused = false
+	// We don't increment gen here anymore as runLLMAndTTS handles it,
+	// keeping it simple and unified.
 	gen := ms.payloadGen
 	ms.mu.Unlock()
 

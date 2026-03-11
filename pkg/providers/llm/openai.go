@@ -27,7 +27,7 @@ func NewOpenAILLM(apiKey string, model string) *OpenAILLM {
 	}
 }
 
-func (l *OpenAILLM) Complete(ctx context.Context, messages []orchestrator.Message) (string, error) {
+func (l *OpenAILLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
 		"messages": messages,

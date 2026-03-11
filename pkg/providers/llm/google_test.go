@@ -63,7 +63,7 @@ func TestGoogleLLM(t *testing.T) {
 		{Role: "user", Content: "hi"},
 	}
 
-	resp, err := l.Complete(context.Background(), messages)
+	resp, err := l.Complete(context.Background(), messages, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

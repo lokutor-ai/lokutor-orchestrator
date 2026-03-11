@@ -29,7 +29,7 @@ func TestGroqSTT(t *testing.T) {
 	s := &GroqSTT{
 		apiKey:     "test-key",
 		url:        server.URL,
-		model:      "whisper-large-v3",
+		model:      "whisper-large-v3-turbo",
 		sampleRate: 44100,
 	}
 

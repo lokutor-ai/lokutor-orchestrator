@@ -8,14 +8,19 @@ import (
 )
 
 
+type ToolHandler func(args string) (string, error)
+
 type Orchestrator struct {
 	stt    STTProvider
 	llm    LLMProvider
 	tts    TTSProvider
 	vad    VADProvider
+	layer2 Layer2ProsodyAnalyzer
 	config Config
 	logger Logger
 	mu     sync.RWMutex
+
+	toolHandlers map[string]ToolHandler
 }
 
 
@@ -26,22 +31,34 @@ func New(stt STTProvider, llm LLMProvider, tts TTSProvider, config Config) *Orch
 
 
 func NewWithVAD(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config) *Orchestrator {
-	return NewWithLogger(stt, llm, tts, vad, config, &NoOpLogger{})
+	return NewWithAllLayers(stt, llm, tts, vad, NewMockProsodyAnalyzer(), config, &NoOpLogger{})
 }
 
 
 func NewWithLogger(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config, logger Logger) *Orchestrator {
+	return NewWithAllLayers(stt, llm, tts, vad, NewMockProsodyAnalyzer(), config, logger)
+}
+
+func NewWithAllLayers(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, layer2 Layer2ProsodyAnalyzer, config Config, logger Logger) *Orchestrator {
 	if logger == nil {
 		logger = &NoOpLogger{}
 	}
 	return &Orchestrator{
-		stt:    stt,
-		llm:    llm,
-		tts:    tts,
-		vad:    vad,
-		config: config,
-		logger: logger,
+		stt:          stt,
+		llm:          llm,
+		tts:          tts,
+		vad:          vad,
+		layer2:       layer2,
+		config:       config,
+		logger:       logger,
+		toolHandlers: make(map[string]ToolHandler),
 	}
+}
+
+func (o *Orchestrator) RegisterTool(name string, handler ToolHandler) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.toolHandlers[name] = handler
 }
 
 
@@ -132,8 +149,22 @@ func (o *Orchestrator) Transcribe(ctx context.Context, audioData []byte, lang La
 }
 
 
+var ErrTurnIncompleteWait = fmt.Errorf("Turn incomplete. Response suppressed.")
+
 func (o *Orchestrator) GenerateResponse(ctx context.Context, session *ConversationSession) (string, error) {
-	return o.llm.Complete(ctx, session.GetContextCopy())
+	// Layer 3: Evaluate token completion before responding
+	layer3 := NewLayer3LLMAnalyzer(o.llm)
+	turn, response, err := layer3.EvaluateContext(ctx, session)
+	if err != nil {
+		return "", err
+	}
+
+	if turn == TurnWait5 || turn == TurnWait10 {
+		o.logger.Info("LLM determined turn is incomplete", "turn", turn, "sessionID", session.ID)
+		return "", ErrTurnIncompleteWait
+	}
+
+	return response, nil
 }
 
 

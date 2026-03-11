@@ -19,6 +19,8 @@ type RMSVAD struct {
 	consecutiveFrames int
 	minConfirmed      int
 	lastRMS           float64
+	localMin          float64
+	lastMinUpdate     time.Time
 	mu                sync.Mutex
 }
 
@@ -86,11 +88,30 @@ func (v *RMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	effectiveThreshold := v.threshold
 	if v.adaptiveMode {
 
-		if rms < v.noiseFloor {
-			v.noiseFloor = rms
-		} else if !v.isSpeaking && rms < v.threshold*2 {
-
-			v.noiseFloor = (1-v.alpha)*v.noiseFloor + v.alpha*rms
+		// Skip adapting noise floor if it's pure digital silence (like injected echo suppression)
+		if rms > 0.0001 {
+			if rms < v.noiseFloor {
+				v.noiseFloor = rms
+				v.localMin = rms
+			} else if !v.isSpeaking {
+				v.noiseFloor = (1-v.alpha)*v.noiseFloor + v.alpha*rms
+				v.localMin = v.noiseFloor
+			} else {
+				// Even while speaking, track the local minimum to adapt if noise increases
+				if rms < v.localMin || v.lastMinUpdate.IsZero() {
+					v.localMin = rms
+					if v.lastMinUpdate.IsZero() {
+						v.lastMinUpdate = now
+					}
+				}
+				if now.Sub(v.lastMinUpdate) > 2*time.Second {
+					// We've been "speaking" for 2s, but the floor has moved up.
+					// This is likely noise, not continuous speech.
+					v.noiseFloor = v.localMin
+					v.lastMinUpdate = now
+					v.localMin = rms
+				}
+			}
 		}
 
 		adaptiveThreshold := v.noiseFloor * 2.0
@@ -150,9 +171,14 @@ func (v *RMSVAD) Clone() VADProvider {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return &RMSVAD{
-		threshold:    v.threshold,
-		silenceLimit: v.silenceLimit,
-		minConfirmed: v.minConfirmed,
+		threshold:     v.threshold,
+		silenceLimit:  v.silenceLimit,
+		minConfirmed:  v.minConfirmed,
+		adaptiveMode:  v.adaptiveMode,
+		noiseFloor:    v.noiseFloor,
+		alpha:         v.alpha,
+		localMin:      v.localMin,
+		lastMinUpdate: v.lastMinUpdate,
 	}
 }
 

@@ -27,7 +27,7 @@ func NewAnthropicLLM(apiKey string, model string) *AnthropicLLM {
 	}
 }
 
-func (l *AnthropicLLM) Complete(ctx context.Context, messages []orchestrator.Message) (string, error) {
+func (l *AnthropicLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	
 	var system string
 	var anthropicMessages []map[string]string

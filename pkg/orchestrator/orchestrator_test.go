@@ -23,7 +23,7 @@ type MockLLMProvider struct {
 	completeErr    error
 }
 
-func (m *MockLLMProvider) Complete(ctx context.Context, messages []Message) (string, error) {
+func (m *MockLLMProvider) Complete(ctx context.Context, messages []Message, tools []Tool) (string, error) {
 	return m.completeResult, m.completeErr
 }
 

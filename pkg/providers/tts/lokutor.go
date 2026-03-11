@@ -66,35 +66,39 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	req := map[string]interface{}{
 		"text":    text,
 		"voice":   string(voice),
 		"lang":    string(lang),
 		"speed":   1.0,
-		"steps":   6,
+		"steps":   4,
 		"visemes": false,
 	}
 
 	if err := wsjson.Write(ctx, conn, req); err != nil {
 		t.conn = nil
 		conn.Close(websocket.StatusAbnormalClosure, "failed to write json")
+		t.mu.Unlock()
 		return fmt.Errorf("failed to send synthesis request: %w", err)
 	}
+	t.mu.Unlock()
 
 	for {
 		messageType, payload, err := conn.Read(ctx)
 		if err != nil {
+			t.mu.Lock()
 			t.conn = nil
 			conn.Close(websocket.StatusAbnormalClosure, "failed to read")
+			t.mu.Unlock()
 			return fmt.Errorf("failed to read from lokutor: %w", err)
 		}
 
 		switch messageType {
 		case websocket.MessageBinary:
-
-			if err := onChunk(payload); err != nil {
+			// Make a copy of the payload because the websocket library might reuse the buffer
+			chunk := make([]byte, len(payload))
+			copy(chunk, payload)
+			if err := onChunk(chunk); err != nil {
 				return err
 			}
 		case websocket.MessageText:

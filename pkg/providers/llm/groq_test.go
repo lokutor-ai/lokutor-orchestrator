@@ -43,14 +43,14 @@ func TestGroqLLM(t *testing.T) {
 	l := &GroqLLM{
 		apiKey: "test-key",
 		url:    server.URL,
-		model:  "llama3-70b",
+		model:  "meta-llama/llama-4-scout-17b-16e-instruct",
 	}
 
 	messages := []orchestrator.Message{
 		{Role: "user", Content: "hi"},
 	}
 
-	resp, err := l.Complete(context.Background(), messages)
+	resp, err := l.Complete(context.Background(), messages, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

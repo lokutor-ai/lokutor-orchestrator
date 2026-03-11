@@ -17,6 +17,7 @@ Lokutor Orchestrator is a production-grade Go library for building voice-powered
 - Predictive audio buffering: prevents clipping of the start of user speech.
 - High-performance echo suppression: correlation filters reduce self-interruption.
 - Pluggable architecture: swap STT, LLM, and TTS implementations with minimal changes.
+- **Tool Calling (v1.4)**: Native support for function calling with automatic TTS suppression and recursive LLM triggers.
 - Instrumentation: stage-by-stage latency tracking (STT, LLM, TTS, end-to-end).
 
 ---
@@ -53,7 +54,7 @@ go get github.com/lokutor-ai/lokutor-orchestrator
 func main() {
     // Initialize High-Performance Providers
     stt := sttProvider.NewDeepgramSTT(apiKey)
-    llm := llmProvider.NewGroqLLM(apiKey, "llama-3.3-70b-versatile")
+    llm := llmProvider.NewGroqLLM(apiKey, "meta-llama/llama-4-scout-17b-16e-instruct")
     tts := ttsProvider.NewLokutorTTS(apiKey)
     
     // Configure VAD & Orchestrator
@@ -142,6 +143,12 @@ Every turn includes detailed instrumentation available via `stream.GetLatencyBre
 *   `User-to-STT`: Time from user stop to final transcript.
 *   `TTFB`: User stop to first audio sample.
 *   `E2E`: Full user-to-speaker turn-around.
+
+## Documentation
+
+For more detailed guides, check out:
+- [Voice Agent API](docs/VOICE_AGENT_API.md)
+- [Tool Calling Guide](docs/TOOL_CALLING_GUIDE.md)
 
 ---
 

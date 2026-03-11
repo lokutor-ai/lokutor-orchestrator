@@ -34,9 +34,15 @@ type StreamingSTTProvider interface {
 }
 
 type LLMProvider interface {
-	Complete(ctx context.Context, messages []Message) (string, error)
+	Complete(ctx context.Context, messages []Message, tools []Tool) (string, error)
 	Name() string
 }
+
+type StreamingLLMProvider interface {
+	LLMProvider
+	StreamComplete(ctx context.Context, messages []Message, tools []Tool, onChunk func(string) error, onToolCall func(ToolCallEventData) error) (string, error)
+}
+
 
 type TTSProvider interface {
 	Synthesize(ctx context.Context, text string, voice Voice, lang Language) ([]byte, error)
@@ -76,9 +82,18 @@ const (
 	BotResponse       EventType = "BOT_RESPONSE"
 	BotSpeaking       EventType = "BOT_SPEAKING"
 	Interrupted       EventType = "INTERRUPTED"
+	BotResumed        EventType = "BOT_RESUMED"
+	TurnIncomplete    EventType = "TURN_INCOMPLETE"
 	AudioChunk        EventType = "AUDIO_CHUNK"
+	ToolCall          EventType = "TOOL_CALL"
 	ErrorEvent        EventType = "ERROR"
 )
+
+type ToolCallEventData struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+	CallID    string `json:"call_id"`
+}
 
 type OrchestratorEvent struct {
 	Type       EventType   `json:"type"`
@@ -116,8 +131,16 @@ const (
 )
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string      `json:"role"`
+	Content    string      `json:"content"`
+	Name       string      `json:"name,omitempty"`
+	ToolCallID string      `json:"tool_call_id,omitempty"`
+	ToolCalls  interface{} `json:"tool_calls,omitempty"`
+}
+
+type Tool struct {
+	Type     string      `json:"type"` // e.g. "function"
+	Function interface{} `json:"function"`
 }
 
 type FirstSpeaker string
@@ -156,9 +179,9 @@ func DefaultConfig() Config {
 		STTTimeout:               30,
 		LLMTimeout:               60,
 		TTSTimeout:               30,
-		BargeInVADThreshold:      0.005,
+		BargeInVADThreshold:      0.007,
 		BargeInVADTrailWindow:    1500 * time.Millisecond,
-		EchoSuppressionThreshold: 0.82,
+		EchoSuppressionThreshold: 0.35,
 		FirstSpeaker:             FirstSpeakerBot,
 	}
 }
@@ -172,6 +195,7 @@ type ConversationSession struct {
 	MaxMessages     int
 	CurrentVoice    Voice
 	CurrentLanguage Language
+	Tools           []Tool
 }
 
 func NewConversationSession(userID string) *ConversationSession {
@@ -185,17 +209,33 @@ func NewConversationSession(userID string) *ConversationSession {
 }
 
 func (s *ConversationSession) AddMessage(role, content string) {
+	s.AddMessageRaw(Message{Role: role, Content: content})
+}
+
+func (s *ConversationSession) AddMessageRaw(msg Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Context = append(s.Context, Message{Role: role, Content: content})
+	s.Context = append(s.Context, msg)
 	if len(s.Context) > s.MaxMessages {
 		s.Context = s.Context[len(s.Context)-s.MaxMessages:]
 	}
-	if role == "user" {
-		s.LastUser = content
-	} else if role == "assistant" {
-		s.LastAssistant = content
+	if msg.Role == "user" {
+		s.LastUser = msg.Content
+	} else if msg.Role == "assistant" && msg.Content != "" {
+		s.LastAssistant = msg.Content
 	}
+}
+
+func (s *ConversationSession) SetTools(tools []Tool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Tools = tools
+}
+
+func (s *ConversationSession) GetTools() []Tool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Tools
 }
 
 func (s *ConversationSession) ClearContext() {
