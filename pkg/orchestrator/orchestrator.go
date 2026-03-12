@@ -15,7 +15,6 @@ type Orchestrator struct {
 	llm    LLMProvider
 	tts    TTSProvider
 	vad    VADProvider
-	layer2 Layer2ProsodyAnalyzer
 	config Config
 	logger Logger
 	mu     sync.RWMutex
@@ -31,15 +30,15 @@ func New(stt STTProvider, llm LLMProvider, tts TTSProvider, config Config) *Orch
 
 
 func NewWithVAD(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config) *Orchestrator {
-	return NewWithAllLayers(stt, llm, tts, vad, NewMockProsodyAnalyzer(), config, &NoOpLogger{})
+	return NewWithAllLayers(stt, llm, tts, vad, config, &NoOpLogger{})
 }
 
 
 func NewWithLogger(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config, logger Logger) *Orchestrator {
-	return NewWithAllLayers(stt, llm, tts, vad, NewMockProsodyAnalyzer(), config, logger)
+	return NewWithAllLayers(stt, llm, tts, vad, config, logger)
 }
 
-func NewWithAllLayers(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, layer2 Layer2ProsodyAnalyzer, config Config, logger Logger) *Orchestrator {
+func NewWithAllLayers(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config, logger Logger) *Orchestrator {
 	if logger == nil {
 		logger = &NoOpLogger{}
 	}
@@ -48,7 +47,6 @@ func NewWithAllLayers(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VAD
 		llm:          llm,
 		tts:          tts,
 		vad:          vad,
-		layer2:       layer2,
 		config:       config,
 		logger:       logger,
 		toolHandlers: make(map[string]ToolHandler),
@@ -149,22 +147,8 @@ func (o *Orchestrator) Transcribe(ctx context.Context, audioData []byte, lang La
 }
 
 
-var ErrTurnIncompleteWait = fmt.Errorf("Turn incomplete. Response suppressed.")
-
 func (o *Orchestrator) GenerateResponse(ctx context.Context, session *ConversationSession) (string, error) {
-	// Layer 3: Evaluate token completion before responding
-	layer3 := NewLayer3LLMAnalyzer(o.llm)
-	turn, response, err := layer3.EvaluateContext(ctx, session)
-	if err != nil {
-		return "", err
-	}
-
-	if turn == TurnWait5 || turn == TurnWait10 {
-		o.logger.Info("LLM determined turn is incomplete", "turn", turn, "sessionID", session.ID)
-		return "", ErrTurnIncompleteWait
-	}
-
-	return response, nil
+	return o.llm.Complete(ctx, session.GetContextCopy(), session.GetTools())
 }
 
 

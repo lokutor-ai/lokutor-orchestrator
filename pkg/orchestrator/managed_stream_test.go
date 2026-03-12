@@ -54,7 +54,6 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 
 	stream.mu.Lock()
 	stream.lastAudioSentAt = time.Now()
-	stream.lastAudioEmittedAt = stream.lastAudioSentAt
 	stream.mu.Unlock()
 
 	loudChunk := make([]byte, 100)
@@ -80,7 +79,6 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 
 	stream.mu.Lock()
 	stream.lastAudioSentAt = time.Now().Add(-5 * time.Second)
-	stream.lastAudioEmittedAt = stream.lastAudioSentAt
 	stream.mu.Unlock()
 
 	normalChunk := make([]byte, 100)

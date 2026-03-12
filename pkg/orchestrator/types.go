@@ -83,7 +83,6 @@ const (
 	BotSpeaking       EventType = "BOT_SPEAKING"
 	Interrupted       EventType = "INTERRUPTED"
 	BotResumed        EventType = "BOT_RESUMED"
-	TurnIncomplete    EventType = "TURN_INCOMPLETE"
 	AudioChunk        EventType = "AUDIO_CHUNK"
 	ToolCall          EventType = "TOOL_CALL"
 	ErrorEvent        EventType = "ERROR"

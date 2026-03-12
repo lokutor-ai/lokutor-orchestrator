@@ -35,8 +35,6 @@ func (m *MockStreamingLLM) StreamComplete(ctx context.Context, messages []Messag
 
 	if resp.content != "" {
 		if onChunk != nil {
-			// Simulate streaming with turn token
-			onChunk(string(TurnComplete) + " ")
 			onChunk(resp.content)
 		}
 	}
@@ -73,9 +71,8 @@ func TestManagedStream_ToolCalling(t *testing.T) {
 
 	stt := &MockSTTProvider{transcribeResult: "whats the weather?"}
 	tts := &MockTTSProvider{synthesizeResult: []byte{1, 2, 3}}
-	vad := NewMockProsodyAnalyzer()
 
-	orch := NewWithAllLayers(stt, llm, tts, nil, vad, DefaultConfig(), &NoOpLogger{})
+	orch := NewWithAllLayers(stt, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
 
 	weatherCalled := false
 	orch.RegisterTool("get_weather", func(args string) (string, error) {

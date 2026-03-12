@@ -134,7 +134,6 @@ func main() {
 	tts := ttsProvider.NewLokutorTTS(lokutorKey)
 
 	// Aggressive silence limit (250ms) to hit sub-300ms latency. 
-	// The 3-layer logic (Layer 3 LLM) will handle waiting if the thought is actually incomplete.
 	vad := orchestrator.NewRMSVAD(config.BargeInVADThreshold, 250*time.Millisecond)
 	vad.SetMinConfirmed(2)
 
@@ -166,17 +165,11 @@ func main() {
 
 	systemPrompt := "You are a helpful and concise voice assistant. " +
 		"This is a real-time conversational phone call. " +
-		"Use short sentences suitable for speech. " +
-		"If you need to use a tool or check something, FIRST say something very brief like 'One moment' or 'Let me check that' and THEN call the tool. " +
-		"Sound naturally human: feel free to use very subtle conversational fillers (like 'umm', 'mhm', or 'well...') only where they feel natural, but avoid overdoing it. " +
-		"The goal is for the conversation to feel fluid, responsive, and less like a scripted AI."
+		"Use short sentences suitable for speech."
 	if lang == orchestrator.LanguageEs {
 		systemPrompt = "Eres un asistente de voz útil y conciso. " +
-			"Esta is una llamada telefónica conversacional en tiempo real. " +
-			"Usa frases cortas adecuadas para el habla. " +
-			"Si necesitas usar una herramienta o consultar algo, PRIMERO di algo muy breve como 'Un momento' o 'Déjame consultarlo' y LUEGO usa la herramienta. " +
-			"Suena naturalmente humano: siéntete libre de usar pequeñas muletillas muy sutiles (como 'ehh', 'bueno', 'ajá') solo donde se sientan apropiadas, pero sin exagerar. " +
-			"El objetivo es que la conversación se sienta fluida, reactiva y menos como una IA programada."
+			"Esta es una llamada telefónica conversacional en tiempo real. " +
+			"Usa frases cortas adecuadas para el habla."
 	}
 	orch.SetSystemPrompt(session, systemPrompt)
 
@@ -338,17 +331,7 @@ func main() {
 				playbackMu.Unlock()
 				fmt.Printf("\r\033[K🛑 [INTERRUPTED] User started talking (gen: %d).\n", currentGeneration)
 
-			case orchestrator.BotResumed:
-				playbackMu.Lock()
-				playbackPaused = false
-				playbackMu.Unlock()
-				fmt.Printf("\r\033[K▶️ [RESUMED] Noise detected, continuing...\n")
 
-			case orchestrator.TurnIncomplete:
-				playbackMu.Lock()
-				playbackPaused = false
-				playbackMu.Unlock()
-				fmt.Printf("\r\033[K⏳ [TURN] Incomplete thought detected, waiting...\n")
 
 			case orchestrator.UserStopped:
 				fmt.Printf("\r\033[K⌛ [STT] Processing...\n")
