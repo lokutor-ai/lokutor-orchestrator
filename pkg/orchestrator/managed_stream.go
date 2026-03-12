@@ -586,7 +586,6 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider StreamingLLMProvider) {
 	var fullText strings.Builder
 	var hasToolCalls bool
-	// We append turn evaluation prompt for the analyzer logic
 	messages := ms.session.GetContextCopy()
 
 	type pendingToolResult struct {
