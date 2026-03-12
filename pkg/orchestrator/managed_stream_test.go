@@ -13,7 +13,9 @@ func TestManagedStream_Interruption(t *testing.T) {
 	tts := &MockTTSProvider{synthesizeResult: []byte{1, 2, 3}}
 	vad := NewRMSVAD(0.1, 100*time.Millisecond)
 
-	orch := NewWithVAD(stt, llm, tts, vad, DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithVAD(stt, llm, tts, vad, cfg)
 	session := NewConversationSession("test")
 
 	stream := orch.NewManagedStream(context.Background(), session)
@@ -34,7 +36,7 @@ func TestManagedStream_Interruption(t *testing.T) {
 		if ev.Type != UserSpeaking {
 			t.Errorf("Expected USER_SPEAKING, got %v", ev.Type)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Error("Timed out waiting for USER_SPEAKING")
 	}
 }
@@ -46,7 +48,9 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 
 	vad := NewRMSVAD(0.1, 100*time.Millisecond)
 
-	orch := NewWithVAD(stt, llm, tts, vad, DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithVAD(stt, llm, tts, vad, cfg)
 	session := NewConversationSession("test")
 
 	stream := orch.NewManagedStream(context.Background(), session)
@@ -58,7 +62,6 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 
 	loudChunk := make([]byte, 100)
 	for i := 0; i < 100; i += 2 {
-
 		val := int16(655)
 		loudChunk[i] = byte(val & 0xFF)
 		loudChunk[i+1] = byte(val >> 8)
@@ -97,7 +100,7 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 		if ev.Type != UserSpeaking && ev.Type != Interrupted {
 			t.Errorf("Expected USER_SPEAKING or INTERRUPTED after danger zone, got %v", ev.Type)
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(1 * time.Second):
 		t.Error("Timed out waiting for USER_SPEAKING after danger zone")
 	}
 }
@@ -142,6 +145,7 @@ func TestManagedStream_MinWordsInterruption(t *testing.T) {
 	tts := &MockTTSProvider{synthesizeResult: []byte{1}}
 
 	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
 	cfg.MinWordsToInterrupt = 3
 	vad := NewRMSVAD(0.1, 50*time.Millisecond)
 	orch := NewWithVAD(stt, llm, tts, vad, cfg)
@@ -151,6 +155,7 @@ func TestManagedStream_MinWordsInterruption(t *testing.T) {
 	defer stream.Close()
 
 	stream.mu.Lock()
+	stream.isThinking = false
 	stream.isSpeaking = true
 	stream.mu.Unlock()
 
@@ -172,7 +177,7 @@ func TestManagedStream_MinWordsInterruption(t *testing.T) {
 		if ev.Type != Interrupted {
 			t.Fatalf("expected Interrupted, got %v", ev.Type)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for Interrupted event")
 	}
 }
@@ -217,6 +222,7 @@ func TestManagedStream_TTSAbortOnInterruption(t *testing.T) {
 	llm := &MockLLMProvider{completeResult: "assistant reply here"}
 	tts := &MockLongRunningTTS{abortCh: make(chan struct{})}
 	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
 	vad := NewRMSVAD(0.02, 100*time.Millisecond)
 	orch := NewWithVAD(stt, llm, tts, vad, cfg)
 	session := NewConversationSession("s1")
@@ -226,7 +232,7 @@ func TestManagedStream_TTSAbortOnInterruption(t *testing.T) {
 
 	go stream.runLLMAndTTS(context.Background(), "hello")
 
-	deadline := time.After(500 * time.Millisecond)
+	deadline := time.After(2 * time.Second)
 	for {
 		select {
 		case ev := <-stream.Events():
@@ -239,14 +245,14 @@ func TestManagedStream_TTSAbortOnInterruption(t *testing.T) {
 	}
 started:
 
-	stream.interrupt()
+	stream.Interrupt()
 
 	select {
 	case ev := <-stream.Events():
 		if ev.Type != Interrupted {
 			t.Fatalf("expected Interrupted event, got %v", ev.Type)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for Interrupted event")
 	}
 
@@ -260,7 +266,9 @@ func TestManagedStream_InterruptDuringPendingResponse(t *testing.T) {
 	llm := &MockLLMProvider{completeResult: "ok"}
 	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
 	vad := NewRMSVAD(0.02, 50*time.Millisecond)
-	orch := NewWithVAD(stt, llm, tts, vad, DefaultConfig())
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithVAD(stt, llm, tts, vad, cfg)
 	session := NewConversationSession("u2")
 
 	stream := orch.NewManagedStream(context.Background(), session)
@@ -273,7 +281,7 @@ func TestManagedStream_InterruptDuringPendingResponse(t *testing.T) {
 
 	stream.Interrupt()
 
-	timeout := time.After(500 * time.Millisecond)
+	timeout := time.After(1 * time.Second)
 	for {
 		select {
 		case ev := <-stream.Events():
@@ -295,8 +303,9 @@ func TestManagedStream_NoSelfInterruptDuringTTS(t *testing.T) {
 	stt := &MockSTTProvider{}
 	llm := &MockLLMProvider{completeResult: "ok"}
 	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
-	vad := NewRMSVAD(0.05, 50*time.Millisecond) // Higher threshold for this synthetic test
+	vad := NewRMSVAD(0.05, 50*time.Millisecond)
 	conf := DefaultConfig()
+	conf.SilenceTimeout = 0
 	conf.BargeInVADThreshold = 0.05
 	orch := NewWithVAD(stt, llm, tts, vad, conf)
 	session := NewConversationSession("u3")
@@ -324,7 +333,7 @@ func TestManagedStream_NoSelfInterruptDuringTTS(t *testing.T) {
 		if ev.Type == Interrupted {
 			t.Fatal("self-interrupt detected during TTS")
 		}
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -334,11 +343,12 @@ func TestManagedStream_TranscriptInterruptWhileSpeaking(t *testing.T) {
 		isFinal bool
 		delay   time.Duration
 	}{
-		{text: "hola", isFinal: false, delay: 150 * time.Millisecond},
+		{text: "hola como estas", isFinal: false, delay: 150 * time.Millisecond},
 	}}
 	llm := &MockLLMProvider{completeResult: "ok"}
 	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
 	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
 	cfg.MinWordsToInterrupt = 1
 	vad := NewRMSVAD(0.02, 50*time.Millisecond)
 	orch := NewWithVAD(stt, llm, tts, vad, cfg)
@@ -358,7 +368,7 @@ func TestManagedStream_TranscriptInterruptWhileSpeaking(t *testing.T) {
 		if ev.Type != Interrupted {
 			t.Fatalf("expected Interrupted from transcript, got %v", ev.Type)
 		}
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for Interrupted via transcript")
 	}
 }

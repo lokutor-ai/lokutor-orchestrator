@@ -52,6 +52,8 @@ type ManagedStream struct {
 	writeChan        chan []byte
 	isClosed         bool
 	lastNoSpeechProb float64
+	inPreemptiveTurn bool
+	lastActivityAt   time.Time
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -77,9 +79,11 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		vad:            streamVAD,
 		echoSuppressor: NewEchoSuppressorWithConfig(config),
 		writeChan:      make(chan []byte, 512),
+		lastActivityAt: time.Now(),
 	}
 
 	go ms.processBackgroundAudio()
+	go ms.monitorInactivity()
 
 	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
 		go func() {
@@ -122,10 +126,7 @@ func (ms *ManagedStream) IsUserSpeaking() bool {
 	if ms.vad == nil {
 		return false
 	}
-	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
-		return rmsVAD.IsSpeaking()
-	}
-	return false
+	return ms.vad.IsSpeaking()
 }
 
 func (ms *ManagedStream) SetEchoSampleRates(playbackRate, inputRate int) {
@@ -149,7 +150,7 @@ func countWords(s string) int {
 	return len(strings.Fields(s))
 }
 
-const speechEndHold = 150 * time.Millisecond
+const speechEndHold = 50 * time.Millisecond
 
 func (ms *ManagedStream) Write(chunk []byte) error {
 	// We MUST copy the chunk here because the caller (main.go) will recycle the
@@ -195,7 +196,9 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 		case VADSpeechStart:
 			ms.mu.Lock()
-			ms.userSpeechStartTime = time.Now()
+			if ms.userSpeechStartTime.IsZero() {
+				ms.userSpeechStartTime = time.Now()
+			}
 			ms.mu.Unlock()
 
 			// We now emit UserSpeaking on a confirmed start to prevent glitchy pausing
@@ -218,7 +221,6 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 			ms.ttsEndTime = time.Time{}
 			ms.botSpeakStartTime = time.Time{}
 			ms.lastAudioSentAt = time.Time{}
-			ms.lastUserAudio = nil
 			ms.mu.Unlock()
 
 			if pipelineCancel != nil {
@@ -246,7 +248,6 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 			} else {
 				audioData := make([]byte, ms.audioBuf.Len())
 				copy(audioData, ms.audioBuf.Bytes())
-				ms.audioBuf.Reset()
 				ms.mu.Unlock()
 
 				go func(buf []byte) {
@@ -257,10 +258,12 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 					// Fast-path: if the sound was very short, don't wait for another second
 					// to see if the user continues. It's likely just noise.
 					if duration < 400*time.Millisecond {
+						fmt.Printf("\r\033[K[DEBUG] Turn too short (%v), runBatchPipeline now\n", duration)
 						ms.runBatchPipeline(buf)
 						return
 					}
 
+					fmt.Printf("\r\033[K[DEBUG] Waiting for speechEndHold (%v) before runBatchPipeline\n", speechEndHold)
 					t := time.NewTimer(speechEndHold)
 					defer t.Stop()
 
@@ -268,12 +271,12 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 					case <-t.C:
 						if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
 							if rmsVAD.IsSpeaking() {
-								ms.mu.Lock()
-								ms.audioBuf.Write(buf)
-								ms.mu.Unlock()
+								fmt.Printf("\r\033[K[DEBUG] User resumed speaking before timer fired, skipping runBatchPipeline\n")
+								// No need to write back, we never Reset() audioBuf in the 244 branch now
 								return
 							}
 						}
+						fmt.Printf("\r\033[K[DEBUG] Timer fired, running runBatchPipeline with %d bytes\n", len(buf))
 						ms.runBatchPipeline(buf)
 					case <-ms.ctx.Done():
 						return
@@ -285,9 +288,9 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		}
 	}
 
-	isUserSpeaking := false
-	if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
-		isUserSpeaking = rmsVAD.IsSpeaking()
+	isUserSpeaking := ms.vad.IsSpeaking()
+	if isUserSpeaking {
+		ms.updateActivity()
 	}
 
 	cleanChunk := chunk
@@ -299,7 +302,8 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 	ms.mu.Lock()
 	ms.audioBuf.Write(cleanChunk)
 	// Keep maximum 4 seconds of pristine audio (176400 bytes). Must slice on an EVEN byte boundary (2-byte samples).
-	if !isUserSpeaking && ms.audioBuf.Len() > 176400 {
+	// Crucially, only trim if we are NOT in the middle of a turn.
+	if !isUserSpeaking && ms.userSpeechStartTime.IsZero() && ms.audioBuf.Len() > 176400 {
 		data := ms.audioBuf.Bytes()
 		// Safe lead-in size (3 seconds = 132300 bytes). This is evenly divisible by 2.
 		leadIn := data[len(data)-132300:]
@@ -316,6 +320,22 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 	if sttChan != nil {
 		toSend := make([]byte, len(cleanChunk))
 		copy(toSend, cleanChunk)
+
+		// VAD Watchdog: If we've been transcribing for more than 15s without a VADSpeechEnd, 
+		// force a commit to prevent getting stuck in noise.
+		ms.mu.Lock()
+		startTime := ms.userSpeechStartTime
+		ms.mu.Unlock()
+		if !startTime.IsZero() && time.Since(startTime) > 15*time.Second {
+			fmt.Printf("\r\033[K[DEBUG] VAD Watchdog fired (15s speech segment). Forcing speech end.\n")
+			ms.mu.Lock()
+			ms.userSpeechEndTime = time.Now()
+			ms.sttChan = nil
+			ms.mu.Unlock()
+			close(sttChan)
+			return nil
+		}
+
 		select {
 		case sttChan <- toSend:
 		default:
@@ -337,7 +357,8 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 	}
 
 	// Very short audio with minimal transcription is usually a hallucination from a click/breath
-	if audioDuration < 800*time.Millisecond && len(clean) <= 15 {
+	// But we lower this to be more inclusive of short words like "Yes" or "No".
+	if audioDuration < 400*time.Millisecond && len(clean) <= 5 {
 		return true
 	}
 	return false
@@ -358,7 +379,7 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 		isStale := ms.sttGeneration != currentGeneration
 		ms.mu.Unlock()
 
-		if isStale {
+		if isStale && !isFinal {
 			return nil
 		}
 
@@ -405,7 +426,15 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 			}
 
 			ms.emit(TranscriptFinal, transcript)
-			ms.session.AddMessage("user", transcript)
+			ms.mu.Lock()
+			if ms.inPreemptiveTurn {
+				ms.mu.Unlock()
+				ms.session.UpdateLastUserMessage(transcript)
+			} else {
+				ms.inPreemptiveTurn = true
+				ms.mu.Unlock()
+				ms.session.AddMessage("user", transcript)
+			}
 
 			go ms.runLLMAndTTS(ctx, transcript)
 		} else {
@@ -434,8 +463,7 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 	if ms.audioBuf.Len() > 0 {
 		data := make([]byte, ms.audioBuf.Len())
 		copy(data, ms.audioBuf.Bytes())
-		ms.lastUserAudio = make([]byte, len(data))
-		copy(ms.lastUserAudio, data)
+		ms.lastUserAudio = append(ms.lastUserAudio, data...)
 		ms.audioBuf.Reset()
 		ms.mu.Unlock()
 		select {
@@ -451,28 +479,39 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 	// DO NOT interrupt here. Wait for a valid transcript first!
 
 	ms.mu.Lock()
-	ctx, cancel := context.WithCancel(ms.ctx)
+	previousCancel := ms.pipelineCancel
+	ctx, cancel := context.WithTimeout(ms.ctx, 15*time.Second)
+	
 	ms.pipelineCtx = ctx
 	ms.pipelineCancel = cancel
 	ms.sttStartTime = time.Now()
 	ms.lastUserAudio = make([]byte, len(audioData))
 	copy(ms.lastUserAudio, audioData)
 	ms.mu.Unlock()
+	
+	if previousCancel != nil {
+		previousCancel()
+	}
 	defer cancel()
 
 	ms.mu.Lock()
 	ms.sttRequestStartTime = time.Now()
 	ms.mu.Unlock()
+	fmt.Printf("\r\033[K[DEBUG] Calling Transcribe for %d bytes\n", len(audioData))
 	result, err := ms.orch.Transcribe(ctx, audioData, ms.session.GetCurrentLanguage())
 	ms.mu.Lock()
 	if err == nil {
+		fmt.Printf("\r\033[K[DEBUG] Transcribe returned: '%s' (prob=%.2f)\n", result.Text, result.NoSpeechProb)
 		ms.sttEndTime = time.Now()
 		ms.lastNoSpeechProb = result.NoSpeechProb
+	} else {
+		fmt.Printf("\r\033[K[DEBUG] Transcribe error: %v\n", err)
 	}
 	ms.mu.Unlock()
 
 	if err != nil {
 		if ctx.Err() == nil {
+			fmt.Printf("\r\033[K[DEBUG] Transcribe error: %v\n", err)
 			ms.emit(ErrorEvent, fmt.Sprintf("transcription error: %v", err))
 		}
 		return
@@ -518,13 +557,25 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 	}
 
 	ms.emit(TranscriptFinal, transcript)
-	ms.session.AddMessage("user", transcript)
+	ms.mu.Lock()
+	if ms.inPreemptiveTurn {
+		ms.mu.Unlock()
+		ms.session.UpdateLastUserMessage(transcript)
+	} else {
+		ms.inPreemptiveTurn = true
+		ms.mu.Unlock()
+		ms.session.AddMessage("user", transcript)
+	}
 
 	ms.runLLMAndTTS(ctx, transcript)
 }
 
 func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.mu.Lock()
+	if ms.orch == nil || ms.session == nil {
+		ms.mu.Unlock()
+		return
+	}
 
 	if ms.responseCancel != nil {
 		ms.responseCancel()
@@ -563,6 +614,9 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.mu.Unlock()
 
 	if err != nil {
+		ms.mu.Lock()
+		ms.isThinking = false
+		ms.mu.Unlock()
 		if rCtx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("LLM error: %v", err))
 		}
@@ -630,7 +684,11 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 	})
 
 	if err != nil {
+		ms.mu.Lock()
+		ms.isThinking = false
+		ms.mu.Unlock()
 		if ctx.Err() == nil {
+			fmt.Printf("\r\033[K[DEBUG] Streaming LLM error: %v\n", err)
 			ms.emit(ErrorEvent, fmt.Sprintf("Streaming LLM error: %v", err))
 		}
 		return
@@ -704,7 +762,18 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 	ms.ttsCancel = sCancel
 	ms.botSpeakStartTime = time.Now()
 	ms.ttsStartTime = ms.botSpeakStartTime
-	ms.audioBuf.Reset()
+
+	// Only reset the user audio buffer if we are NOT currently being interrupted
+	// or if the user hasn't already started a new turn.
+	if ms.vad == nil || !ms.vad.IsSpeaking() {
+		fmt.Printf("\r\033[K[DEBUG] Resetting audio buffer at start of bot speech\n")
+		ms.audioBuf.Reset()
+		ms.lastUserAudio = nil
+		ms.userSpeechStartTime = time.Time{}
+		ms.inPreemptiveTurn = false
+	} else {
+		fmt.Printf("\r\033[K[DEBUG] NOT resetting audio buffer - user is already speaking!\n")
+	}
 	ms.mu.Unlock()
 
 	ms.emit(BotSpeaking, nil)
@@ -900,6 +969,9 @@ func (ms *ManagedStream) Close() {
 }
 
 func (ms *ManagedStream) emit(eventType EventType, data interface{}) {
+	if eventType != AudioChunk {
+		ms.updateActivity()
+	}
 	ms.mu.Lock()
 	gen := ms.payloadGen
 	ms.mu.Unlock()
@@ -928,17 +1000,20 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		}
 	}
 
-	event := OrchestratorEvent{
-		Type:       eventType,
-		SessionID:  ms.session.ID,
-		Data:       data,
-		Generation: gen,
-	}
+	sessionID := ms.session.ID
+	ms.mu.Unlock()
 
 	defer func() {
 		if r := recover(); r != nil {
 		}
 	}()
+
+	event := OrchestratorEvent{
+		Type:       eventType,
+		SessionID:  sessionID,
+		Data:       data,
+		Generation: gen,
+	}
 
 	if eventType == AudioChunk {
 		select {
@@ -953,7 +1028,6 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		case <-ms.ctx.Done():
 		}
 	}
-	ms.mu.Unlock()
 }
 
 func (ms *ManagedStream) interrupt() {
@@ -974,6 +1048,8 @@ func (ms *ManagedStream) internalInterrupt() {
 
 	responseCancel := ms.responseCancel
 	ttsCancel := ms.ttsCancel
+
+	ms.lastActivityAt = time.Now()
 
 	ms.responseCancel = nil
 	ms.ttsCancel = nil
@@ -1041,4 +1117,76 @@ DrainDone:
 		default:
 		}
 	}
+}
+
+func (ms *ManagedStream) updateActivity() {
+	ms.mu.Lock()
+	ms.lastActivityAt = time.Now()
+	ms.mu.Unlock()
+}
+
+func (ms *ManagedStream) monitorInactivity() {
+	ms.mu.Lock()
+	timeout := 10 * time.Second
+	if ms.orch != nil {
+		timeout = ms.orch.config.SilenceTimeout
+	}
+	ms.mu.Unlock()
+
+	if timeout <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ms.ctx.Done():
+			return
+		case <-ticker.C:
+			ms.mu.Lock()
+			thinking := ms.isThinking
+			speaking := ms.isSpeaking
+			userSpeaking := false
+			if ms.vad != nil {
+				userSpeaking = ms.vad.IsSpeaking()
+			}
+			lastActivity := ms.lastActivityAt
+			closed := ms.isClosed
+			ms.mu.Unlock()
+
+			if closed {
+				return
+			}
+
+			// If nobody is doing anything for the timeout period, trigger a re-prompt.
+			if !thinking && !speaking && !userSpeaking {
+				if time.Since(lastActivity) > timeout {
+					ms.updateActivity() // Prevent spamming
+					fmt.Printf("\r\033[K[DEBUG] Inactivity guard fired (%v silence). Reprompting...\n", timeout)
+
+					// We inject a hidden user message [SILENCE] to trigger a natural follow-up
+					go ms.runSilenceCheck()
+				}
+			}
+		}
+	}
+}
+
+func (ms *ManagedStream) runSilenceCheck() {
+	ms.mu.Lock()
+	if ms.orch == nil || ms.orch.llm == nil {
+		ms.mu.Unlock()
+		return
+	}
+	if ms.isThinking || ms.isSpeaking || (ms.vad != nil && ms.vad.IsSpeaking()) {
+		ms.mu.Unlock()
+		return
+	}
+	ctx := ms.ctx
+	ms.mu.Unlock()
+
+	// Ask the LLM to handle the silence naturally
+	ms.runLLMAndTTS(ctx, "[USER_SILENCE_TIMEOUT]")
 }

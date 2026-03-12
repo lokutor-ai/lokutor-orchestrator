@@ -58,6 +58,7 @@ type TTSProvider interface {
 
 type VADProvider interface {
 	Process(chunk []byte) (*VADEvent, error)
+	IsSpeaking() bool
 	Reset()
 	Clone() VADProvider
 	Name() string
@@ -170,6 +171,7 @@ type Config struct {
 	BargeInVADTrailWindow    time.Duration
 	EchoSuppressionThreshold float64
 	FirstSpeaker             FirstSpeaker
+	SilenceTimeout           time.Duration
 }
 
 func DefaultConfig() Config {
@@ -188,6 +190,7 @@ func DefaultConfig() Config {
 		BargeInVADTrailWindow:    1500 * time.Millisecond,
 		EchoSuppressionThreshold: 0.35,
 		FirstSpeaker:             FirstSpeakerBot,
+		SilenceTimeout:           0,
 	}
 }
 
@@ -229,6 +232,21 @@ func (s *ConversationSession) AddMessageRaw(msg Message) {
 	} else if msg.Role == "assistant" && msg.Content != "" {
 		s.LastAssistant = msg.Content
 	}
+}
+
+func (s *ConversationSession) UpdateLastUserMessage(content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.Context) - 1; i >= 0; i-- {
+		if s.Context[i].Role == "user" {
+			s.Context[i].Content = content
+			s.LastUser = content
+			return
+		}
+	}
+	// Fallback if no user message found
+	s.Context = append(s.Context, Message{Role: "user", Content: content})
+	s.LastUser = content
 }
 
 func (s *ConversationSession) SetTools(tools []Tool) {

@@ -118,6 +118,7 @@ func main() {
 
 	config := orchestrator.DefaultConfig()
 	config.Language = lang
+	config.SilenceTimeout = 10 * time.Second
 
 	firstSpeaker := os.Getenv("FIRST_SPEAKER")
 	if firstSpeaker == "bot" {
@@ -134,7 +135,7 @@ func main() {
 	tts := ttsProvider.NewLokutorTTS(lokutorKey)
 
 	// Advanced VAD with ZCR and Peak tracking for better noise rejection.
-	vad := orchestrator.NewImprovedRMSVAD(config.BargeInVADThreshold, 250*time.Millisecond, SampleRate)
+	vad := orchestrator.NewImprovedRMSVAD(config.BargeInVADThreshold, 200*time.Millisecond, SampleRate)
 	// Wait for ~80ms of continuous energy before muting (8 * 10ms frame size).
 	// This filters out tiny spikes (keyboard clicks, desk bumps) while remaining fast.
 	vad.SetMinConfirmed(2)
@@ -167,11 +168,13 @@ func main() {
 
 	systemPrompt := "You are a helpful and concise voice assistant. " +
 		"This is a real-time conversational phone call. " +
-		"Use short sentences suitable for speech."
+		"Use short sentences suitable for speech. " +
+		"If the user is silent for a long time, you will receive '[USER_SILENCE_TIMEOUT]'. In that case, briefly check if they are still there or if they need anything else."
 	if lang == orchestrator.LanguageEs {
 		systemPrompt = "Eres un asistente de voz útil y conciso. " +
 			"Esta es una llamada telefónica conversacional en tiempo real. " +
-			"Usa frases cortas adecuadas para el habla."
+			"Usa frases cortas adecuadas para el habla. " +
+			"Si el usuario está en silencio por mucho tiempo, recibirás '[USER_SILENCE_TIMEOUT]'. En ese caso, pregunta brevemente si siguen ahí o si necesitan algo más."
 	}
 	orch.SetSystemPrompt(session, systemPrompt)
 
@@ -276,8 +279,12 @@ func main() {
 					if bd.UserToPlay > 0 {
 						fmt.Printf("\r\033[K⏱️  [REPORT] Pipe_Ready: %dms | STT_Net: %dms | LLM_1st_Net: %dms | TTS_1st_Net: %dms\n", 
 							bd.BotStartLatency, bd.STT, bd.LLM, bd.LLMToTTSFirstByte)
-						fmt.Printf("\r\033[K⏱️  [E2E] User_Stop -> Play: %dms | TTS_Total: %dms | Prob: %.2f\n",
-							bd.UserToPlay, bd.TTSTotal, bd.NoSpeechProb)
+						probStr := ""
+						if bd.NoSpeechProb > 0.01 {
+							probStr = fmt.Sprintf(" | Prob: %.2f", bd.NoSpeechProb)
+						}
+						fmt.Printf("\r\033[K⏱️  [E2E] User_Stop -> Play: %dms | TTS_Total: %dms%s\n",
+							bd.UserToPlay, bd.TTSTotal, probStr)
 						e2eLogged = true
 					}
 				}
