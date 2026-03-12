@@ -20,33 +20,33 @@ type ManagedStream struct {
 	audioBuf *bytes.Buffer
 	mu       sync.Mutex
 
-	pipelineCtx       context.Context
-	pipelineCancel    context.CancelFunc
-	sttChan           chan<- []byte
-	sttGeneration     int
-	isSpeaking        bool
-	isThinking        bool
-	lastAudioSentAt   time.Time
+	pipelineCtx         context.Context
+	pipelineCancel      context.CancelFunc
+	sttChan             chan<- []byte
+	sttGeneration       int
+	isSpeaking          bool
+	isThinking          bool
+	lastAudioSentAt     time.Time
 	userSpeechStartTime time.Time
 	userSpeechEndTime   time.Time
 	botSpeakStartTime   time.Time
 
 	lastUserAudio []byte
 
-	sttStartTime      time.Time
+	sttStartTime        time.Time
 	sttRequestStartTime time.Time
-	sttEndTime        time.Time
-	llmStartTime      time.Time
-	llmEndTime        time.Time
-	ttsStartTime      time.Time
-	ttsFirstChunkTime time.Time
-	ttsEndTime        time.Time
+	sttEndTime          time.Time
+	llmStartTime        time.Time
+	llmEndTime          time.Time
+	ttsStartTime        time.Time
+	ttsFirstChunkTime   time.Time
+	ttsEndTime          time.Time
 
-	responseCancel     context.CancelFunc
-	ttsCancel          context.CancelFunc
-	userInterrupting   bool
-	echoSuppressor     *EchoSuppressor
-	closeOnce          sync.Once
+	responseCancel   context.CancelFunc
+	ttsCancel        context.CancelFunc
+	userInterrupting bool
+	echoSuppressor   *EchoSuppressor
+	closeOnce        sync.Once
 
 	payloadGen       int
 	writeChan        chan []byte
@@ -90,7 +90,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 				greeting = "¡Hola!"
 			}
 			ms.session.AddMessage("assistant", greeting)
-			ms.runLLMAndTTS(ms.ctx, greeting) 
+			ms.runLLMAndTTS(ms.ctx, greeting)
 		}()
 	}
 
@@ -149,16 +149,16 @@ func countWords(s string) int {
 	return len(strings.Fields(s))
 }
 
-const speechEndHold = 1000 * time.Millisecond
+const speechEndHold = 150 * time.Millisecond
 
 func (ms *ManagedStream) Write(chunk []byte) error {
-	// We MUST copy the chunk here because the caller (main.go) will recycle the 
+	// We MUST copy the chunk here because the caller (main.go) will recycle the
 	// underlying buffer into the sync.Pool as soon as this function returns.
 	// Without this copy, doWrite() would be processing memory that is being
 	// simultaneously overwritten by the microphone callback.
 	buf := make([]byte, len(chunk))
 	copy(buf, chunk)
-	
+
 	ms.writeChan <- buf
 	return nil
 }
@@ -199,7 +199,7 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 			ms.mu.Unlock()
 
 			// We now emit UserSpeaking on a confirmed start to prevent glitchy pausing
-			ms.emit(UserSpeaking, nil) 
+			ms.emit(UserSpeaking, nil)
 
 			ms.mu.Lock()
 			ms.sttGeneration++
@@ -740,7 +740,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 	if ms.ttsCancel != nil {
 		// Only clear it if it's still pointing to our local cancel
 		// This is a bit tricky but simple enough for local logic
-		ms.ttsCancel = nil 
+		ms.ttsCancel = nil
 	}
 	ms.mu.Unlock()
 }
