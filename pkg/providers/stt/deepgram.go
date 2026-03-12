@@ -28,10 +28,10 @@ func (s *DeepgramSTT) Name() string {
 	return "deepgram-stt"
 }
 
-func (s *DeepgramSTT) Transcribe(ctx context.Context, audioPCM []byte, lang orchestrator.Language) (string, error) {
+func (s *DeepgramSTT) Transcribe(ctx context.Context, audioPCM []byte, lang orchestrator.Language) (orchestrator.TranscriptionResult, error) {
 	u, err := url.Parse(s.url)
 	if err != nil {
-		return "", err
+		return orchestrator.TranscriptionResult{}, err
 	}
 
 	params := u.Query()
@@ -44,7 +44,7 @@ func (s *DeepgramSTT) Transcribe(ctx context.Context, audioPCM []byte, lang orch
 
 	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(audioPCM))
 	if err != nil {
-		return "", err
+		return orchestrator.TranscriptionResult{}, err
 	}
 
 	req.Header.Set("Authorization", "Token "+s.apiKey)
@@ -52,13 +52,13 @@ func (s *DeepgramSTT) Transcribe(ctx context.Context, audioPCM []byte, lang orch
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return orchestrator.TranscriptionResult{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("deepgram error (status %d): %s", resp.StatusCode, string(respBody))
+		return orchestrator.TranscriptionResult{}, fmt.Errorf("deepgram error (status %d): %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
@@ -66,18 +66,23 @@ func (s *DeepgramSTT) Transcribe(ctx context.Context, audioPCM []byte, lang orch
 			Channels []struct {
 				Alternatives []struct {
 					Transcript string `json:"transcript"`
+					Confidence float64 `json:"confidence"`
 				} `json:"alternatives"`
 			} `json:"channels"`
 		} `json:"results"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return orchestrator.TranscriptionResult{}, err
 	}
 
 	if len(result.Results.Channels) == 0 || len(result.Results.Channels[0].Alternatives) == 0 {
-		return "", nil
+		return orchestrator.TranscriptionResult{}, nil
 	}
 
-	return result.Results.Channels[0].Alternatives[0].Transcript, nil
+	alt := result.Results.Channels[0].Alternatives[0]
+	return orchestrator.TranscriptionResult{
+		Text:         alt.Transcript,
+		NoSpeechProb: 1.0 - alt.Confidence,
+	}, nil
 }

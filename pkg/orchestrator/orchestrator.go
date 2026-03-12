@@ -75,19 +75,19 @@ func (o *Orchestrator) ProcessAudio(ctx context.Context, session *ConversationSe
 		return "", nil, fmt.Errorf("transcription failed: %w", err)
 	}
 
-	if strings.TrimSpace(transcript) == "" {
+	if strings.TrimSpace(transcript.Text) == "" {
 		o.logger.Warn("empty transcription received", "sessionID", session.ID)
 		return "", nil, ErrEmptyTranscription
 	}
 
-	o.logger.Info("transcription completed", "sessionID", session.ID, "length", len(transcript))
-	session.AddMessage("user", transcript)
+	o.logger.Info("transcription completed", "sessionID", session.ID, "length", len(transcript.Text))
+	session.AddMessage("user", transcript.Text)
 
 	
 	response, err := o.GenerateResponse(ctx, session)
 	if err != nil {
 		o.logger.Error("LLM generation failed", "sessionID", session.ID, "error", err)
-		return transcript, nil, fmt.Errorf("%w: %v", ErrLLMFailed, err)
+		return transcript.Text, nil, fmt.Errorf("%w: %v", ErrLLMFailed, err)
 	}
 
 	o.logger.Info("LLM response generated", "sessionID", session.ID, "length", len(response))
@@ -97,11 +97,11 @@ func (o *Orchestrator) ProcessAudio(ctx context.Context, session *ConversationSe
 	audioBytes, err := o.Synthesize(ctx, response, session.GetCurrentVoice(), session.GetCurrentLanguage())
 	if err != nil {
 		o.logger.Error("TTS synthesis failed", "sessionID", session.ID, "error", err)
-		return transcript, nil, fmt.Errorf("%w: %v", ErrTTSFailed, err)
+		return transcript.Text, nil, fmt.Errorf("%w: %v", ErrTTSFailed, err)
 	}
 
 	o.logger.Info("TTS synthesis completed", "sessionID", session.ID, "audioSize", len(audioBytes))
-	return transcript, audioBytes, nil
+	return transcript.Text, audioBytes, nil
 }
 
 
@@ -112,19 +112,19 @@ func (o *Orchestrator) ProcessAudioStream(ctx context.Context, session *Conversa
 		return "", fmt.Errorf("transcription failed: %w", err)
 	}
 
-	if strings.TrimSpace(transcript) == "" {
+	if strings.TrimSpace(transcript.Text) == "" {
 		o.logger.Warn("empty transcription received", "sessionID", session.ID)
 		return "", ErrEmptyTranscription
 	}
 
-	o.logger.Info("transcription completed", "sessionID", session.ID, "length", len(transcript))
-	session.AddMessage("user", transcript)
+	o.logger.Info("transcription completed", "sessionID", session.ID, "length", len(transcript.Text))
+	session.AddMessage("user", transcript.Text)
 
 	
 	response, err := o.GenerateResponse(ctx, session)
 	if err != nil {
 		o.logger.Error("LLM generation failed", "sessionID", session.ID, "error", err)
-		return transcript, fmt.Errorf("%w: %v", ErrLLMFailed, err)
+		return transcript.Text, fmt.Errorf("%w: %v", ErrLLMFailed, err)
 	}
 
 	o.logger.Info("LLM response generated", "sessionID", session.ID, "length", len(response))
@@ -134,15 +134,15 @@ func (o *Orchestrator) ProcessAudioStream(ctx context.Context, session *Conversa
 	err = o.SynthesizeStream(ctx, response, session.GetCurrentVoice(), session.GetCurrentLanguage(), onAudioChunk)
 	if err != nil {
 		o.logger.Error("TTS streaming failed", "sessionID", session.ID, "error", err)
-		return transcript, fmt.Errorf("%w: %v", ErrTTSFailed, err)
+		return transcript.Text, fmt.Errorf("%w: %v", ErrTTSFailed, err)
 	}
 
 	o.logger.Info("TTS streaming completed", "sessionID", session.ID)
-	return transcript, nil
+	return transcript.Text, nil
 }
 
 
-func (o *Orchestrator) Transcribe(ctx context.Context, audioData []byte, lang Language) (string, error) {
+func (o *Orchestrator) Transcribe(ctx context.Context, audioData []byte, lang Language) (TranscriptionResult, error) {
 	return o.stt.Transcribe(ctx, audioData, lang)
 }
 
@@ -202,8 +202,17 @@ func (o *Orchestrator) NewSessionWithDefaults(userID string) *ConversationSessio
 
 
 
+const VoiceUXInstructionsEn = "\n\nIMPORTANT: Real-time voice mode. Avoid silence. If you need to use a tool, say a very brief filler sentence first (e.g., 'Let me check that.', 'One moment.') so the user knows you are working."
+const VoiceUXInstructionsEs = "\n\nIMPORTANTE: Modo de voz en tiempo real. Evita silencios. Si vas a usar una herramienta, di primero una frase muy breve (ej: 'Un momento.', 'Déjame consultarlo.') para que el usuario sepa que estás trabajando."
+
 func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt string) {
-	session.AddMessage("system", prompt)
+	fullPrompt := prompt
+	if session.CurrentLanguage == LanguageEs {
+		fullPrompt += VoiceUXInstructionsEs
+	} else {
+		fullPrompt += VoiceUXInstructionsEn
+	}
+	session.AddMessage("system", fullPrompt)
 }
 
 

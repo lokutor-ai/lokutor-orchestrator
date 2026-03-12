@@ -25,34 +25,34 @@ func (s *AssemblyAISTT) Name() string {
 	return "assemblyai-stt"
 }
 
-func (s *AssemblyAISTT) Transcribe(ctx context.Context, audioPCM []byte, lang orchestrator.Language) (string, error) {
+func (s *AssemblyAISTT) Transcribe(ctx context.Context, audioPCM []byte, lang orchestrator.Language) (orchestrator.TranscriptionResult, error) {
 	
 	uploadURL, err := s.upload(ctx, audioPCM)
 	if err != nil {
-		return "", err
+		return orchestrator.TranscriptionResult{}, err
 	}
 
 	
 	transcriptID, err := s.submit(ctx, uploadURL, lang)
 	if err != nil {
-		return "", err
+		return orchestrator.TranscriptionResult{}, err
 	}
 
 	
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return orchestrator.TranscriptionResult{}, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
-			text, status, err := s.getTranscript(ctx, transcriptID)
+			res, status, err := s.getTranscript(ctx, transcriptID)
 			if err != nil {
-				return "", err
+				return orchestrator.TranscriptionResult{}, err
 			}
 			if status == "completed" {
-				return text, nil
+				return res, nil
 			}
 			if status == "error" {
-				return "", fmt.Errorf("assemblyai transcription failed")
+				return orchestrator.TranscriptionResult{}, fmt.Errorf("assemblyai transcription failed")
 			}
 		}
 	}
@@ -104,20 +104,24 @@ func (s *AssemblyAISTT) submit(ctx context.Context, uploadURL string, lang orche
 	return result.ID, nil
 }
 
-func (s *AssemblyAISTT) getTranscript(ctx context.Context, id string) (string, string, error) {
+func (s *AssemblyAISTT) getTranscript(ctx context.Context, id string) (orchestrator.TranscriptionResult, string, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.assemblyai.com/v2/transcript/"+id, nil)
 	req.Header.Set("Authorization", s.apiKey)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", "", err
+		return orchestrator.TranscriptionResult{}, "", err
 	}
 	defer resp.Body.Close()
 
 	var result struct {
-		Status string `json:"status"`
-		Text   string `json:"text"`
+		Status     string  `json:"status"`
+		Text       string  `json:"text"`
+		Confidence float64 `json:"confidence"`
 	}
 	json.NewDecoder(resp.Body).Decode(&result)
-	return result.Text, result.Status, nil
+	return orchestrator.TranscriptionResult{
+		Text:         result.Text,
+		NoSpeechProb: 1.0 - result.Confidence,
+	}, result.Status, nil
 }

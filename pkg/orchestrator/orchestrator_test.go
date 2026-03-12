@@ -10,8 +10,8 @@ type MockSTTProvider struct {
 	transcribeErr    error
 }
 
-func (m *MockSTTProvider) Transcribe(ctx context.Context, audio []byte, lang Language) (string, error) {
-	return m.transcribeResult, m.transcribeErr
+func (m *MockSTTProvider) Transcribe(ctx context.Context, audio []byte, lang Language) (TranscriptionResult, error) {
+	return TranscriptionResult{Text: m.transcribeResult}, m.transcribeErr
 }
 
 func (m *MockSTTProvider) Name() string {

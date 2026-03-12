@@ -38,8 +38,8 @@ func TestOpenAISTT(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if result != "transcribed text" {
-		t.Errorf("expected 'transcribed text', got '%s'", result)
+	if result.Text != "transcribed text" {
+		t.Errorf("expected 'transcribed text', got '%s'", result.Text)
 	}
 
 	if s.Name() != "openai_stt" {

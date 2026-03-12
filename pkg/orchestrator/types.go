@@ -23,8 +23,13 @@ func (n *NoOpLogger) Info(msg string, args ...interface{})  {}
 func (n *NoOpLogger) Warn(msg string, args ...interface{})  {}
 func (n *NoOpLogger) Error(msg string, args ...interface{}) {}
 
+type TranscriptionResult struct {
+	Text         string
+	NoSpeechProb float64 // Probability that the audio contains no speech (0.0 to 1.0)
+}
+
 type STTProvider interface {
-	Transcribe(ctx context.Context, audio []byte, lang Language) (string, error)
+	Transcribe(ctx context.Context, audio []byte, lang Language) (TranscriptionResult, error)
 	Name() string
 }
 
@@ -61,9 +66,10 @@ type VADProvider interface {
 type VADEventType string
 
 const (
-	VADSpeechStart VADEventType = "SPEECH_START"
-	VADSpeechEnd   VADEventType = "SPEECH_END"
-	VADSilence     VADEventType = "SILENCE"
+	VADSpeechStart     VADEventType = "SPEECH_START"
+	VADSpeechPotential VADEventType = "SPEECH_POTENTIAL"
+	VADSpeechEnd       VADEventType = "SPEECH_END"
+	VADSilence         VADEventType = "SILENCE"
 )
 
 type VADEvent struct {

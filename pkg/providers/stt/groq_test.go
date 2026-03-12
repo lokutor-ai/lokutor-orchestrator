@@ -38,8 +38,8 @@ func TestGroqSTT(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if result != "groq transcription" {
-		t.Errorf("expected 'groq transcription', got '%s'", result)
+	if result.Text != "groq transcription" {
+		t.Errorf("expected 'groq transcription', got '%s'", result.Text)
 	}
 
 	s.SetSampleRate(16000)

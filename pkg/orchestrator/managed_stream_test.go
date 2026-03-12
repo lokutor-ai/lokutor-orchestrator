@@ -110,8 +110,8 @@ type MockStreamingSTT struct {
 	}
 }
 
-func (m *MockStreamingSTT) Transcribe(ctx context.Context, audio []byte, lang Language) (string, error) {
-	return "", nil
+func (m *MockStreamingSTT) Transcribe(ctx context.Context, audio []byte, lang Language) (TranscriptionResult, error) {
+	return TranscriptionResult{}, nil
 }
 func (m *MockStreamingSTT) Name() string { return "MockStreamingSTT" }
 func (m *MockStreamingSTT) StreamTranscribe(ctx context.Context, lang Language, onTranscript func(transcript string, isFinal bool) error) (chan<- []byte, error) {

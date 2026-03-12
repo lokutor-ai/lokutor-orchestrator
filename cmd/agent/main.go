@@ -133,8 +133,10 @@ func main() {
 
 	tts := ttsProvider.NewLokutorTTS(lokutorKey)
 
-	// Aggressive silence limit (250ms) to hit sub-300ms latency. 
-	vad := orchestrator.NewRMSVAD(config.BargeInVADThreshold, 250*time.Millisecond)
+	// Advanced VAD with ZCR and Peak tracking for better noise rejection.
+	vad := orchestrator.NewImprovedRMSVAD(config.BargeInVADThreshold, 250*time.Millisecond, SampleRate)
+	// Wait for ~80ms of continuous energy before muting (8 * 10ms frame size).
+	// This filters out tiny spikes (keyboard clicks, desk bumps) while remaining fast.
 	vad.SetMinConfirmed(2)
 
 	orch := orchestrator.NewWithVAD(stt, llm, tts, vad, config)
@@ -165,13 +167,11 @@ func main() {
 
 	systemPrompt := "You are a helpful and concise voice assistant. " +
 		"This is a real-time conversational phone call. " +
-		"Use short sentences suitable for speech. " +
-		"IMPORTANT: If you call a tool or function, you MUST always say a very brief sentence first (e.g. 'Let me check that.' or 'One moment.') before the tool call, so there is no silence."
+		"Use short sentences suitable for speech."
 	if lang == orchestrator.LanguageEs {
 		systemPrompt = "Eres un asistente de voz útil y conciso. " +
 			"Esta es una llamada telefónica conversacional en tiempo real. " +
-			"Usa frases cortas adecuadas para el habla. " +
-			"IMPORTANTE: Si llamas a una herramienta o función, SIEMPRE di antes una frase muy breve (por ejemplo 'Un momento.' o 'Déjame consultarlo.') antes de llamar la herramienta, para que no haya silencio."
+			"Usa frases cortas adecuadas para el habla."
 	}
 	orch.SetSystemPrompt(session, systemPrompt)
 
@@ -250,32 +250,34 @@ func main() {
 
 			}
 
-			if len(playbackBytes) == 0 || playbackPaused {
+			playedRealAudio := false
 
+			if len(playbackBytes) == 0 || playbackPaused {
 				for i := range pOutput {
 					pOutput[i] = 0
 				}
 			} else {
+				playedRealAudio = true
 				if len(playbackBytes) < bytesToRead {
-
 					copy(pOutput, playbackBytes)
 					for i := len(playbackBytes); i < bytesToRead; i++ {
 						pOutput[i] = 0
 					}
 					playbackBytes = nil
 				} else {
-
 					copy(pOutput, playbackBytes[:bytesToRead])
 					playbackBytes = playbackBytes[bytesToRead:]
 				}
 			}
 
 			if !preRolling {
-				if !e2eLogged {
+				if playedRealAudio && !e2eLogged {
 					bd := stream.GetLatencyBreakdown()
-					if bd.UserToPlay > 0 || bd.UserToTTSFirstByte > 0 || bd.UserToLLM > 0 || bd.UserToSTT > 0 {
-						fmt.Printf("\r\033[K⏱️ [LATENCY] user→stt=%dms stt=%dms user→llm=%dms llm=%dms user→tts_first=%dms llm→tts_first=%dms tts_total=%dms user→play=%dms\n",
-							bd.UserToSTT, bd.STT, bd.UserToLLM, bd.LLM, bd.UserToTTSFirstByte, bd.LLMToTTSFirstByte, bd.TTSTotal, bd.UserToPlay)
+					if bd.UserToPlay > 0 {
+						fmt.Printf("\r\033[K⏱️  [REPORT] Pipe_Ready: %dms | STT_Net: %dms | LLM_1st_Net: %dms | TTS_1st_Net: %dms\n", 
+							bd.BotStartLatency, bd.STT, bd.LLM, bd.LLMToTTSFirstByte)
+						fmt.Printf("\r\033[K⏱️  [E2E] User_Stop -> Play: %dms | TTS_Total: %dms | Prob: %.2f\n",
+							bd.UserToPlay, bd.TTSTotal, bd.NoSpeechProb)
 						e2eLogged = true
 					}
 				}
@@ -332,6 +334,11 @@ func main() {
 				currentGeneration = event.Generation
 				playbackMu.Unlock()
 				fmt.Printf("\r\033[K🛑 [INTERRUPTED] User started talking (gen: %d).\n", currentGeneration)
+			case orchestrator.BotResumed:
+				playbackMu.Lock()
+				playbackPaused = false
+				playbackMu.Unlock()
+				fmt.Printf("\r\033[K🔄 [RESUMED] User input was noise.\n")
 
 
 
@@ -370,18 +377,15 @@ func main() {
 				playbackMu.Lock()
 				playbackPaused = false
 				playbackMu.Unlock()
-				latency := stream.GetLatency()
-				if latency > 0 {
-					fmt.Printf("\r\033[K🔊 [TTS] Speaking... (latency: %dms)\n", latency)
-				} else {
-					fmt.Printf("\r\033[K🔊 [TTS] Speaking...\n")
-				}
-				// Add latency print here
+				
 				if !e2eLogged {
 					bd := stream.GetLatencyBreakdown()
-					if bd.UserToPlay > 0 || bd.UserToTTSFirstByte > 0 || bd.UserToLLM > 0 || bd.UserToSTT > 0 {
-						fmt.Printf("\r\033[K⏱️ [LATENCY] user→stt=%dms stt=%dms user→llm=%dms llm=%dms user→tts_first=%dms llm→tts_first=%dms tts_total=%dms user→play=%dms\n",
-							bd.UserToSTT, bd.STT, bd.UserToLLM, bd.LLM, bd.UserToTTSFirstByte, bd.LLMToTTSFirstByte, bd.TTSTotal, bd.UserToPlay)
+					if bd.UserToPlay > 0 {
+						fmt.Printf("\r\033[K🔊 [TTS] Speaking... (gen: %d)\n", event.Generation)
+						fmt.Printf("\r\033[K⏱️  [REPORT] Pipe_Ready: %dms | STT_Net: %dms | LLM_1st_Net: %dms | TTS_1st_Net: %dms\n", 
+							bd.BotStartLatency, bd.STT, bd.LLM, bd.LLMToTTSFirstByte)
+						fmt.Printf("\r\033[K⏱️  [E2E] User_Stop -> Play: %dms | TTS_Total: %dms | Prob: %.2f\n",
+							bd.UserToPlay, bd.TTSTotal, bd.NoSpeechProb)
 						e2eLogged = true
 					}
 				}
