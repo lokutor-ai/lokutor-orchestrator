@@ -54,6 +54,7 @@ type ManagedStream struct {
 	lastNoSpeechProb float64
 	inPreemptiveTurn bool
 	lastActivityAt   time.Time
+	playbackRate     int
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -80,6 +81,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		echoSuppressor: NewEchoSuppressorWithConfig(config),
 		writeChan:      make(chan []byte, 512),
 		lastActivityAt: time.Now(),
+		playbackRate:   44100, // Default to hifi
 	}
 
 	go ms.processBackgroundAudio()
@@ -130,6 +132,9 @@ func (ms *ManagedStream) IsUserSpeaking() bool {
 }
 
 func (ms *ManagedStream) SetEchoSampleRates(playbackRate, inputRate int) {
+	ms.mu.Lock()
+	ms.playbackRate = playbackRate
+	ms.mu.Unlock()
 	if ms.echoSuppressor != nil {
 		ms.echoSuppressor.SetSampleRates(playbackRate, inputRate)
 	}
@@ -208,8 +213,10 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 			ms.sttGeneration++
 			pipelineCancel := ms.pipelineCancel
 			sttChan := ms.sttChan
+			ttsCancel := ms.ttsCancel
 			ms.pipelineCancel = nil
 			ms.sttChan = nil
+			ms.ttsCancel = nil
 
 			ms.sttStartTime = time.Now()
 			ms.sttRequestStartTime = time.Time{}
@@ -223,6 +230,10 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 			ms.lastAudioSentAt = time.Time{}
 			ms.mu.Unlock()
 
+			// Stop TTS immediately on interrupt
+			if ttsCancel != nil {
+				ttsCancel()
+			}
 			if pipelineCancel != nil {
 				pipelineCancel()
 			}
@@ -257,7 +268,7 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 					// Fast-path: if the sound was very short, don't wait for another second
 					// to see if the user continues. It's likely just noise.
-					if duration < 400*time.Millisecond {
+					if duration < 500*time.Millisecond {
 						fmt.Printf("\r\033[K[DEBUG] Turn too short (%v), runBatchPipeline now\n", duration)
 						ms.runBatchPipeline(buf)
 						return
@@ -321,7 +332,7 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		toSend := make([]byte, len(cleanChunk))
 		copy(toSend, cleanChunk)
 
-		// VAD Watchdog: If we've been transcribing for more than 15s without a VADSpeechEnd, 
+		// VAD Watchdog: If we've been transcribing for more than 15s without a VADSpeechEnd,
 		// force a commit to prevent getting stuck in noise.
 		ms.mu.Lock()
 		startTime := ms.userSpeechStartTime
@@ -358,7 +369,7 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 
 	// Very short audio with minimal transcription is usually a hallucination from a click/breath
 	// But we lower this to be more inclusive of short words like "Yes" or "No".
-	if audioDuration < 400*time.Millisecond && len(clean) <= 5 {
+	if audioDuration < 500*time.Millisecond && len(clean) <= 5 {
 		return true
 	}
 	return false
@@ -447,11 +458,13 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 		// Just log or emit a warning, do not cancel the whole pipeline
 		// because the orchestrator will gracefully fall back to batch Transcribe.
 		fmt.Printf("Warning: could not start streaming STT (falling back to batch): %v\n", err)
-	} else {
 		ms.mu.Lock()
-		ms.sttChan = sttChan
+		ms.pipelineCtx = ctx
 		ms.pipelineCancel = cancel
+		ms.sttChan = nil
+		ms.sttStartTime = time.Now()
 		ms.mu.Unlock()
+		return
 	}
 
 	ms.mu.Lock()
@@ -460,15 +473,22 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 	ms.sttChan = sttChan
 	ms.sttStartTime = time.Now()
 
+	// Flush pre-buffered audio to STT channel with blocking send
+	// This ensures audio captured before VADSpeechStart is included in transcription
 	if ms.audioBuf.Len() > 0 {
 		data := make([]byte, ms.audioBuf.Len())
 		copy(data, ms.audioBuf.Bytes())
 		ms.lastUserAudio = append(ms.lastUserAudio, data...)
 		ms.audioBuf.Reset()
 		ms.mu.Unlock()
+		
+		// Use blocking send to ensure pre-buffered audio is not discarded
 		select {
 		case sttChan <- data:
-		default:
+			// Successfully sent buffered audio to STT
+		case <-ctx.Done():
+			// Context cancelled during buffer send
+			return
 		}
 	} else {
 		ms.mu.Unlock()
@@ -481,14 +501,14 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 	ms.mu.Lock()
 	previousCancel := ms.pipelineCancel
 	ctx, cancel := context.WithTimeout(ms.ctx, 15*time.Second)
-	
+
 	ms.pipelineCtx = ctx
 	ms.pipelineCancel = cancel
 	ms.sttStartTime = time.Now()
 	ms.lastUserAudio = make([]byte, len(audioData))
 	copy(ms.lastUserAudio, audioData)
 	ms.mu.Unlock()
-	
+
 	if previousCancel != nil {
 		previousCancel()
 	}
@@ -778,16 +798,21 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 
 	ms.emit(BotSpeaking, nil)
 
+	fmt.Printf("\r\033[K[DEBUG] Starting TTS synthesis for: %s\n", text)
 	err := ms.orch.SynthesizeStream(sCtx, text, ms.session.GetCurrentVoice(), ms.session.GetCurrentLanguage(), func(chunk []byte) error {
+		fmt.Printf("\r\033[K[DEBUG] TTS chunk received: %d bytes\n", len(chunk))
 		ms.mu.Lock()
 		ms.lastAudioSentAt = time.Now()
-		if ms.ttsFirstChunkTime.IsZero() {
-			ms.ttsFirstChunkTime = time.Now()
-		}
+		pRate := ms.playbackRate
 		gen := ms.payloadGen
 		ms.mu.Unlock()
 
-		frameSize := 1764 // 44100Hz * 0.02s * 2 bytes
+		// Calculate frame size for exactly 20ms at current playback rate
+		// (playbackRate * 0.02s * 2 bytes per sample)
+		frameSize := int(float64(pRate)*0.02) * 2
+		if frameSize <= 0 {
+			frameSize = 1764 // Fallback to 44.1k 20ms
+		}
 		for i := 0; i < len(chunk); i += frameSize {
 			end := i + frameSize
 			if end > len(chunk) {
@@ -801,6 +826,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 	})
 
 	if err != nil && sCtx.Err() == nil {
+		fmt.Printf("\r\033[K[DEBUG] TTS error: %v\n", err)
 		ms.emit(ErrorEvent, fmt.Sprintf("TTS error: %v", err))
 	}
 

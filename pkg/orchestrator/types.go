@@ -48,7 +48,6 @@ type StreamingLLMProvider interface {
 	StreamComplete(ctx context.Context, messages []Message, tools []Tool, onChunk func(string) error, onToolCall func(ToolCallEventData) error) (string, error)
 }
 
-
 type TTSProvider interface {
 	Synthesize(ctx context.Context, text string, voice Voice, lang Language) ([]byte, error)
 	StreamSynthesize(ctx context.Context, text string, voice Voice, lang Language, onChunk func([]byte) error) error

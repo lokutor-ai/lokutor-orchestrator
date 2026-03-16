@@ -69,13 +69,17 @@ func NewImprovedRMSVAD(threshold float64, silenceLimit time.Duration, sampleRate
 }
 
 func (v *ImprovedRMSVAD) SetThreshold(t float64) { v.mu.Lock(); defer v.mu.Unlock(); v.threshold = t }
-func (v *ImprovedRMSVAD) SetAdaptiveMode(b bool) { v.mu.Lock(); defer v.mu.Unlock(); v.adaptiveMode = b }
-func (v *ImprovedRMSVAD) SetMinConfirmed(n int)  { v.mu.Lock(); defer v.mu.Unlock(); v.minConfirmed = n }
-func (v *ImprovedRMSVAD) Threshold() float64      { v.mu.Lock(); defer v.mu.Unlock(); return v.threshold }
-func (v *ImprovedRMSVAD) MinConfirmed() int      { v.mu.Lock(); defer v.mu.Unlock(); return v.minConfirmed }
-func (v *ImprovedRMSVAD) IsSpeaking() bool       { v.mu.Lock(); defer v.mu.Unlock(); return v.isSpeaking }
-func (v *ImprovedRMSVAD) LastRMS() float64       { v.mu.Lock(); defer v.mu.Unlock(); return v.lastRMS }
-func (v *ImprovedRMSVAD) Name() string           { return "improved_rms_vad" }
+func (v *ImprovedRMSVAD) SetAdaptiveMode(b bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.adaptiveMode = b
+}
+func (v *ImprovedRMSVAD) SetMinConfirmed(n int) { v.mu.Lock(); defer v.mu.Unlock(); v.minConfirmed = n }
+func (v *ImprovedRMSVAD) Threshold() float64    { v.mu.Lock(); defer v.mu.Unlock(); return v.threshold }
+func (v *ImprovedRMSVAD) MinConfirmed() int     { v.mu.Lock(); defer v.mu.Unlock(); return v.minConfirmed }
+func (v *ImprovedRMSVAD) IsSpeaking() bool      { v.mu.Lock(); defer v.mu.Unlock(); return v.isSpeaking }
+func (v *ImprovedRMSVAD) LastRMS() float64      { v.mu.Lock(); defer v.mu.Unlock(); return v.lastRMS }
+func (v *ImprovedRMSVAD) Name() string          { return "improved_rms_vad" }
 
 func (v *ImprovedRMSVAD) Reset() {
 	v.mu.Lock()
@@ -203,12 +207,13 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 		effectiveThreshold = 0.35
 	}
 
-	// 3. Filters
+	// 3. Filters - stricter for background noise
 	crestFactor := 0.0
 	if rms > 0.001 {
 		crestFactor = peak / rms
 	}
-	isImpulsive := crestFactor > 7.0
+	// Coughs, door slams have high crest factor (5.5-8.0), speech is more uniform (~2-4)
+	isImpulsive := crestFactor > 5.5
 
 	penalty := 1.0
 
@@ -217,7 +222,7 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	zcrLimitHigh := 0.15
 	if v.sampleRate > 16000 {
 		// Loosen ZCR slightly for higher sample rates
-		zcrLimitHigh = 0.25 
+		zcrLimitHigh = 0.25
 	}
 
 	if v.emaZCR < zcrLimitLow || v.emaZCR > zcrLimitHigh {
@@ -225,7 +230,7 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	}
 
 	if isImpulsive {
-		penalty *= 2.0
+		penalty *= 4.0 // Stronger rejection of sudden loud sounds
 	}
 
 	// Require Energy Persistence to start

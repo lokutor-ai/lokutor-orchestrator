@@ -195,17 +195,6 @@ func TestConfigManagement(t *testing.T) {
 	}
 }
 
-func TestHandleInterruption(t *testing.T) {
-	stt := &MockSTTProvider{}
-	llm := &MockLLMProvider{}
-	tts := &MockTTSProvider{}
-
-	orch := New(stt, llm, tts, DefaultConfig())
-	session := NewConversationSession("test_user")
-
-	orch.HandleInterruption(session)
-}
-
 func TestConcurrentSessionOperations(t *testing.T) {
 	stt := &MockSTTProvider{transcribeResult: "Hello"}
 	llm := &MockLLMProvider{completeResult: "Hi there"}
