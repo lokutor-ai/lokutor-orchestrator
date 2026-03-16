@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,12 @@ type ManagedStream struct {
 	inPreemptiveTurn bool
 	lastActivityAt   time.Time
 	playbackRate     int
+
+	// Audio isolation state
+	hpLastSample float64
+	hpLastOutput float64
+	emaEnergy    float64
+	noiseFloor   float64
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -82,6 +89,8 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		writeChan:      make(chan []byte, 512),
 		lastActivityAt: time.Now(),
 		playbackRate:   44100, // Default to hifi
+		noiseFloor:     0.005, // Initial guess
+		emaEnergy:      0.005,
 	}
 
 	go ms.processBackgroundAudio()
@@ -181,11 +190,13 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		return fmt.Errorf("VAD not configured for this stream")
 	}
 
-	// Apply echo suppression BEFORE VAD to prevent the bot from interrupting itself.
-	// We use the "Fast" version to minimize latency impact on the real-time audio loop.
-	vadChunk := chunk
+	// 1. Process audio through Noise Isolation suite
+	processedChunk := ms.applyIsolation(chunk)
+
+	// 2. Apply echo suppression BEFORE VAD to prevent the bot from interrupting itself.
+	vadChunk := processedChunk
 	if ms.echoSuppressor != nil {
-		vadChunk = ms.echoSuppressor.RemoveEchoRealtime(chunk)
+		vadChunk = ms.echoSuppressor.RemoveEchoRealtime(processedChunk)
 	}
 
 	event, err := ms.vad.Process(vadChunk)
@@ -367,12 +378,107 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 		return true
 	}
 
-	// Very short audio with minimal transcription is usually a hallucination from a click/breath
-	// But we lower this to be more inclusive of short words like "Yes" or "No".
-	if audioDuration < 500*time.Millisecond && len(clean) <= 5 {
+	// 1. Density Heuristic (Characters per Second)
+	// Typical speaking rate is 10-20 chars/sec.
+	// Hallucinations like "Gracias..." on a 100ms click result in >50 chars/sec.
+	if audioDuration > 0 {
+		charsPerSec := float64(len(clean)) / audioDuration.Seconds()
+		// If audio is shorter than 1s and charsPerSec is > 15, it's very likely a hallucination.
+		if audioDuration < 1*time.Second && charsPerSec > 15 {
+			return true
+		}
+	}
+
+	// 2. Minimum Duration for complexity
+	// Audio shorter than 400ms is rarely long enough for more than a single syllable.
+	if audioDuration < 400*time.Millisecond && len(clean) > 3 {
 		return true
 	}
+
+	// 3. Repeated single characters or nonsensical short strings
+	if len(clean) > 0 && len(clean) < 4 {
+		// Catch things like "..." or "!!!" or "aaa"
+		allSame := true
+		for i := 1; i < len(clean); i++ {
+			if clean[i] != clean[0] {
+				allSame = false
+				break
+			}
+		}
+		if allSame {
+			return true
+		}
+	}
+
 	return false
+}
+
+// applyIsolation applies High-pass (DC removal) and an Adaptive Noise Gate
+// to isolate the main voice from background rumble and low-level noise.
+func (ms *ManagedStream) applyIsolation(chunk []byte) []byte {
+	if len(chunk) < 2 {
+		return chunk
+	}
+
+	out := make([]byte, len(chunk))
+	samples := len(chunk) / 2
+
+	// Filter constants
+	alphaHP := 0.98 // Simple High-pass (DC offset removal ~100Hz at 16k)
+	alphaEMA := 0.05
+	gateKnee := 2.5 // Suppress everything below 2.5x noise floor
+
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	var currentEnergy float64
+	for i := 0; i < samples; i++ {
+		// Read S16 LE
+		raw := int16(chunk[i*2]) | (int16(chunk[i*2+1]) << 8)
+		sample := float64(raw) / 32768.0
+
+		// High-pass filter (y[n] = x[n] - x[n-1] + alpha * y[n-1])
+		output := sample - ms.hpLastSample + alphaHP*ms.hpLastOutput
+		ms.hpLastSample = sample
+		ms.hpLastOutput = output
+
+		currentEnergy += output * output
+
+		// Store back to out (temp, will be gated below)
+		finalS16 := int16(output * 32768.0)
+		out[i*2] = byte(finalS16 & 0xFF)
+		out[i*2+1] = byte(finalS16 >> 8)
+	}
+
+	rms := math.Sqrt(currentEnergy / float64(samples))
+
+	// Update Noise Floor and Energy EMA
+	if rms < ms.noiseFloor || ms.noiseFloor == 0 {
+		ms.noiseFloor = (ms.noiseFloor * 0.99) + (rms * 0.01)
+	} else {
+		ms.noiseFloor = (ms.noiseFloor * 0.999) + (rms * 0.01)
+	}
+	ms.emaEnergy = (1-alphaEMA)*ms.emaEnergy + alphaEMA*rms
+
+	// Adaptive Noise Gate
+	// If RMS is significantly below noise floor relative to recent peaks, zero it out.
+	threshold := ms.noiseFloor * gateKnee
+	if ms.emaEnergy < threshold {
+		gain := ms.emaEnergy / threshold
+		if gain < 0.1 {
+			gain = 0
+		}
+		if gain < 1.0 {
+			for i := 0; i < samples; i++ {
+				raw := int16(out[i*2]) | (int16(out[i*2+1]) << 8)
+				scaled := int16(float64(raw) * gain)
+				out[i*2] = byte(scaled & 0xFF)
+				out[i*2+1] = byte(scaled >> 8)
+			}
+		}
+	}
+
+	return out
 }
 
 func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
