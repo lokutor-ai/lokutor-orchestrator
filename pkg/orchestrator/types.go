@@ -178,7 +178,7 @@ func DefaultConfig() Config {
 		SampleRate:               44100,
 		Channels:                 1,
 		BytesPerSamp:             2,
-		MaxContextMessages:       20,
+		MaxContextMessages:       100,
 		VoiceStyle:               VoiceF1,
 		MinWordsToInterrupt:      1,
 		Language:                 LanguageEn,
