@@ -268,7 +268,7 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 
 		limit := v.silenceLimit
 		if v.emaRMS < effectiveThreshold {
-			limit = 150 * time.Millisecond // Fast drop for preemptive trigger
+			limit = 150 * time.Millisecond // Fast trigger for responsiveness; checked before committing to interrupt
 		}
 
 		if now.Sub(v.silenceStart) >= limit {

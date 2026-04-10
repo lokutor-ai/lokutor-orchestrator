@@ -481,7 +481,7 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 		ms.lastUserAudio = append(ms.lastUserAudio, data...)
 		ms.audioBuf.Reset()
 		ms.mu.Unlock()
-		
+
 		// Use blocking send to ensure pre-buffered audio is not discarded
 		select {
 		case sttChan <- data:
@@ -552,10 +552,18 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 
 	transcript := result.Text
 
+	// Before committing to interrupt, check if user is still speaking
+	// If they resumed during transcription processing, discard and keep listening
 	ms.mu.Lock()
+	userStillSpeaking := ms.vad != nil && ms.vad.IsSpeaking()
 	speaking := ms.isSpeaking
 	thinking := ms.isThinking
 	ms.mu.Unlock()
+
+	if userStillSpeaking {
+		fmt.Printf("\r\033[K[DEBUG] User resumed speaking during transcription processing, discarding result and continuing to listen\n")
+		return
+	}
 
 	if speaking {
 		minWords := 1
