@@ -57,6 +57,8 @@ type ManagedStream struct {
 	inPreemptiveTurn bool
 	lastActivityAt   time.Time
 	playbackRate     int
+
+	toolRecursionDepth int // Safety counter to prevent infinite tool loops
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -644,6 +646,12 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.isThinking = true
 	ms.payloadGen++
 	gen := ms.payloadGen
+
+	// Reset tool recursion depth on new user turn (when transcript is non-empty)
+	if transcript != "" {
+		ms.toolRecursionDepth = 0
+	}
+
 	ms.mu.Unlock()
 
 	defer rCancel()
@@ -690,12 +698,53 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 	var fullText strings.Builder
 	var hasToolCalls bool
 	messages := ms.session.GetContextCopy()
+	fmt.Printf("\r\033[K[DEBUG] runStreamingLLM: Starting with %d messages in session\n", len(messages))
+
+	// Debug: Show message breakdown
+	var systemCount, userCount, assistantCount, toolCount int
+	for _, m := range messages {
+		switch m.Role {
+		case "system":
+			systemCount++
+		case "user":
+			userCount++
+		case "assistant":
+			assistantCount++
+		case "tool":
+			toolCount++
+		}
+	}
+	fmt.Printf("\r\033[K[DEBUG] Message breakdown: system=%d, user=%d, assistant=%d, tool=%d\n", systemCount, userCount, assistantCount, toolCount)
+
+	// Debug: Show last 3 messages for context
+	if len(messages) > 0 {
+		fmt.Printf("\r\033[K[DEBUG] Last messages in context:\n")
+		start := len(messages) - 3
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(messages); i++ {
+			m := messages[i]
+			content := m.Content
+			if len(content) > 60 {
+				content = content[:60] + "..."
+			}
+			if m.Role == "tool" {
+				fmt.Printf("\r\033[K  [%d] %s (id=%s): %s\n", i, m.Role, m.ToolCallID, content)
+			} else if m.ToolCalls != nil {
+				fmt.Printf("\r\033[K  [%d] %s (with tool calls): %s\n", i, m.Role, content)
+			} else {
+				fmt.Printf("\r\033[K  [%d] %s: %s\n", i, m.Role, content)
+			}
+		}
+	}
 
 	type pendingToolResult struct {
 		tc     ToolCallEventData
 		result string
 	}
 	var toolResults []pendingToolResult
+	var toolCallCount int
 
 	_, err := provider.StreamComplete(ctx, messages, ms.session.GetTools(), func(chunk string) error {
 		fullText.WriteString(chunk)
@@ -706,9 +755,13 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 		ms.mu.Unlock()
 		return nil
 	}, func(tc ToolCallEventData) error {
+		toolCallCount++
+		fmt.Printf("\r\033[K[DEBUG] Tool call #%d: %s, callID=%s\n", toolCallCount, tc.Name, tc.CallID)
+
 		// If the model produced some text BEFORE the tool call (the "filler"), speak it immediately
 		fillerText := strings.TrimSpace(fullText.String())
 		if fillerText != "" && !hasToolCalls {
+			fmt.Printf("\r\033[K[DEBUG] Speaking filler text before tool call: %q\n", fillerText)
 			go func(t string) {
 				ttsCtx, ttsCancel := context.WithCancel(ctx)
 				defer ttsCancel()
@@ -718,6 +771,7 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 		}
 
 		hasToolCalls = true
+		fmt.Printf("\r\033[K[DEBUG] Tool call detected: %s, callID=%s\n", tc.Name, tc.CallID)
 		ms.emit(ToolCall, tc)
 
 		o := ms.orch
@@ -727,11 +781,13 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 
 		result := "Error: tool not found"
 		if ok {
+			fmt.Printf("\r\033[K[DEBUG] Executing tool: %s with args: %v\n", tc.Name, tc.Arguments)
 			var err error
 			result, err = handler(tc.Arguments)
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
+			fmt.Printf("\r\033[K[DEBUG] Tool result: %q\n", result)
 		}
 
 		toolResults = append(toolResults, pendingToolResult{tc: tc, result: result})
@@ -771,6 +827,7 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 
 	if hasToolCalls {
 		// Add Tool Calls to History in correct sequence
+		fmt.Printf("\r\033[K[DEBUG] Adding %d tool results to session history\n", len(toolResults))
 		var tcData []interface{}
 		for _, tr := range toolResults {
 			tcData = append(tcData, map[string]interface{}{
@@ -799,7 +856,31 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 		}
 
 		// Recurse to handle the tool results
-		go ms.runLLMAndTTS(ms.ctx, "")
+		fmt.Printf("\r\033[K[DEBUG] Recursing to process tool results (depth=%d)\n", ms.toolRecursionDepth)
+		ms.mu.Lock()
+		ms.toolRecursionDepth++
+		depth := ms.toolRecursionDepth
+		ms.mu.Unlock()
+
+		// Safety check: prevent infinite loops from tool recursion
+		if depth > 3 {
+			fmt.Printf("\r\033[K[DEBUG] ⚠️  SAFETY: Tool recursion depth exceeded (depth=%d), stopping recursion and speaking accumulated response\n", depth)
+			// Don't recurse further, just ensure the bot can speak whatever response we have
+			ms.mu.Lock()
+			ms.isThinking = false
+			ms.mu.Unlock()
+			return
+		}
+
+		// Use a fresh context for the recursive call rather than the streaming context
+		freshCtx, cancel := context.WithCancel(ms.ctx)
+		go func() {
+			defer cancel()
+			ms.runLLMAndTTS(freshCtx, "")
+			ms.mu.Lock()
+			ms.toolRecursionDepth--
+			ms.mu.Unlock()
+		}()
 	}
 }
 
