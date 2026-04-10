@@ -31,7 +31,9 @@ type ManagedStream struct {
 	userSpeechEndTime   time.Time
 	botSpeakStartTime   time.Time
 
-	lastUserAudio []byte
+	lastUserAudio  []byte
+	lastTranscript string // Tracks the latest user transcription
+	turnCompletion *TurnCompletionAnalyzer
 
 	sttStartTime        time.Time
 	sttRequestStartTime time.Time
@@ -82,6 +84,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		writeChan:      make(chan []byte, 512),
 		lastActivityAt: time.Now(),
 		playbackRate:   44100, // Default to hifi
+		turnCompletion: NewTurnCompletionAnalyzer(),
 	}
 
 	go ms.processBackgroundAudio()
@@ -154,8 +157,6 @@ func countWords(s string) int {
 	}
 	return len(strings.Fields(s))
 }
-
-const speechEndHold = 50 * time.Millisecond
 
 func (ms *ManagedStream) Write(chunk []byte) error {
 	// We MUST copy the chunk here because the caller (main.go) will recycle the
@@ -264,6 +265,7 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 				go func(buf []byte) {
 					ms.mu.Lock()
 					duration := ms.userSpeechEndTime.Sub(ms.userSpeechStartTime)
+					lastTranscript := ms.lastTranscript
 					ms.mu.Unlock()
 
 					// Fast-path: if the sound was very short, don't wait for another second
@@ -274,16 +276,39 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 						return
 					}
 
-					fmt.Printf("\r\033[K[DEBUG] Waiting for speechEndHold (%v) before runBatchPipeline\n", speechEndHold)
-					t := time.NewTimer(speechEndHold)
+					// Adaptive hold time: longer hold for short utterances (likely pauses),
+					// shorter hold for longer utterances (likely complete thoughts)
+					completionScore := ms.turnCompletion.CombinedCompletionScore(
+						lastTranscript,
+						int(duration.Milliseconds()),
+						ms.vad,
+					)
+
+					fmt.Printf("\r\033[K[DEBUG] Completion score: %.2f (transcript: %q)\n", completionScore, lastTranscript)
+
+					var holdTime time.Duration
+					if completionScore < 0.35 {
+						holdTime = 500 * time.Millisecond // Incomplete: likely continuing
+					} else if completionScore > 0.65 {
+						holdTime = 100 * time.Millisecond // Complete: confident end of turn
+					} else {
+						// Ambiguous: use temporal heuristic
+						if duration < 1500*time.Millisecond {
+							holdTime = 400 * time.Millisecond
+						} else {
+							holdTime = 200 * time.Millisecond
+						}
+					}
+
+					fmt.Printf("\r\033[K[DEBUG] Waiting for smart hold (%v) before runBatchPipeline (duration: %v)\n", holdTime, duration)
+					t := time.NewTimer(holdTime)
 					defer t.Stop()
 
 					select {
 					case <-t.C:
-						if rmsVAD, ok := ms.vad.(*RMSVAD); ok {
-							if rmsVAD.IsSpeaking() {
+						if improvedVAD, ok := ms.vad.(*ImprovedRMSVAD); ok {
+							if improvedVAD.IsSpeaking() {
 								fmt.Printf("\r\033[K[DEBUG] User resumed speaking before timer fired, skipping runBatchPipeline\n")
-								// No need to write back, we never Reset() audioBuf in the 244 branch now
 								return
 							}
 						}
@@ -388,6 +413,8 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 		speaking := ms.isSpeaking
 		thinking := ms.isThinking
 		isStale := ms.sttGeneration != currentGeneration
+		// Track transcript for turn completion analysis
+		ms.lastTranscript = transcript
 		ms.mu.Unlock()
 
 		if isStale && !isFinal {

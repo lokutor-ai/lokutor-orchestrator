@@ -32,6 +32,10 @@ type ImprovedRMSVAD struct {
 	energyWindow []float64
 	windowIdx    int
 
+	// Energy trend tracking for prosody (detect falling vs rising intonation)
+	energyTrendWindow []float64
+	trendIdx          int
+
 	// Advanced noise tracking
 	lastMinRMS   float64
 	minTrackerAt time.Time
@@ -51,20 +55,21 @@ func NewImprovedRMSVAD(threshold float64, silenceLimit time.Duration, sampleRate
 		sampleRate = 44100
 	}
 	return &ImprovedRMSVAD{
-		threshold:    threshold,
-		silenceLimit: silenceLimit,
-		minConfirmed: 6, // Increased to reduce false starts
-		noiseFloor:   threshold,
-		alphaEMA:     0.25,
-		alphaZCR:     0.1,
-		alphaPeak:    0.05,
-		adaptiveMode: true,
-		lastMinRMS:   1.0,
-		minTrackerAt: time.Now(),
-		isWarmup:     true,
-		voiceZCR:     0.02,
-		energyWindow: make([]float64, 5),
-		sampleRate:   sampleRate,
+		threshold:         threshold,
+		silenceLimit:      silenceLimit,
+		minConfirmed:      6, // Increased to reduce false starts
+		noiseFloor:        threshold,
+		alphaEMA:          0.25,
+		alphaZCR:          0.1,
+		alphaPeak:         0.05,
+		adaptiveMode:      true,
+		lastMinRMS:        1.0,
+		minTrackerAt:      time.Now(),
+		isWarmup:          true,
+		voiceZCR:          0.02,
+		energyWindow:      make([]float64, 5),
+		energyTrendWindow: make([]float64, 10), // 10-frame window for prosody trend
+		sampleRate:        sampleRate,
 	}
 }
 
@@ -81,6 +86,38 @@ func (v *ImprovedRMSVAD) IsSpeaking() bool      { v.mu.Lock(); defer v.mu.Unlock
 func (v *ImprovedRMSVAD) LastRMS() float64      { v.mu.Lock(); defer v.mu.Unlock(); return v.lastRMS }
 func (v *ImprovedRMSVAD) Name() string          { return "improved_rms_vad" }
 
+// GetEnergyTrend returns the trend of energy over the last 10 frames.
+// Negative trend = falling energy (end of turn, falling intonation)
+// Positive trend = rising energy (continuing, excited)
+// Used for prosodic completion detection.
+func (v *ImprovedRMSVAD) GetEnergyTrend() float64 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if len(v.energyTrendWindow) < 2 {
+		return 0
+	}
+
+	// Calculate linear regression slope
+	n := float64(len(v.energyTrendWindow))
+	sumX := 0.0
+	sumY := 0.0
+	sumXY := 0.0
+	sumX2 := 0.0
+
+	for i, val := range v.energyTrendWindow {
+		x := float64(i)
+		sumX += x
+		sumY += val
+		sumXY += x * val
+		sumX2 += x * x
+	}
+
+	// Slope of linear regression
+	slope := (n*sumXY - sumX*sumY) / (n*sumX2 - sumX*sumX)
+	return slope
+}
+
 func (v *ImprovedRMSVAD) Reset() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -93,16 +130,17 @@ func (v *ImprovedRMSVAD) Clone() VADProvider {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return &ImprovedRMSVAD{
-		threshold:    v.threshold,
-		silenceLimit: v.silenceLimit,
-		minConfirmed: v.minConfirmed,
-		noiseFloor:   v.noiseFloor,
-		alphaEMA:     v.alphaEMA,
-		alphaZCR:     v.alphaZCR,
-		adaptiveMode: v.adaptiveMode,
-		voiceZCR:     v.voiceZCR,
-		energyWindow: make([]float64, 5),
-		sampleRate:   v.sampleRate,
+		threshold:         v.threshold,
+		silenceLimit:      v.silenceLimit,
+		minConfirmed:      v.minConfirmed,
+		noiseFloor:        v.noiseFloor,
+		alphaEMA:          v.alphaEMA,
+		alphaZCR:          v.alphaZCR,
+		adaptiveMode:      v.adaptiveMode,
+		voiceZCR:          v.voiceZCR,
+		energyWindow:      make([]float64, 5),
+		energyTrendWindow: make([]float64, 10),
+		sampleRate:        v.sampleRate,
 	}
 }
 
@@ -150,6 +188,10 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	// Update Energy Persistence Window
 	v.energyWindow[v.windowIdx] = rms
 	v.windowIdx = (v.windowIdx + 1) % len(v.energyWindow)
+
+	// Update Energy Trend Window for prosody analysis
+	v.energyTrendWindow[v.trendIdx] = rms
+	v.trendIdx = (v.trendIdx + 1) % len(v.energyTrendWindow)
 
 	sustainedEnergy := 0.0
 	for _, val := range v.energyWindow {
@@ -268,7 +310,7 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 
 		limit := v.silenceLimit
 		if v.emaRMS < effectiveThreshold {
-			limit = 150 * time.Millisecond // Fast trigger for responsiveness; checked before committing to interrupt
+			limit = 150 * time.Millisecond // Fast VAD detection; recovery checked by adaptive speechEndHold
 		}
 
 		if now.Sub(v.silenceStart) >= limit {
