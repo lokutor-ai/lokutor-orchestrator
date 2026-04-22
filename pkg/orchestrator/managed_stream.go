@@ -273,7 +273,6 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 					// Fast-path: if the sound was very short, don't wait for another second
 					// to see if the user continues. It's likely just noise.
 					if duration < 500*time.Millisecond {
-						fmt.Printf("\r\033[K[DEBUG] Turn too short (%v), runBatchPipeline now\n", duration)
 						ms.runBatchPipeline(buf)
 						return
 					}
@@ -286,35 +285,35 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 						ms.vad,
 					)
 
-					fmt.Printf("\r\033[K[DEBUG] Completion score: %.2f (transcript: %q)\n", completionScore, lastTranscript)
-
+					// SMART HOLD: completion score gates the response speed.
+					// High score = user finished sentence → respond FAST.
+					// Low score = user paused mid-sentence → wait LONG.
 					var holdTime time.Duration
 					if completionScore < 0.35 {
-						holdTime = 500 * time.Millisecond // Incomplete: likely continuing
+						// Incomplete sentence (e.g. "I think that...") → long hold
+						holdTime = 600 * time.Millisecond
 					} else if completionScore > 0.65 {
-						holdTime = 100 * time.Millisecond // Complete: confident end of turn
+						// Complete sentence (e.g. "How are you?") → respond immediately
+						holdTime = 50 * time.Millisecond
 					} else {
-						// Ambiguous: use temporal heuristic
+						// Ambiguous → medium hold, shorter for longer utterances
 						if duration < 1500*time.Millisecond {
-							holdTime = 400 * time.Millisecond
+							holdTime = 350 * time.Millisecond
 						} else {
 							holdTime = 200 * time.Millisecond
 						}
 					}
 
-					fmt.Printf("\r\033[K[DEBUG] Waiting for smart hold (%v) before runBatchPipeline (duration: %v)\n", holdTime, duration)
 					t := time.NewTimer(holdTime)
 					defer t.Stop()
 
 					select {
 					case <-t.C:
-						if improvedVAD, ok := ms.vad.(*ImprovedRMSVAD); ok {
-							if improvedVAD.IsSpeaking() {
-								fmt.Printf("\r\033[K[DEBUG] User resumed speaking before timer fired, skipping runBatchPipeline\n")
-								return
-							}
+						// FIX: Check IsSpeaking() via the generic interface so this
+						// works for ALL VAD types, not just ImprovedRMSVAD.
+						if ms.vad != nil && ms.vad.IsSpeaking() {
+							return
 						}
-						fmt.Printf("\r\033[K[DEBUG] Timer fired, running runBatchPipeline with %d bytes\n", len(buf))
 						ms.runBatchPipeline(buf)
 					case <-ms.ctx.Done():
 						return

@@ -308,12 +308,11 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 			v.silenceStart = now
 		}
 
-		limit := v.silenceLimit
-		if v.emaRMS < effectiveThreshold {
-			limit = 150 * time.Millisecond // Fast VAD detection; recovery checked by adaptive speechEndHold
-		}
-
-		if now.Sub(v.silenceStart) >= limit {
+		// CRITICAL FIX: Always use the configured silenceLimit.
+		// The 150ms fast-path was causing false SpeechEnd events during
+		// natural pauses in continuous speech, making the bot interrupt
+		// the user while they were still speaking.
+		if now.Sub(v.silenceStart) >= v.silenceLimit {
 			v.isSpeaking = false
 			v.silenceStart = time.Time{}
 			return &VADEvent{Type: VADSpeechEnd, Timestamp: now.UnixMilli()}, nil
