@@ -914,21 +914,49 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 
 	ms.emit(BotSpeaking, nil)
 
-	fmt.Printf("\r\033[K[DEBUG] Starting TTS synthesis for: %s\n", text)
+	ms.mu.Lock()
+	pRate := ms.playbackRate
+	gen := ms.payloadGen
+	ms.mu.Unlock()
+
+	// JITTER BUFFER for single-core ARM:
+	// On Cobalt100, TTS chunks can arrive late due to ONNX scheduling jitter.
+	// We buffer ~200ms of audio before starting playback, then emit 60ms frames
+	// to create a runway that absorbs sporadic slowdowns.
+	const jitterBufferMs = 200
+	frameSize := int(float64(pRate)*0.06) * 2 // 60ms frames (was 20ms)
+	if frameSize <= 0 {
+		frameSize = 5292 // Fallback to 44.1k 60ms
+	}
+	jitterTargetBytes := int(float64(pRate)*float64(jitterBufferMs)/1000.0) * 2
+	var jitterBuf []byte
+	hasStartedPlayback := false
+
 	err := ms.orch.SynthesizeStream(sCtx, text, ms.session.GetCurrentVoice(), ms.session.GetCurrentLanguage(), func(chunk []byte) error {
-		fmt.Printf("\r\033[K[DEBUG] TTS chunk received: %d bytes\n", len(chunk))
 		ms.mu.Lock()
 		ms.lastAudioSentAt = time.Now()
-		pRate := ms.playbackRate
-		gen := ms.payloadGen
 		ms.mu.Unlock()
 
-		// Calculate frame size for exactly 20ms at current playback rate
-		// (playbackRate * 0.02s * 2 bytes per sample)
-		frameSize := int(float64(pRate)*0.02) * 2
-		if frameSize <= 0 {
-			frameSize = 1764 // Fallback to 44.1k 20ms
+		if !hasStartedPlayback {
+			jitterBuf = append(jitterBuf, chunk...)
+			if len(jitterBuf) >= jitterTargetBytes {
+				hasStartedPlayback = true
+				// Emit buffered audio in 60ms frames
+				for i := 0; i < len(jitterBuf); i += frameSize {
+					end := i + frameSize
+					if end > len(jitterBuf) {
+						end = len(jitterBuf)
+					}
+					c := make([]byte, end-i)
+					copy(c, jitterBuf[i:end])
+					ms.emitWithGen(AudioChunk, c, gen)
+				}
+				jitterBuf = nil
+			}
+			return nil
 		}
+
+		// Playback already started: emit immediately in 60ms frames
 		for i := 0; i < len(chunk); i += frameSize {
 			end := i + frameSize
 			if end > len(chunk) {
@@ -940,6 +968,19 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 		}
 		return nil
 	})
+
+	// Flush any remaining jitter buffer at end-of-stream
+	if !hasStartedPlayback && len(jitterBuf) > 0 {
+		for i := 0; i < len(jitterBuf); i += frameSize {
+			end := i + frameSize
+			if end > len(jitterBuf) {
+				end = len(jitterBuf)
+			}
+			c := make([]byte, end-i)
+			copy(c, jitterBuf[i:end])
+			ms.emitWithGen(AudioChunk, c, gen)
+		}
+	}
 
 	if err != nil && sCtx.Err() == nil {
 		fmt.Printf("\r\033[K[DEBUG] TTS error: %v\n", err)
