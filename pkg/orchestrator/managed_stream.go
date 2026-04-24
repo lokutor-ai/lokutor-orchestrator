@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -393,9 +395,11 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 		return true
 	}
 
-	// Very short audio with minimal transcription is usually a hallucination from a click/breath
-	// But we lower this to be more inclusive of short words like "Yes" or "No".
-	if audioDuration < 500*time.Millisecond && len(clean) <= 5 {
+	// Only reject very short audio with extremely short transcription.
+	// "Yes", "No", "Hi", "Okay" are all valid conversational utterances
+	// that must not be discarded. Only reject 1-2 character transcripts
+	// under 300ms (likely clicks/breaths), or empty text.
+	if audioDuration < 300*time.Millisecond && len(clean) <= 1 {
 		return true
 	}
 	return false
@@ -920,9 +924,15 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 
 	// JITTER BUFFER for single-core ARM:
 	// On Cobalt100, TTS chunks can arrive late due to ONNX scheduling jitter.
-	// We buffer ~200ms of audio before starting playback, then emit 60ms frames
-	// to create a runway that absorbs sporadic slowdowns.
-	const jitterBufferMs = 200
+	// We buffer audio before starting playback to create a runway that absorbs
+	// sporadic slowdowns. Configurable via env var; default 200ms for ARM,
+	// but can be lowered to 50-100ms on multi-core systems for lower latency.
+	jitterBufferMs := 200
+	if env := os.Getenv("JITTER_BUFFER_MS"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v >= 0 {
+			jitterBufferMs = v
+		}
+	}
 	frameSize := int(float64(pRate)*0.06) * 2 // 60ms frames (was 20ms)
 	if frameSize <= 0 {
 		frameSize = 5292 // Fallback to 44.1k 60ms

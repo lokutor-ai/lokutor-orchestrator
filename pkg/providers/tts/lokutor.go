@@ -71,7 +71,7 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 		"voice":   string(voice),
 		"lang":    string(lang),
 		"speed":   1.0,
-		"steps":   32,
+		"steps":   6,
 		"visemes": false,
 	}
 

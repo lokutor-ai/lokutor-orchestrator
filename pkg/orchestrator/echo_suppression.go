@@ -459,11 +459,11 @@ func (es *EchoSuppressor) RemoveEchoRealtime(input []byte) []byte {
 	}
 	maxCorr := es.maxCorrelationRing(inSamples, searchSize, true)
 
-	// Only hard-mute if correlation is EXTREMELY high (0.95+). 
-	// This prevents zeroing out a user speaking over the bot.
-	if maxCorr < 0.95 {
+	// Hard-mute if correlation is high (0.85+). This catches actual echo while
+	// allowing users to speak over the bot (their voice decorrelates the signal).
+	if maxCorr < 0.85 {
 		envCorr := es.maxEnvelopeCorrelationRing(inSamples, searchSize, 8)
-		if envCorr < 0.98 {
+		if envCorr < 0.90 {
 			out := make([]byte, len(input))
 			copy(out, input)
 			return out

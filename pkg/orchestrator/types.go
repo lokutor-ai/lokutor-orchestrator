@@ -180,7 +180,7 @@ func DefaultConfig() Config {
 		BytesPerSamp:             2,
 		MaxContextMessages:       100,
 		VoiceStyle:               VoiceF1,
-		MinWordsToInterrupt:      1,
+		MinWordsToInterrupt:      2,
 		Language:                 LanguageEn,
 		STTTimeout:               30,
 		LLMTimeout:               60,
