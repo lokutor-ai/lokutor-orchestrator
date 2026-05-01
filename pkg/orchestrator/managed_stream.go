@@ -922,6 +922,14 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 	gen := ms.payloadGen
 	ms.mu.Unlock()
 
+	// Detect streaming TTS providers (Deepgram workaround).
+	// For streaming providers we skip jitter buffer entirely — chunks arrive
+	// smoothly from the remote API and the 200ms buffer is pure dead latency.
+	isStreamingTTS := ms.orch.GetProviders()["tts"] == "deepgram"
+	if isStreamingTTS {
+		fmt.Printf("\r\033[K[DEBUG] Streaming TTS detected — bypassing jitter buffer\n")
+	}
+
 	// JITTER BUFFER for single-core ARM:
 	// On Cobalt100, TTS chunks can arrive late due to ONNX scheduling jitter.
 	// We buffer audio before starting playback to create a runway that absorbs
@@ -945,6 +953,20 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 		ms.mu.Lock()
 		ms.lastAudioSentAt = time.Now()
 		ms.mu.Unlock()
+
+		if isStreamingTTS {
+			// Streaming provider: emit immediately in 60ms frames, no buffering
+			for i := 0; i < len(chunk); i += frameSize {
+				end := i + frameSize
+				if end > len(chunk) {
+					end = len(chunk)
+				}
+				c := make([]byte, end-i)
+				copy(c, chunk[i:end])
+				ms.emitWithGen(AudioChunk, c, gen)
+			}
+			return nil
+		}
 
 		if !hasStartedPlayback {
 			jitterBuf = append(jitterBuf, chunk...)
