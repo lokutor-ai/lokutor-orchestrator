@@ -2,29 +2,38 @@ package noise
 
 import (
 	"fmt"
+	"os"
+	"runtime"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
 
 // Suppressor wraps the ONNX model for noise suppression.
 type Suppressor struct {
-	session     *ort.AdvancedSession
-	featuresInput  *ort.Tensor[float32]
-	hiddenInput    *ort.Tensor[float32]
-	gainsOutput    *ort.Tensor[float32]
-	dfOutput       *ort.Tensor[float32]
-	vadOutput      *ort.Tensor[float32]
+	session         *ort.AdvancedSession
+	featuresInput   *ort.Tensor[float32]
+	hiddenInput     *ort.Tensor[float32]
+	gainsOutput     *ort.Tensor[float32]
+	dfOutput        *ort.Tensor[float32]
+	vadOutput       *ort.Tensor[float32]
 	newHiddenOutput *ort.Tensor[float32]
 }
 
 // NewSuppressor loads an ONNX noise suppression model.
 func NewSuppressor(modelPath string) (*Suppressor, error) {
-	ort.SetSharedLibraryPath("/usr/local/lib/libonnxruntime.so")
+	libPath := os.Getenv("ONNXRUNTIME_LIB_PATH")
+	if libPath == "" {
+		if runtime.GOOS == "darwin" {
+			libPath = "/opt/homebrew/lib/libonnxruntime.dylib"
+		} else {
+			libPath = "/usr/local/lib/libonnxruntime.so"
+		}
+	}
+	ort.SetSharedLibraryPath(libPath)
 	if err := ort.InitializeEnvironment(); err != nil {
-		return nil, fmt.Errorf("failed to initialize ONNX runtime: %w", err)
+		return nil, fmt.Errorf("init onnx: %w", err)
 	}
 
-	// Create input tensors
 	featuresInput, err := ort.NewEmptyTensor[float32]([]int64{1, int64(NFeatures)})
 	if err != nil {
 		return nil, err
@@ -35,7 +44,6 @@ func NewSuppressor(modelPath string) (*Suppressor, error) {
 		return nil, err
 	}
 
-	// Create output tensors
 	gainsOutput, err := ort.NewEmptyTensor[float32]([]int64{1, int64(NBands)})
 	if err != nil {
 		return nil, err
@@ -65,7 +73,7 @@ func NewSuppressor(modelPath string) (*Suppressor, error) {
 		nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load ONNX model: %w", err)
+		return nil, fmt.Errorf("load onnx: %w", err)
 	}
 
 	return &Suppressor{
@@ -79,28 +87,27 @@ func NewSuppressor(modelPath string) (*Suppressor, error) {
 	}, nil
 }
 
-// ProcessFrame runs inference on a single frame.
-// features: (78,) float32
-// hidden: (3*1*256 = 768,) float32
-// Returns: gains (34,), new_hidden (768,)
-func (s *Suppressor) ProcessFrame(features, hidden []float32) ([]float32, []float32, error) {
-	// Copy input data
+// ProcessFrame runs inference on a single frame and returns gains, dfCoefs, and new hidden state.
+func (s *Suppressor) ProcessFrame(features, hidden []float32) (gains, dfCoefs []float32, vad float32, newHidden []float32, err error) {
 	copy(s.featuresInput.GetData(), features)
 	copy(s.hiddenInput.GetData(), hidden)
 
-	// Run inference
 	if err := s.session.Run(); err != nil {
-		return nil, nil, fmt.Errorf("inference failed: %w", err)
+		return nil, nil, 0, nil, fmt.Errorf("inference failed: %w", err)
 	}
 
-	// Copy outputs
-	gains := make([]float32, NBands)
+	gains = make([]float32, NBands)
 	copy(gains, s.gainsOutput.GetData())
 
-	newHidden := make([]float32, GRULayers*1*GRUUnits)
+	dfCoefs = make([]float32, NDFBins*2)
+	copy(dfCoefs, s.dfOutput.GetData())
+
+	vad = s.vadOutput.GetData()[0]
+
+	newHidden = make([]float32, GRULayers*1*GRUUnits)
 	copy(newHidden, s.newHiddenOutput.GetData())
 
-	return gains, newHidden, nil
+	return gains, dfCoefs, vad, newHidden, nil
 }
 
 // Destroy cleans up the ONNX session.

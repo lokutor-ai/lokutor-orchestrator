@@ -44,3 +44,40 @@ func createBarkFilterbank(nFFT, sr, nBands int) [][]float32 {
 func hzToBark(f float64) float64 {
 	return 13.0*math.Atan(0.00076*f) + 3.5*math.Atan((f/7500.0)*(f/7500.0))
 }
+
+// normalizeFilterbank normalizes each row to sum to 1.
+func normalizeFilterbank(fb [][]float32) [][]float32 {
+	norm := make([][]float32, len(fb))
+	for b := range fb {
+		norm[b] = make([]float32, len(fb[b]))
+		var sum float32
+		for f := range fb[b] {
+			sum += fb[b][f]
+		}
+		if sum < 1e-10 {
+			sum = 1e-10
+		}
+		for f := range fb[b] {
+			norm[b][f] = fb[b][f] / sum
+		}
+	}
+	return norm
+}
+
+// getDFBinIndices returns frequency bin indices for deep filter coefficients.
+// Matches PyTorch's searchsorted(bin_edges, df_freqs, right=False).
+func getDFBinIndices() []int {
+	nFreq := NFFT/2 + 1
+	maxFreq := SampleRate / 2
+	binWidth := float64(maxFreq) / float64(nFreq-1)
+	indices := make([]int, NDFBins)
+	for i := 0; i < NDFBins; i++ {
+		dfFreq := float64(i) * float64(maxFreq) / float64(NDFBins-1)
+		binIdx := int(math.Ceil(dfFreq / binWidth))
+		if binIdx >= nFreq {
+			binIdx = nFreq - 1
+		}
+		indices[i] = binIdx
+	}
+	return indices
+}

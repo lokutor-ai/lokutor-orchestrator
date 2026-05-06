@@ -94,17 +94,20 @@ func main() {
 	// Wrap STT with noise suppression filter if model is available
 	noiseModelPath := os.Getenv("NOISE_FILTER_MODEL")
 	if noiseModelPath == "" {
-		// Default to the versa-1.0 model directory
-		noiseModelPath = "assets/onnx/versa-1.0/noise_suppressor_v2.onnx"
+		// Default path relative to the agent's working directory (lokutor-orchestrator)
+		noiseModelPath = "../assets/onnx/versa-1.0/noise_suppressor_v2.onnx"
 	}
+	log.Printf("Noise filter model path: %s", noiseModelPath)
 	if _, err := os.Stat(noiseModelPath); err == nil {
 		wrappedSTT, err := noiseFilter.NewSTTWrapper(stt, noiseModelPath, SampleRate)
 		if err != nil {
 			log.Printf("Warning: failed to load noise filter (%v), using unfiltered STT", err)
 		} else {
 			stt = wrappedSTT
-			fmt.Printf("✅ Noise filter active: %s\n", wrappedSTT.Name())
+			log.Printf("Noise filter ACTIVE: model=%s provider=%s", noiseModelPath, wrappedSTT.Name())
 		}
+	} else {
+		log.Printf("Noise filter model NOT FOUND at %s (err: %v), continuing without noise filter", noiseModelPath, err)
 	}
 
 	var llm orchestrator.LLMProvider
@@ -340,6 +343,7 @@ func main() {
 
 	go func() {
 		currentGeneration := 0
+		botHasAudio := false
 		for event := range stream.Events() {
 			switch event.Type {
 			case orchestrator.UserSpeaking:
@@ -352,12 +356,18 @@ func main() {
 
 			case orchestrator.Interrupted:
 				playbackMu.Lock()
-				playbackBytes = nil
-				preRolling = true
+				if botHasAudio {
+					// Bot was speaking - this was just brief noise, don't kill playback
+					fmt.Printf("\r\033[K🔄 [INTERRUPTED] Brief noise - resuming bot playback.\n")
+				} else {
+					playbackBytes = nil
+					preRolling = true
+					currentGeneration = event.Generation
+					fmt.Printf("\r\033[K🛑 [INTERRUPTED] User started talking (gen: %d).\n", currentGeneration)
+				}
+				botHasAudio = false
 				playbackPaused = false
-				currentGeneration = event.Generation
 				playbackMu.Unlock()
-				fmt.Printf("\r\033[K🛑 [INTERRUPTED] User started talking (gen: %d).\n", currentGeneration)
 			case orchestrator.BotResumed:
 				playbackMu.Lock()
 				playbackPaused = false
@@ -415,12 +425,12 @@ func main() {
 				}
 			case orchestrator.AudioChunk:
 				if event.Generation < currentGeneration {
-
 					continue
 				}
 				chunk := event.Data.([]byte)
 				playbackMu.Lock()
 				playbackBytes = append(playbackBytes, chunk...)
+				botHasAudio = true
 				playbackMu.Unlock()
 
 			case orchestrator.ErrorEvent:
