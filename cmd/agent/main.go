@@ -15,6 +15,7 @@ import (
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/audio"
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 	llmProvider "github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/llm"
+	noiseFilter "github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/noise"
 	sttProvider "github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/stt"
 	ttsProvider "github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/tts"
 )
@@ -88,6 +89,22 @@ func main() {
 
 	if s, ok := stt.(interface{ SetSampleRate(int) }); ok {
 		s.SetSampleRate(SampleRate)
+	}
+
+	// Wrap STT with noise suppression filter if model is available
+	noiseModelPath := os.Getenv("NOISE_FILTER_MODEL")
+	if noiseModelPath == "" {
+		// Default to the versa-1.0 model directory
+		noiseModelPath = "assets/onnx/versa-1.0/noise_suppressor_v2.onnx"
+	}
+	if _, err := os.Stat(noiseModelPath); err == nil {
+		wrappedSTT, err := noiseFilter.NewSTTWrapper(stt, noiseModelPath, SampleRate)
+		if err != nil {
+			log.Printf("Warning: failed to load noise filter (%v), using unfiltered STT", err)
+		} else {
+			stt = wrappedSTT
+			fmt.Printf("✅ Noise filter active: %s\n", wrappedSTT.Name())
+		}
 	}
 
 	var llm orchestrator.LLMProvider

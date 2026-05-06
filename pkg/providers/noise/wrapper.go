@@ -4,26 +4,28 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"math"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
 
 // STTWrapper wraps an STT provider with noise suppression.
+// It resamples audio to 16kHz for the filter, then back to the original rate for STT.
 type STTWrapper struct {
-	inner  orchestrator.STTProvider
-	filter *Filter
+	inner      orchestrator.STTProvider
+	filter     *Filter
+	sampleRate int
 }
 
 // NewSTTWrapper creates a noise-suppressing wrapper around an STT provider.
-func NewSTTWrapper(inner orchestrator.STTProvider, modelPath string) (*STTWrapper, error) {
+func NewSTTWrapper(inner orchestrator.STTProvider, modelPath string, sampleRate int) (*STTWrapper, error) {
 	filter, err := NewFilter(modelPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create noise filter: %w", err)
 	}
 	return &STTWrapper{
-		inner:  inner,
-		filter: filter,
+		inner:      inner,
+		filter:     filter,
+		sampleRate: sampleRate,
 	}, nil
 }
 
@@ -34,12 +36,22 @@ func (w *STTWrapper) Name() string {
 
 // Transcribe applies noise suppression before transcribing.
 func (w *STTWrapper) Transcribe(ctx context.Context, audioPCM []byte, lang orchestrator.Language) (orchestrator.TranscriptionResult, error) {
-	// Convert bytes to float32 samples (assuming 16-bit PCM)
+	// Convert bytes to float32 samples (16-bit PCM)
 	samples := pcmBytesToFloat32(audioPCM)
 
-	// Apply noise suppression
+	// Resample to 16kHz if needed
+	if w.sampleRate != SampleRate {
+		samples = ResampleLinear(samples, w.sampleRate, SampleRate)
+	}
+
+	// Apply noise suppression at 16kHz
 	cleanSamples := w.filter.ProcessChunk(samples)
 	cleanSamples = append(cleanSamples, w.filter.Flush()...)
+
+	// Resample back to original rate if needed
+	if w.sampleRate != SampleRate {
+		cleanSamples = ResampleLinear(cleanSamples, SampleRate, w.sampleRate)
+	}
 
 	// Convert back to bytes
 	cleanPCM := float32ToPCMBytes(cleanSamples)
@@ -56,7 +68,6 @@ func (w *STTWrapper) Destroy() {
 }
 
 func pcmBytesToFloat32(data []byte) []float32 {
-	// Assume 16-bit little-endian PCM
 	nSamples := len(data) / 2
 	samples := make([]float32, nSamples)
 	for i := 0; i < nSamples; i++ {
@@ -69,7 +80,6 @@ func pcmBytesToFloat32(data []byte) []float32 {
 func float32ToPCMBytes(samples []float32) []byte {
 	data := make([]byte, len(samples)*2)
 	for i, s := range samples {
-		// Clamp
 		if s > 1.0 {
 			s = 1.0
 		} else if s < -1.0 {
@@ -79,16 +89,4 @@ func float32ToPCMBytes(samples []float32) []byte {
 		binary.LittleEndian.PutUint16(data[i*2:], uint16(val))
 	}
 	return data
-}
-
-// RMS calculates root-mean-square of a float32 slice.
-func RMS(samples []float32) float32 {
-	if len(samples) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, s := range samples {
-		sum += float64(s) * float64(s)
-	}
-	return float32(math.Sqrt(sum / float64(len(samples))))
 }

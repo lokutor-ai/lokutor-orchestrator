@@ -16,3 +16,8 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/gen2brain/malgo v0.11.24
 )
+
+require (
+	github.com/yalue/onnxruntime_go v1.12.0 // indirect
+	gonum.org/v1/gonum v0.15.0 // indirect
+)
