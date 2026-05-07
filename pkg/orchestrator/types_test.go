@@ -14,8 +14,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.SampleRate != 44100 {
 		t.Errorf("Expected sample rate 44100, got %d", cfg.SampleRate)
 	}
-	if cfg.MaxContextMessages != 20 {
-		t.Errorf("Expected max messages 20, got %d", cfg.MaxContextMessages)
+	if cfg.MaxContextMessages != 100 {
+		t.Errorf("Expected max messages 100, got %d", cfg.MaxContextMessages)
 	}
 }
 

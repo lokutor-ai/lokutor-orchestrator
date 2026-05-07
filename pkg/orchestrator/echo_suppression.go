@@ -378,11 +378,23 @@ func calculateEnergy(samples []float64) float64 {
 	return energy
 }
 
+func (es *EchoSuppressor) IsTTSSilent(silenceMs int) bool {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	return time.Since(es.lastTTSTime) > time.Duration(silenceMs)*time.Millisecond
+}
+
 func (es *EchoSuppressor) ClearEchoBuffer() {
 	es.mu.Lock()
 	defer es.mu.Unlock()
 	es.writeIdx = 0
 	es.count = 0
+}
+
+func (es *EchoSuppressor) LastTTSTime() time.Time {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	return es.lastTTSTime
 }
 
 func (es *EchoSuppressor) PostProcess(input []byte) []byte {

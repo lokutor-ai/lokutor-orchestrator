@@ -282,12 +282,14 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 
 	targetThreshold := effectiveThreshold * penalty
 
-	// 5. Detection Logic
-	if v.emaRMS > targetThreshold {
-		v.consecutiveFrames++
-		if !v.isSpeaking {
+	// 5. Speech Start Detection — uses emaRMS for persistence against noise
+	emaAboveThreshold := v.emaRMS > targetThreshold
+	rawAboveThreshold := rms > effectiveThreshold
+
+	if !v.isSpeaking {
+		if emaAboveThreshold {
+			v.consecutiveFrames++
 			if v.consecutiveFrames == 1 {
-				// Instant signal for muting
 				return &VADEvent{Type: VADSpeechPotential, Timestamp: now.UnixMilli()}, nil
 			}
 			if v.consecutiveFrames >= v.minConfirmed {
@@ -296,22 +298,25 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 				return &VADEvent{Type: VADSpeechStart, Timestamp: now.UnixMilli()}, nil
 			}
 		} else {
-			v.silenceStart = time.Time{}
+			v.consecutiveFrames = 0
 		}
 		return nil, nil
 	}
 
-	// Silence detection
-	v.consecutiveFrames = 0
-	if v.isSpeaking {
+	// 6. Silence Detection — uses raw RMS so the EMA tail from speech
+	//    doesn't delay/suppress VADSpeechEnd.  Without this fix the
+	//    exponential moving average (~650 ms to decay below threshold with
+	//    α=0.25) keeps emaRMS > targetThreshold long after the user stops
+	//    speaking, resetting silenceStart on every frame and preventing
+	//    the end-of-speech event from ever firing.
+	if rawAboveThreshold {
+		// True speech energy — reset the silence timer
+		v.silenceStart = time.Time{}
+	} else {
+		// Raw RMS is below threshold — count silence toward VADSpeechEnd
 		if v.silenceStart.IsZero() {
 			v.silenceStart = now
 		}
-
-		// CRITICAL FIX: Always use the configured silenceLimit.
-		// The 150ms fast-path was causing false SpeechEnd events during
-		// natural pauses in continuous speech, making the bot interrupt
-		// the user while they were still speaking.
 		if now.Sub(v.silenceStart) >= v.silenceLimit {
 			v.isSpeaking = false
 			v.silenceStart = time.Time{}

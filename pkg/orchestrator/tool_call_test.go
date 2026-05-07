@@ -69,10 +69,14 @@ func TestManagedStream_ToolCalling(t *testing.T) {
 		},
 	}
 
+	cfg := DefaultConfig()
+	cfg.FirstSpeaker = FirstSpeakerUser
+	cfg.SilenceTimeout = 0
+
 	stt := &MockSTTProvider{transcribeResult: "whats the weather?"}
 	tts := &MockTTSProvider{synthesizeResult: []byte{1, 2, 3}}
 
-	orch := NewWithAllLayers(stt, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+	orch := New(stt, llm, tts, nil, cfg, nil)
 
 	weatherCalled := false
 	orch.RegisterTool("get_weather", func(args string) (string, error) {
@@ -109,6 +113,26 @@ loop:
 		t.Error("get_weather tool was never called")
 	}
 
+	// Wait for the completion to flush to session context (sentence streaming
+	// adds the response after all TTS chunks are done, which may be after BotSpeaking).
+	foundFinal := false
+	for i := 0; i < 50; i++ {
+		tctx := session.GetContextCopy()
+		for _, m := range tctx {
+			if m.Role == "assistant" && strings.Contains(m.Content, "weather in Madrid is sunny") {
+				foundFinal = true
+				break
+			}
+		}
+		if foundFinal {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !foundFinal {
+		t.Error("Final assistant response not found in session context (timeout)")
+	}
+
 	// Verify conversation history has tool result
 	ctx := session.GetContextCopy()
 	hasToolMsg := false
@@ -124,13 +148,4 @@ loop:
 		t.Error("Tool result message not found in session context")
 	}
 
-	foundFinalResponse := false
-	for _, m := range ctx {
-		if m.Role == "assistant" && strings.Contains(m.Content, "weather in Madrid is sunny") {
-			foundFinalResponse = true
-		}
-	}
-	if !foundFinalResponse {
-		t.Error("Final assistant response not found in session context")
-	}
 }

@@ -171,6 +171,27 @@ type Config struct {
 	EchoSuppressionThreshold float64
 	FirstSpeaker             FirstSpeaker
 	SilenceTimeout           time.Duration
+
+	// Sentence-level streaming: emit LLM text at sentence boundaries to TTS
+	SentenceStreaming bool
+
+	// Backchannel generation during user speech
+	BackchannelEnabled   bool
+	BackchannelThreshold float64
+
+	// Speculative pre-generation on partial transcripts
+	SpeculativeEnabled   bool
+	SpeculativeProvider  string   // e.g. "groq"
+	SpeculativeModel     string   // e.g. "llama-3.1-8b-instant"
+
+	// Expressive mode: LLM outputs prosody/emotion tags for TTS
+	ExpressiveMode bool
+
+	// Context management
+	ContextSummarizationThreshold int // turns before summarization
+
+	// Acoustic interruption filtering (language-agnostic)
+	AcousticInterruptThreshold float64 // RMS ratio below which partial is likely backchannel
 }
 
 func DefaultConfig() Config {
@@ -189,7 +210,17 @@ func DefaultConfig() Config {
 		BargeInVADTrailWindow:    1500 * time.Millisecond,
 		EchoSuppressionThreshold: 0.35,
 		FirstSpeaker:             FirstSpeakerBot,
-		SilenceTimeout:           0,
+		SilenceTimeout: 10 * time.Second,
+
+		SentenceStreaming:              true,
+		BackchannelEnabled:             true,
+		BackchannelThreshold:           0.6,
+		SpeculativeEnabled:             true,
+		SpeculativeProvider:            "",
+		SpeculativeModel:               "",
+		ExpressiveMode:                 true,
+		ContextSummarizationThreshold:  6,
+		AcousticInterruptThreshold:     0.5,
 	}
 }
 

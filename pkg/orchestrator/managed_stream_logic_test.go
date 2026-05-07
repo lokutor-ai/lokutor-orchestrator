@@ -8,7 +8,7 @@ import (
 )
 
 func TestManagedStream_InterruptionLogic(t *testing.T) {
-	orch := New(nil, nil, nil, Config{})
+	orch := New(nil, nil, nil, nil, Config{}, nil)
 	session := NewConversationSession("test")
 	ms := NewManagedStream(context.Background(), orch, session)
 
@@ -41,7 +41,7 @@ func TestManagedStream_InterruptionLogic(t *testing.T) {
 }
 
 func TestManagedStream_EchoGuard(t *testing.T) {
-	orch := New(nil, nil, nil, Config{})
+	orch := New(nil, nil, nil, nil, Config{}, nil)
 	session := NewConversationSession("test")
 	ms := NewManagedStream(context.Background(), orch, session)
 

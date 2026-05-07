@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -34,7 +35,7 @@ type ManagedStream struct {
 	botSpeakStartTime   time.Time
 
 	lastUserAudio  []byte
-	lastTranscript string // Tracks the latest user transcription
+	lastTranscript string
 	turnCompletion *TurnCompletionAnalyzer
 
 	sttStartTime        time.Time
@@ -52,6 +53,8 @@ type ManagedStream struct {
 	echoSuppressor   *EchoSuppressor
 	closeOnce        sync.Once
 
+	vadDebounceUntil time.Time
+
 	payloadGen       int
 	writeChan        chan []byte
 	isClosed         bool
@@ -60,7 +63,22 @@ type ManagedStream struct {
 	lastActivityAt   time.Time
 	playbackRate     int
 
-	toolRecursionDepth int // Safety counter to prevent infinite tool loops
+	toolRecursionDepth int
+
+	sentenceBuffer *SentenceBuffer
+	backchannelGen *BackchannelGenerator
+	speculator     *Speculator
+
+	ttsSentenceChan chan string
+
+	userSegmentRMS     float64
+	userSegmentSamples int
+	userBaselineRMS    float64
+	segmentRMSStart    time.Time
+
+	turnCount int
+
+	config Config
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -87,17 +105,30 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		echoSuppressor: NewEchoSuppressorWithConfig(config),
 		writeChan:      make(chan []byte, 512),
 		lastActivityAt: time.Now(),
-		playbackRate:   44100, // Default to hifi
+		playbackRate:   44100,
 		turnCompletion: NewTurnCompletionAnalyzer(),
+		sentenceBuffer: NewSentenceBuffer(),
+		config:         config,
 	}
+
+	ms.speculator = NewSpeculator(o, session, config.SpeculativeEnabled)
+	if config.SpeculativeEnabled && o != nil && o.llm != nil {
+		ms.speculator.SetSpeculativeProvider(o.llm)
+	}
+	ms.backchannelGen = NewBackchannelGenerator(o, session, config.BackchannelEnabled, config.BackchannelThreshold, config.Language)
+
+	ms.ttsSentenceChan = make(chan string, 32)
 
 	go ms.processBackgroundAudio()
 	go ms.monitorInactivity()
 
+	if config.BackchannelEnabled {
+		go ms.backchannelGen.PreWarm(mCtx)
+	}
+
 	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
 		go func() {
-			time.Sleep(500 * time.Millisecond) // Give audio some time to stabilize
-			// Add greeting to context first so LLM knows what it's saying
+			time.Sleep(500 * time.Millisecond)
 			greeting := "Hello!"
 			if o.config.Language == LanguageEs {
 				greeting = "¡Hola!"
@@ -174,6 +205,24 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 	return nil
 }
 
+func (ms *ManagedStream) computeRMS(chunk []byte) float64 {
+	if len(chunk) < 2 {
+		return 0
+	}
+	var sum float64
+	n := 0
+	for i := 0; i < len(chunk)-1; i += 2 {
+		sample := int16(chunk[i]) | (int16(chunk[i+1]) << 8)
+		f := float64(sample) / 32768.0
+		sum += f * f
+		n++
+	}
+	if n == 0 {
+		return 0
+	}
+	return math.Sqrt(sum / float64(n))
+}
+
 func (ms *ManagedStream) doWrite(chunk []byte) error {
 	ms.mu.Lock()
 	if ms.ctx.Err() != nil {
@@ -186,12 +235,30 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		return fmt.Errorf("VAD not configured for this stream")
 	}
 
-	// Apply echo suppression BEFORE VAD to prevent the bot from interrupting itself.
-	// We use the "Fast" version to minimize latency impact on the real-time audio loop.
 	vadChunk := chunk
 	if ms.echoSuppressor != nil {
 		vadChunk = ms.echoSuppressor.RemoveEchoRealtime(chunk)
 	}
+
+	rms := ms.computeRMS(vadChunk)
+	if ms.backchannelGen != nil {
+		ms.backchannelGen.RecordAudio(rms)
+	}
+
+	ms.mu.Lock()
+	userSpeaking := false
+	if ms.vad != nil {
+		userSpeaking = ms.vad.IsSpeaking()
+	}
+	if userSpeaking && rms > 0.001 {
+		ms.userSegmentRMS += rms
+		ms.userSegmentSamples++
+		ms.userBaselineRMS = ms.userBaselineRMS*0.995 + rms*0.005
+	} else if !userSpeaking {
+		ms.userSegmentRMS = 0
+		ms.userSegmentSamples = 0
+	}
+	ms.mu.Unlock()
 
 	event, err := ms.vad.Process(vadChunk)
 	if err != nil {
@@ -201,27 +268,19 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 	if event != nil && event.Type != VADSilence {
 		switch event.Type {
 		case VADSpeechPotential:
-			// Instant mute signal disabled to wait for firmer confirmation
-			// ms.emit(UserSpeaking, nil)
 
 		case VADSpeechStart:
+			if ms.backchannelGen != nil {
+				ms.backchannelGen.RecordUserSpeechStart()
+			}
+
 			ms.mu.Lock()
 			if ms.userSpeechStartTime.IsZero() {
 				ms.userSpeechStartTime = time.Now()
 			}
-			ms.mu.Unlock()
-
-			// We now emit UserSpeaking on a confirmed start to prevent glitchy pausing
-			ms.emit(UserSpeaking, nil)
-
-			ms.mu.Lock()
-			ms.sttGeneration++
-			pipelineCancel := ms.pipelineCancel
-			sttChan := ms.sttChan
-			ttsCancel := ms.ttsCancel
-			ms.pipelineCancel = nil
-			ms.sttChan = nil
-			ms.ttsCancel = nil
+			ms.segmentRMSStart = time.Now()
+			ms.userSegmentRMS = 0
+			ms.userSegmentSamples = 0
 
 			ms.sttStartTime = time.Now()
 			ms.sttRequestStartTime = time.Time{}
@@ -233,23 +292,41 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 			ms.ttsEndTime = time.Time{}
 			ms.botSpeakStartTime = time.Time{}
 			ms.lastAudioSentAt = time.Time{}
+
+			speaking := ms.isSpeaking
 			ms.mu.Unlock()
 
-			// Stop TTS immediately on interrupt
-			if ttsCancel != nil {
-				ttsCancel()
-			}
-			if pipelineCancel != nil {
-				pipelineCancel()
-			}
+			ms.emit(UserSpeaking, nil)
+
+			ms.mu.Lock()
+			ms.sttGeneration++
+			sttChan := ms.sttChan
+			ms.sttChan = nil
+			ms.mu.Unlock()
+
 			if sttChan != nil {
 				close(sttChan)
 			}
 
+			ms.speculator.Reset()
+			ms.sentenceBuffer.Reset()
+
 			if sProvider, ok := ms.orch.stt.(StreamingSTTProvider); ok {
-				ms.startStreamingSTT(sProvider)
+				if speaking {
+					ms.mu.Lock()
+					ms.vadDebounceUntil = time.Now().Add(300 * time.Millisecond)
+					ms.mu.Unlock()
+					go ms.debounceThenStartSTT(sProvider)
+				} else {
+					ms.emit(UserSpeaking, nil)
+					ms.startStreamingSTT(sProvider)
+				}
 			}
 		case VADSpeechEnd:
+			if ms.backchannelGen != nil {
+				ms.backchannelGen.OnSpeechEnd()
+			}
+
 			ms.mu.Lock()
 			ms.userSpeechEndTime = time.Now()
 			ms.mu.Unlock()
@@ -272,33 +349,25 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 					lastTranscript := ms.lastTranscript
 					ms.mu.Unlock()
 
-					// Fast-path: if the sound was very short, don't wait for another second
-					// to see if the user continues. It's likely just noise.
 					if duration < 500*time.Millisecond {
 						ms.runBatchPipeline(buf)
 						return
 					}
 
-					// Adaptive hold time: longer hold for short utterances (likely pauses),
-					// shorter hold for longer utterances (likely complete thoughts)
 					completionScore := ms.turnCompletion.CombinedCompletionScore(
 						lastTranscript,
 						int(duration.Milliseconds()),
 						ms.vad,
 					)
 
-					// SMART HOLD: completion score gates the response speed.
-					// High score = user finished sentence → respond FAST.
-					// Low score = user paused mid-sentence → wait LONG.
+					acousticComplete := ms.acousticCompletionHint()
+
 					var holdTime time.Duration
-					if completionScore < 0.35 {
-						// Incomplete sentence (e.g. "I think that...") → long hold
+					if completionScore < 0.35 && !acousticComplete {
 						holdTime = 600 * time.Millisecond
-					} else if completionScore > 0.65 {
-						// Complete sentence (e.g. "How are you?") → respond immediately
+					} else if completionScore > 0.65 || acousticComplete {
 						holdTime = 50 * time.Millisecond
 					} else {
-						// Ambiguous → medium hold, shorter for longer utterances
 						if duration < 1500*time.Millisecond {
 							holdTime = 350 * time.Millisecond
 						} else {
@@ -311,8 +380,6 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 					select {
 					case <-t.C:
-						// FIX: Check IsSpeaking() via the generic interface so this
-						// works for ALL VAD types, not just ImprovedRMSVAD.
 						if ms.vad != nil && ms.vad.IsSpeaking() {
 							return
 						}
@@ -330,21 +397,56 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 	isUserSpeaking := ms.vad.IsSpeaking()
 	if isUserSpeaking {
 		ms.updateActivity()
+		if ms.backchannelGen != nil {
+			ms.backchannelGen.OnUserResumed()
+		}
+	} else {
+		if ms.backchannelGen != nil && event != nil && event.Type == VADSilence {
+			ms.mu.Lock()
+			speaking := ms.isSpeaking
+			thinking := ms.isThinking
+			userStart := ms.userSpeechStartTime
+			ms.mu.Unlock()
+
+			if !speaking && !thinking && !userStart.IsZero() && time.Since(userStart) > time.Second {
+				doBC, bcText := ms.backchannelGen.OnUserPause()
+				if doBC && bcText != "" {
+					go func(t string) {
+						audio, err := ms.backchannelGen.SynthesiszeBackchannel(ms.ctx, t)
+						if err != nil || len(audio) == 0 {
+							return
+						}
+						ms.mu.Lock()
+						gen := ms.payloadGen
+						ms.mu.Unlock()
+						frameSize := int(float64(ms.playbackRate)*0.06) * 2
+						if frameSize <= 0 {
+							frameSize = 5292
+						}
+						for i := 0; i < len(audio); i += frameSize {
+							end := i + frameSize
+							if end > len(audio) {
+								end = len(audio)
+							}
+							c := make([]byte, end-i)
+							copy(c, audio[i:end])
+							ms.emitWithGen(AudioChunk, c, gen)
+						}
+					}(bcText)
+				}
+			}
+		}
 	}
 
 	cleanChunk := chunk
-	// Protect against byte-tearing on S16 PCM chunks
 	if len(cleanChunk)%2 != 0 {
 		cleanChunk = cleanChunk[:len(cleanChunk)-1]
 	}
 
 	ms.mu.Lock()
 	ms.audioBuf.Write(cleanChunk)
-	// Keep maximum 4 seconds of pristine audio (176400 bytes). Must slice on an EVEN byte boundary (2-byte samples).
-	// Crucially, only trim if we are NOT in the middle of a turn.
 	if !isUserSpeaking && ms.userSpeechStartTime.IsZero() && ms.audioBuf.Len() > 176400 {
 		data := ms.audioBuf.Bytes()
-		// Safe lead-in size (3 seconds = 132300 bytes). This is evenly divisible by 2.
 		leadIn := data[len(data)-132300:]
 		ms.audioBuf.Reset()
 		ms.audioBuf.Write(leadIn)
@@ -384,8 +486,7 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 	return nil
 }
 
-func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration time.Duration) bool {
-	// If the STT engine is >= 70% sure this is not speech, trust it.
+func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration time.Duration, speaking bool) bool {
 	if result.NoSpeechProb > 0.7 {
 		return true
 	}
@@ -395,14 +496,58 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 		return true
 	}
 
-	// Only reject very short audio with extremely short transcription.
-	// "Yes", "No", "Hi", "Okay" are all valid conversational utterances
-	// that must not be discarded. Only reject 1-2 character transcripts
-	// under 300ms (likely clicks/breaths), or empty text.
-	if audioDuration < 300*time.Millisecond && len(clean) <= 1 {
+	if len(clean) <= 1 || audioDuration < 150*time.Millisecond {
+		return true
+	}
+	if speaking && len(clean) <= 2 && audioDuration < 500*time.Millisecond {
 		return true
 	}
 	return false
+}
+
+func (ms *ManagedStream) acousticCompletionHint() bool {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	if ms.userSegmentSamples == 0 {
+		return false
+	}
+
+	avgRMS := ms.userSegmentRMS / float64(ms.userSegmentSamples)
+	baseline := ms.userBaselineRMS
+	if baseline <= 0 {
+		baseline = 0.02
+	}
+
+	energyRatio := avgRMS / baseline
+
+	fallingEnergy := energyRatio < 0.8
+	shortUtterance := ms.userSegmentSamples < 20
+
+	return fallingEnergy && shortUtterance
+}
+
+func (ms *ManagedStream) debounceThenStartSTT(provider StreamingSTTProvider) {
+	// Wait for debounce period to filter out brief noises (door slam, clap, cough)
+	ms.mu.Lock()
+	deadline := ms.vadDebounceUntil
+	ms.mu.Unlock()
+	time.Sleep(time.Until(deadline))
+
+	ms.mu.Lock()
+	// Check if VAD is still speaking (user actually continued past debounce window)
+	vadSpeaking := ms.vad != nil && ms.vad.IsSpeaking()
+	// Check if bot is still speaking (hasn't already been interrupted)
+	botSpeaking := ms.isSpeaking
+	ms.mu.Unlock()
+
+	if vadSpeaking && botSpeaking {
+		ms.emit(UserSpeaking, nil)
+		ms.startStreamingSTT(provider)
+	} else if !vadSpeaking {
+		// Brief noise - VAD stopped before debounce expired
+		fmt.Printf("\r\033[K🔇 [VAD-DEBOUNCE] Ignored brief VAD spike (noise)\n")
+	}
 }
 
 func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
@@ -418,12 +563,20 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 		speaking := ms.isSpeaking
 		thinking := ms.isThinking
 		isStale := ms.sttGeneration != currentGeneration
-		// Track transcript for turn completion analysis
 		ms.lastTranscript = transcript
+		segmentRMS := ms.userSegmentRMS
+		segmentSamples := ms.userSegmentSamples
+		baselineRMS := ms.userBaselineRMS
+		segmentDuration := time.Since(ms.segmentRMSStart)
 		ms.mu.Unlock()
 
 		if isStale && !isFinal {
 			return nil
+		}
+
+		avgSegmentRMS := 0.0
+		if segmentSamples > 0 {
+			avgSegmentRMS = segmentRMS / float64(segmentSamples)
 		}
 
 		ms.mu.Lock()
@@ -435,21 +588,45 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 		ms.mu.Unlock()
 
 		if speaking || thinking {
+			if ms.speculator != nil && ms.config.SpeculativeEnabled {
+				ms.speculator.OnInterimTranscript(ms.ctx, transcript)
+			}
+
+			isBackchannel := false
+			if segmentSamples > 0 {
+				isBackchannel = IsLikelyBackchannelAcoustic(transcript, avgSegmentRMS, baselineRMS, segmentDuration, ms.config.AcousticInterruptThreshold)
+			}
+
+			if isBackchannel && !isFinal {
+				ms.emit(TranscriptPartial, transcript)
+				return nil
+			}
+
 			wc := countWords(transcript)
+			shouldInterrupt := false
+
+			// Skip interrupt if this is likely echo from the bot's own TTS.
+			// Only check if bot was speaking and transcript has high word overlap
+			// with last assistant response (echo signature).
+			isLikelyEcho := false
+			if speaking && ms.isEchoTranscript(transcript) {
+				isLikelyEcho = true
+				fmt.Printf("\r\033[K🌀 [ECHO-GUARD] Skipping interrupt, overlap detected\n")
+			}
+
 			if minWords > 1 {
-				if wc < minWords {
-					if !isFinal {
-						ms.emit(TranscriptPartial, transcript)
-					}
-					return nil
-				}
-				noise := ms.isLikelyNoise(TranscriptionResult{Text: transcript}, duration)
-				if !noise {
-					ms.internalInterrupt()
+				if wc >= minWords && !isLikelyEcho {
+					shouldInterrupt = true
 				}
 			} else {
-				noise := ms.isLikelyNoise(TranscriptionResult{Text: transcript}, duration)
-				if strings.TrimSpace(transcript) != "" && !noise {
+				if strings.TrimSpace(transcript) != "" && !isLikelyEcho {
+					shouldInterrupt = true
+				}
+			}
+
+			if shouldInterrupt {
+				noise := ms.isLikelyNoise(TranscriptionResult{Text: transcript}, duration, speaking)
+				if !noise && !isBackchannel {
 					ms.internalInterrupt()
 				}
 			}
@@ -461,25 +638,87 @@ func (ms *ManagedStream) startStreamingSTT(provider StreamingSTTProvider) {
 			duration := time.Since(ms.sttStartTime)
 			ms.mu.Unlock()
 
-			// Warning: Streaming transcribers may not provide NoSpeechProb, so we rely on heuristics
-			if ms.isLikelyNoise(TranscriptionResult{Text: transcript}, duration) {
+			if ms.isLikelyNoise(TranscriptionResult{Text: transcript}, duration, speaking) {
 				fmt.Printf("\r\033[K🔄 [NOISE] Rejected hallucination: '%s' (dur=%v)\n", transcript, duration)
 				ms.emit(BotResumed, nil)
 				return nil
 			}
 
-			ms.emit(TranscriptFinal, transcript)
-			ms.mu.Lock()
-			if ms.inPreemptiveTurn {
-				ms.mu.Unlock()
-				ms.session.UpdateLastUserMessage(transcript)
-			} else {
-				ms.inPreemptiveTurn = true
-				ms.mu.Unlock()
-				ms.session.AddMessage("user", transcript)
+			// Echo guard: if the bot was speaking when this audio was captured,
+			// the transcription is likely echo from TTS playback. Skip processing
+			// it as user input to prevent an interrupt loop.
+			if speaking && ms.isEchoTranscript(transcript) {
+				fmt.Printf("\r\033[K🌀 [ECHO] Skipped echo transcript: '%s'\n", transcript)
+				return nil
 			}
 
-			go ms.runLLMAndTTS(ctx, transcript)
+			acceptedSpeculation := false
+			if ms.speculator != nil && ms.config.SpeculativeEnabled {
+				candidate := ms.speculator.OnFinalTranscript(ms.ctx, transcript)
+				if candidate != nil && candidate.acceptOnFinal {
+					acceptedSpeculation = true
+					sentence, audio := ms.speculator.AcceptAndConsume()
+					if sentence != "" && len(audio) > 0 {
+						ms.mu.Lock()
+						gen := ms.payloadGen
+						ms.session.AddMessage("user", transcript)
+						ms.inPreemptiveTurn = true
+						ms.session.AddMessage("assistant", sentence)
+						ms.mu.Unlock()
+
+						ms.emit(TranscriptFinal, transcript)
+						ms.emitWithGen(BotResponse, sentence, gen)
+
+						ms.mu.Lock()
+						ms.isSpeaking = true
+						ms.isThinking = false
+						if ms.vad != nil {
+							ms.vad.Reset()
+						}
+						ms.botSpeakStartTime = time.Now()
+						ms.mu.Unlock()
+
+						ms.emit(BotSpeaking, nil)
+						frameSize := int(float64(ms.playbackRate)*0.06) * 2
+						if frameSize <= 0 {
+							frameSize = 5292
+						}
+						for i := 0; i < len(audio); i += frameSize {
+							end := i + frameSize
+							if end > len(audio) {
+								end = len(audio)
+							}
+							c := make([]byte, end-i)
+							copy(c, audio[i:end])
+							ms.emitWithGen(AudioChunk, c, gen)
+						}
+
+						ms.mu.Lock()
+						ms.isSpeaking = false
+						ms.mu.Unlock()
+
+						// Turn is complete: user message + assistant response
+						// already in context, audio already played. Do NOT
+						// re-run the LLM — that would double the first sentence.
+						return nil
+					}
+				}
+			}
+
+			if !acceptedSpeculation {
+				ms.emit(TranscriptFinal, transcript)
+				ms.mu.Lock()
+				if ms.inPreemptiveTurn {
+					ms.mu.Unlock()
+					ms.session.UpdateLastUserMessage(transcript)
+				} else {
+					ms.inPreemptiveTurn = true
+					ms.mu.Unlock()
+					ms.session.AddMessage("user", transcript)
+				}
+
+				go ms.runLLMAndTTS(ctx, transcript)
+			}
 		} else {
 			ms.emit(TranscriptPartial, transcript)
 		}
@@ -574,7 +813,11 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 		audioDuration = ms.userSpeechEndTime.Sub(ms.userSpeechStartTime)
 	}
 
-	if result.Text == "" || ms.isLikelyNoise(result, audioDuration) {
+	ms.mu.Lock()
+	speaking := ms.isSpeaking
+	ms.mu.Unlock()
+
+	if result.Text == "" || ms.isLikelyNoise(result, audioDuration, speaking) {
 		if result.Text != "" {
 			fmt.Printf("\r\033[K🔄 [NOISE] Rejected hallucination: '%s' (prob=%.2f, dur=%v)\n", result.Text, result.NoSpeechProb, audioDuration)
 		}
@@ -588,7 +831,6 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 	// If they resumed during transcription processing, discard and keep listening
 	ms.mu.Lock()
 	userStillSpeaking := ms.vad != nil && ms.vad.IsSpeaking()
-	speaking := ms.isSpeaking
 	thinking := ms.isThinking
 	ms.mu.Unlock()
 
@@ -616,6 +858,14 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 		ms.internalInterrupt()
 	}
 
+	// Echo guard: if the bot was speaking, the transcription is likely
+	// echo from TTS playback. Skip to prevent the interrupt loop.
+	if speaking && ms.isEchoTranscript(transcript) {
+		fmt.Printf("\r\033[K🌀 [ECHO] Skipped echo transcript: '%s'\n", transcript)
+		ms.emit(BotResumed, nil)
+		return
+	}
+
 	ms.emit(TranscriptFinal, transcript)
 	ms.mu.Lock()
 	if ms.inPreemptiveTurn {
@@ -637,6 +887,17 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 		return
 	}
 
+	// Debug: trace LLM calls
+	fmt.Printf("\r\033[K🔍 [runLLMAndTTS] called with transcript: %q\n", transcript)
+
+	if transcript != "" {
+		ms.turnCount++
+	}
+
+	if ms.shouldSummarizeContext() {
+		go ms.summarizeContext(ctx)
+	}
+
 	if ms.responseCancel != nil {
 		ms.responseCancel()
 	}
@@ -650,7 +911,6 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.payloadGen++
 	gen := ms.payloadGen
 
-	// Reset tool recursion depth on new user turn (when transcript is non-empty)
 	if transcript != "" {
 		ms.toolRecursionDepth = 0
 	}
@@ -665,7 +925,6 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.llmStartTime = time.Now()
 	ms.mu.Unlock()
 
-	// Try streaming if supported
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
 		ms.runStreamingLLMPipeline(rCtx, sProvider)
 		return
@@ -698,49 +957,192 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 }
 
 func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider StreamingLLMProvider) {
+	useSentenceStreaming := ms.config.SentenceStreaming
+
+	if useSentenceStreaming {
+		ms.runStreamingLLMPipelineWithSentences(ctx, provider)
+		return
+	}
+
+	ms.runStreamingLLMPipelineLegacy(ctx, provider)
+}
+
+func (ms *ManagedStream) runStreamingLLMPipelineWithSentences(ctx context.Context, provider StreamingLLMProvider) {
 	var fullText strings.Builder
 	var hasToolCalls bool
 	messages := ms.session.GetContextCopy()
-	fmt.Printf("\r\033[K[DEBUG] runStreamingLLM: Starting with %d messages in session\n", len(messages))
 
-	// Debug: Show message breakdown
-	var systemCount, userCount, assistantCount, toolCount int
-	for _, m := range messages {
-		switch m.Role {
-		case "system":
-			systemCount++
-		case "user":
-			userCount++
-		case "assistant":
-			assistantCount++
-		case "tool":
-			toolCount++
+	type pendingToolResult struct {
+		tc     ToolCallEventData
+		result string
+	}
+	var toolResults []pendingToolResult
+	var toolCallCount int
+
+	sentenceCh := make(chan string, 16)
+	ttsSeqCtx, ttsSeqCancel := context.WithCancel(ctx)
+	defer ttsSeqCancel()
+
+	ttsDone := make(chan struct{})
+	go ms.ttsSequencer(ttsSeqCtx, sentenceCh, ttsDone)
+
+	hasSpoken := false
+
+	_, err := provider.StreamComplete(ctx, messages, ms.session.GetTools(), func(chunk string) error {
+		fullText.WriteString(chunk)
+
+		ms.mu.Lock()
+		if ms.llmEndTime.IsZero() {
+			ms.llmEndTime = time.Now()
+		}
+		ms.mu.Unlock()
+
+		if ms.config.ExpressiveMode {
+			chunk = stripExpressiveTags(chunk)
+		}
+
+		if ms.sentenceBuffer != nil {
+			if sentence := ms.sentenceBuffer.Feed(chunk); sentence != "" {
+				hasSpoken = true
+				select {
+				case sentenceCh <- sentence:
+				case <-ctx.Done():
+				}
+			}
+		}
+
+		return nil
+	}, func(tc ToolCallEventData) error {
+		toolCallCount++
+		hasToolCalls = true
+		ms.emit(ToolCall, tc)
+
+		if toolCallCount == 1 && ms.sentenceBuffer != nil {
+			ms.sentenceBuffer.Reset()
+		}
+
+		o := ms.orch
+		o.mu.RLock()
+		handler, ok := o.toolHandlers[tc.Name]
+		o.mu.RUnlock()
+
+		result := "Error: tool not found"
+		if ok {
+			var err error
+			result, err = handler(tc.Arguments)
+			if err != nil {
+				result = fmt.Sprintf("Error: %v", err)
+			}
+		}
+
+		toolResults = append(toolResults, pendingToolResult{tc: tc, result: result})
+		return nil
+	})
+
+	if err != nil {
+		close(sentenceCh)
+		ms.mu.Lock()
+		ms.isThinking = false
+		ms.mu.Unlock()
+		if ctx.Err() == nil {
+			ms.emit(ErrorEvent, fmt.Sprintf("Streaming LLM error: %v", err))
+		}
+		return
+	}
+
+	remainingSentences := ms.sentenceBuffer.DrainRemaining()
+	fmt.Printf("\r\033[K🔍 [DRAIN] %d remaining sentences\n", len(remainingSentences))
+	for _, s := range remainingSentences {
+		if s == "" {
+			continue
+		}
+		fmt.Printf("\r\033[K🔍 [DRAIN-SEND] %q (len=%d)\n", s[:minInt(50, len(s))], len(s))
+		hasSpoken = true
+		select {
+		case sentenceCh <- s:
+		case <-ctx.Done():
 		}
 	}
-	fmt.Printf("\r\033[K[DEBUG] Message breakdown: system=%d, user=%d, assistant=%d, tool=%d\n", systemCount, userCount, assistantCount, toolCount)
 
-	// Debug: Show last 3 messages for context
-	if len(messages) > 0 {
-		fmt.Printf("\r\033[K[DEBUG] Last messages in context:\n")
-		start := len(messages) - 3
-		if start < 0 {
-			start = 0
+	close(sentenceCh)
+
+	<-ttsDone
+
+	response := strings.TrimSpace(fullText.String())
+
+	if hasSpoken && response != "" {
+		fmt.Printf("\r\033[K🔍 [PATH-A] hasSpoken=true, response=%q\n", response[:min(30, len(response))])
+		if !hasToolCalls {
+			ms.session.AddMessage("assistant", response)
 		}
-		for i := start; i < len(messages); i++ {
-			m := messages[i]
-			content := m.Content
-			if len(content) > 60 {
-				content = content[:60] + "..."
-			}
-			if m.Role == "tool" {
-				fmt.Printf("\r\033[K  [%d] %s (id=%s): %s\n", i, m.Role, m.ToolCallID, content)
-			} else if m.ToolCalls != nil {
-				fmt.Printf("\r\033[K  [%d] %s (with tool calls): %s\n", i, m.Role, content)
-			} else {
-				fmt.Printf("\r\033[K  [%d] %s: %s\n", i, m.Role, content)
-			}
+		ms.emit(BotResponse, response)
+	} else if response != "" {
+		fmt.Printf("\r\033[K🔍 [PATH-B] hasSpoken=%v, response=%q - CALLING SPEAKTEXT!\n", hasSpoken, response[:min(30, len(response))])
+		if !hasToolCalls {
+			ms.session.AddMessage("assistant", response)
 		}
+		ms.emit(BotResponse, response)
+		ms.speakText(ctx, response)
+	} else {
+		ms.mu.Lock()
+		ms.isThinking = false
+		ms.mu.Unlock()
 	}
+
+	if hasToolCalls && len(toolResults) > 0 {
+		var tcData []interface{}
+		for _, tr := range toolResults {
+			tcData = append(tcData, map[string]interface{}{
+				"id":   tr.tc.CallID,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      tr.tc.Name,
+					"arguments": tr.tc.Arguments,
+				},
+			})
+		}
+
+		ms.session.AddMessageRaw(Message{
+			Role:      "assistant",
+			Content:   response,
+			ToolCalls: tcData,
+		})
+
+		for _, tr := range toolResults {
+			ms.session.AddMessageRaw(Message{
+				Role:       "tool",
+				Content:    tr.result,
+				ToolCallID: tr.tc.CallID,
+			})
+		}
+
+		ms.mu.Lock()
+		ms.toolRecursionDepth++
+		depth := ms.toolRecursionDepth
+		ms.mu.Unlock()
+
+		if depth > 3 {
+			ms.mu.Lock()
+			ms.isThinking = false
+			ms.mu.Unlock()
+			return
+		}
+
+		freshCtx, cancel := context.WithCancel(ms.ctx)
+		go func() {
+			defer cancel()
+			ms.runLLMAndTTS(freshCtx, "")
+			ms.mu.Lock()
+			ms.toolRecursionDepth--
+			ms.mu.Unlock()
+		}()
+	}
+}
+
+func (ms *ManagedStream) runStreamingLLMPipelineLegacy(ctx context.Context, provider StreamingLLMProvider) {
+	var fullText strings.Builder
+	var hasToolCalls bool
+	messages := ms.session.GetContextCopy()
 
 	type pendingToolResult struct {
 		tc     ToolCallEventData
@@ -759,22 +1161,7 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 		return nil
 	}, func(tc ToolCallEventData) error {
 		toolCallCount++
-		fmt.Printf("\r\033[K[DEBUG] Tool call #%d: %s, callID=%s\n", toolCallCount, tc.Name, tc.CallID)
-
-		// If the model produced some text BEFORE the tool call (the "filler"), speak it immediately
-		fillerText := strings.TrimSpace(fullText.String())
-		if fillerText != "" && !hasToolCalls {
-			fmt.Printf("\r\033[K[DEBUG] Speaking filler text before tool call: %q\n", fillerText)
-			go func(t string) {
-				ttsCtx, ttsCancel := context.WithCancel(ctx)
-				defer ttsCancel()
-				ms.speakText(ttsCtx, t)
-			}(fillerText)
-			fullText.Reset()
-		}
-
 		hasToolCalls = true
-		fmt.Printf("\r\033[K[DEBUG] Tool call detected: %s, callID=%s\n", tc.Name, tc.CallID)
 		ms.emit(ToolCall, tc)
 
 		o := ms.orch
@@ -784,13 +1171,11 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 
 		result := "Error: tool not found"
 		if ok {
-			fmt.Printf("\r\033[K[DEBUG] Executing tool: %s with args: %v\n", tc.Name, tc.Arguments)
 			var err error
 			result, err = handler(tc.Arguments)
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
-			fmt.Printf("\r\033[K[DEBUG] Tool result: %q\n", result)
 		}
 
 		toolResults = append(toolResults, pendingToolResult{tc: tc, result: result})
@@ -802,7 +1187,6 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 		ms.isThinking = false
 		ms.mu.Unlock()
 		if ctx.Err() == nil {
-			fmt.Printf("\r\033[K[DEBUG] Streaming LLM error: %v\n", err)
 			ms.emit(ErrorEvent, fmt.Sprintf("Streaming LLM error: %v", err))
 		}
 		return
@@ -811,14 +1195,11 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 	response := strings.TrimSpace(fullText.String())
 
 	if response != "" {
-		// Only add to history now if there are NO tool calls.
-		// If there are tool calls, we add it later along with the calls.
 		if !hasToolCalls {
 			ms.session.AddMessage("assistant", response)
 		}
 		ms.emit(BotResponse, response)
 
-		// Create a local context for synthesis
 		ttsCtx, ttsCancel := context.WithCancel(ctx)
 		defer ttsCancel()
 		ms.speakText(ttsCtx, response)
@@ -829,8 +1210,6 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 	}
 
 	if hasToolCalls {
-		// Add Tool Calls to History in correct sequence
-		fmt.Printf("\r\033[K[DEBUG] Adding %d tool results to session history\n", len(toolResults))
 		var tcData []interface{}
 		for _, tr := range toolResults {
 			tcData = append(tcData, map[string]interface{}{
@@ -843,7 +1222,6 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 			})
 		}
 
-		// This assistant message includes BOTH any text response and the tool calls
 		ms.session.AddMessageRaw(Message{
 			Role:      "assistant",
 			Content:   response,
@@ -858,24 +1236,18 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 			})
 		}
 
-		// Recurse to handle the tool results
-		fmt.Printf("\r\033[K[DEBUG] Recursing to process tool results (depth=%d)\n", ms.toolRecursionDepth)
 		ms.mu.Lock()
 		ms.toolRecursionDepth++
 		depth := ms.toolRecursionDepth
 		ms.mu.Unlock()
 
-		// Safety check: prevent infinite loops from tool recursion
 		if depth > 3 {
-			fmt.Printf("\r\033[K[DEBUG] ⚠️  SAFETY: Tool recursion depth exceeded (depth=%d), stopping recursion and speaking accumulated response\n", depth)
-			// Don't recurse further, just ensure the bot can speak whatever response we have
 			ms.mu.Lock()
 			ms.isThinking = false
 			ms.mu.Unlock()
 			return
 		}
 
-		// Use a fresh context for the recursive call rather than the streaming context
 		freshCtx, cancel := context.WithCancel(ms.ctx)
 		go func() {
 			defer cancel()
@@ -888,6 +1260,9 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string) {
+	// Debug: trace batch TTS calls
+	fmt.Printf("\r\033[K🔊 [speakText] text: %q\n", text)
+
 	// Create a sub-context that we can cancel specifically if interrupted
 	sCtx, sCancel := context.WithCancel(ctx)
 	defer sCancel()
@@ -1025,6 +1400,306 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 		// This is a bit tricky but simple enough for local logic
 		ms.ttsCancel = nil
 	}
+	ms.mu.Unlock()
+}
+
+func (ms *ManagedStream) ttsSequencer(ctx context.Context, sentences <-chan string, done chan<- struct{}) {
+	defer func() {
+		if done != nil {
+			close(done)
+		}
+	}()
+
+	hasEmittedSpeaking := false
+	var lastSentence string
+
+	// Capture generation at start to detect stale calls after interruption
+	startGen := ms.payloadGen
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sentence, ok := <-sentences:
+			if !ok {
+				return
+			}
+
+			// Check if this is a stale call from previous generation
+			ms.mu.Lock()
+			currentGen := ms.payloadGen
+			ms.mu.Unlock()
+			if currentGen != startGen {
+				fmt.Printf("\r\033[K⚠️ [STALE-TTS] Generation mismatch: expected %d, got %d\n", startGen, currentGen)
+				return
+			}
+
+			if sentence == "" {
+				continue
+			}
+
+			// Guard: skip if same sentence was just synthesized (prevents duplicates after interruption)
+			if lastSentence == sentence {
+				fmt.Printf("\r\033[K⚠️ [DUPLICATE-GUARD] Skipping duplicate: %q\n", sentence)
+				lastSentence = sentence
+				continue
+			}
+			lastSentence = sentence
+
+			if !hasEmittedSpeaking {
+				ms.mu.Lock()
+				ms.isThinking = false
+				ms.isSpeaking = true
+				if ms.vad != nil {
+					ms.vad.Reset()
+				}
+				ms.botSpeakStartTime = time.Now()
+				ms.ttsStartTime = ms.botSpeakStartTime
+
+				if ms.vad == nil || !ms.vad.IsSpeaking() {
+					ms.audioBuf.Reset()
+					ms.lastUserAudio = nil
+					ms.userSpeechStartTime = time.Time{}
+					ms.inPreemptiveTurn = false
+				}
+				ms.mu.Unlock()
+
+				ms.emit(BotSpeaking, nil)
+				hasEmittedSpeaking = true
+			}
+
+			ms.synthesizeSentence(ctx, sentence)
+		}
+	}
+}
+
+func (ms *ManagedStream) synthesizeSentence(ctx context.Context, sentence string) {
+	ms.mu.Lock()
+	pRate := ms.playbackRate
+	gen := ms.payloadGen
+	isStreamingTTS := ms.orch != nil && ms.orch.GetProviders()["tts"] == "deepgram"
+	ms.mu.Unlock()
+
+	// Debug: trace TTS calls
+	fmt.Printf("\r\033[K🔊 [synthesizeSentence] sentence: %q\n", sentence)
+
+	jitterBufferMs := ms.adaptiveJitterMs()
+	frameSize := int(float64(pRate)*0.06) * 2
+	if frameSize <= 0 {
+		frameSize = 5292
+	}
+	jitterTargetBytes := int(float64(pRate)*float64(jitterBufferMs)/1000.0) * 2
+
+	var jitterBuf []byte
+	hasStartedPlayback := false
+
+	err := ms.orch.SynthesizeStream(ctx, sentence, ms.session.GetCurrentVoice(), ms.session.GetCurrentLanguage(), func(chunk []byte) error {
+		// Check if this generation is still active (not cancelled/interrupted)
+		ms.mu.Lock()
+		currentGen := ms.payloadGen
+		ms.mu.Unlock()
+		if currentGen != gen {
+			return nil // Skip audio from cancelled generation
+		}
+
+		ms.mu.Lock()
+		ms.lastAudioSentAt = time.Now()
+		ms.mu.Unlock()
+
+		if isStreamingTTS {
+			for i := 0; i < len(chunk); i += frameSize {
+				end := i + frameSize
+				if end > len(chunk) {
+					end = len(chunk)
+				}
+				c := make([]byte, end-i)
+				copy(c, chunk[i:end])
+				ms.emitWithGen(AudioChunk, c, gen)
+			}
+			return nil
+		}
+
+		if !hasStartedPlayback {
+			jitterBuf = append(jitterBuf, chunk...)
+			if len(jitterBuf) >= jitterTargetBytes {
+				hasStartedPlayback = true
+				for i := 0; i < len(jitterBuf); i += frameSize {
+					end := i + frameSize
+					if end > len(jitterBuf) {
+						end = len(jitterBuf)
+					}
+					c := make([]byte, end-i)
+					copy(c, jitterBuf[i:end])
+					ms.emitWithGen(AudioChunk, c, gen)
+				}
+				jitterBuf = nil
+			}
+			return nil
+		}
+
+		for i := 0; i < len(chunk); i += frameSize {
+			end := i + frameSize
+			if end > len(chunk) {
+				end = len(chunk)
+			}
+			c := make([]byte, end-i)
+			copy(c, chunk[i:end])
+			ms.emitWithGen(AudioChunk, c, gen)
+		}
+		return nil
+	})
+
+	if !hasStartedPlayback && len(jitterBuf) > 0 {
+		for i := 0; i < len(jitterBuf); i += frameSize {
+			end := i + frameSize
+			if end > len(jitterBuf) {
+				end = len(jitterBuf)
+			}
+			c := make([]byte, end-i)
+			copy(c, jitterBuf[i:end])
+			ms.emitWithGen(AudioChunk, c, gen)
+		}
+	}
+
+	if err != nil && ctx.Err() == nil {
+		ms.emit(ErrorEvent, fmt.Sprintf("TTS sentence error: %v", err))
+	}
+}
+
+func (ms *ManagedStream) adaptiveJitterMs() int {
+	base := 200
+	if env := os.Getenv("JITTER_BUFFER_MS"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v >= 0 {
+			base = v
+		}
+	}
+
+	ms.mu.Lock()
+	isStreaming := ms.orch != nil && ms.orch.GetProviders()["tts"] == "deepgram"
+	ms.mu.Unlock()
+
+	if isStreaming {
+		return 0
+	}
+
+	if ms.config.SentenceStreaming {
+		return minInt(base, 100)
+	}
+
+	return base
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+var expressiveTagPatterns = []struct {
+	open  string
+	close string
+}{
+	{open: "[laughs]", close: "[/laughs]"},
+	{open: "[whispers]", close: "[/whispers]"},
+	{open: "[sighs]", close: "[/sighs]"},
+	{open: "[excited]", close: "[/excited]"},
+	{open: "[slow]", close: "[/slow]"},
+	{open: "[fast]", close: "[/fast]"},
+	{open: "[sad]", close: "[/sad]"},
+	{open: "[angry]", close: "[/angry]"},
+}
+
+func stripExpressiveTags(text string) string {
+	result := text
+	for _, p := range expressiveTagPatterns {
+		result = strings.ReplaceAll(result, p.open, "")
+		result = strings.ReplaceAll(result, p.close, "")
+	}
+	result = strings.ReplaceAll(result, "[", "")
+	result = strings.ReplaceAll(result, "]", "")
+	return result
+}
+
+// isEchoTranscript checks if the transcript likely comes from the bot's own
+// TTS playback being picked up by the microphone. It compares word overlap
+// with the last assistant response.
+func (ms *ManagedStream) isEchoTranscript(transcript string) bool {
+	if ms.session == nil {
+		return false
+	}
+	ctx := ms.session.GetContextCopy()
+	if len(ctx) == 0 {
+		return false
+	}
+	// Check the last 2 messages for assistant role
+	var lastMsg Message
+	found := false
+	for i := len(ctx) - 1; i >= 0; i-- {
+		if ctx[i].Role == "assistant" {
+			lastMsg = ctx[i]
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	overlap := specSimilarity(transcript, lastMsg.Content)
+	// Lower threshold to catch more echo - even partial word matches matter
+	return overlap > 0.15
+}
+
+func (ms *ManagedStream) shouldSummarizeContext() bool {
+	threshold := ms.config.ContextSummarizationThreshold
+	if threshold <= 0 {
+		return false
+	}
+	return ms.turnCount > 0 && ms.turnCount%threshold == 0
+}
+
+func (ms *ManagedStream) summarizeContext(ctx context.Context) {
+	if ms.orch == nil || ms.orch.llm == nil {
+		return
+	}
+
+	ms.mu.Lock()
+	messages := ms.session.GetContextCopy()
+	ms.mu.Unlock()
+
+	if len(messages) < 6 {
+		return
+	}
+
+	var textParts []string
+	for _, m := range messages[:len(messages)-4] {
+		if m.Role == "user" || m.Role == "assistant" {
+			textParts = append(textParts, m.Role+": "+m.Content)
+		}
+	}
+
+	if len(textParts) < 3 {
+		return
+	}
+
+	prompt := "Summarize the key points from this conversation history in 2-3 sentences." +
+		" Focus on facts established, user preferences, and any decisions made.\n\n" + strings.Join(textParts, "\n")
+
+	summary, err := ms.orch.llm.Complete(ctx, []Message{
+		{Role: "system", Content: "You are a conversation summarizer. Output ONLY a brief summary."},
+		{Role: "user", Content: prompt},
+	}, nil)
+
+	if err != nil || summary == "" {
+		return
+	}
+
+	ms.mu.Lock()
+	keep := ms.session.Context[len(ms.session.Context)-4:]
+	ms.session.Context = append([]Message{
+		{Role: "system", Content: fmt.Sprintf("[Conversation summary of previous turns]: %s", summary)},
+	}, keep...)
+	ms.turnCount = 0
 	ms.mu.Unlock()
 }
 
@@ -1251,8 +1926,6 @@ func (ms *ManagedStream) interrupt() {
 func (ms *ManagedStream) internalInterrupt() {
 	ms.mu.Lock()
 
-	// Check if there's anything to interrupt (TTS or LLM request)
-	// We allow a 1-second window after isSpeaking=false to account for audio in the playback buffer.
 	isStillPlaying := time.Since(ms.lastAudioSentAt) < time.Second
 
 	if ms.responseCancel == nil && ms.ttsCancel == nil && !ms.isSpeaking && !ms.isThinking && !ms.userInterrupting && !isStillPlaying {
@@ -1271,15 +1944,20 @@ func (ms *ManagedStream) internalInterrupt() {
 	if ms.userSpeechEndTime.IsZero() {
 		ms.userSpeechEndTime = time.Now()
 	}
-	ms.sttEndTime = ms.userSpeechEndTime // For latency breakdown consistency
+	ms.sttEndTime = ms.userSpeechEndTime
 
 	ms.isSpeaking = false
 	ms.isThinking = false
 	ms.userInterrupting = false
-	// We don't increment gen here anymore as runLLMAndTTS handles it,
-	// keeping it simple and unified.
 	gen := ms.payloadGen
 	ms.mu.Unlock()
+
+	if ms.speculator != nil {
+		ms.speculator.Reset()
+	}
+	if ms.sentenceBuffer != nil {
+		ms.sentenceBuffer.Reset()
+	}
 
 	ms.echoSuppressor.ClearEchoBuffer()
 

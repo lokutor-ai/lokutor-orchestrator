@@ -7,7 +7,7 @@ import (
 )
 
 func TestManagedStream_PlaybackAlignedEchoDetection(t *testing.T) {
-	orch := New(nil, nil, nil, Config{})
+	orch := New(nil, nil, nil, nil, Config{}, nil)
 	sess := NewConversationSession("test")
 	ms := NewManagedStream(context.Background(), orch, sess)
 

@@ -62,7 +62,7 @@ func TestOrchestratorCreation(t *testing.T) {
 	tts := &MockTTSProvider{}
 	config := DefaultConfig()
 
-	orch := New(stt, llm, tts, config)
+	orch := New(stt, llm, tts, nil, config, nil)
 
 	if orch == nil {
 		t.Fatal("Expected orchestrator to be created")
@@ -91,13 +91,15 @@ func TestProcessAudio(t *testing.T) {
 		synthesizeResult: []byte{0x01, 0x02, 0x03, 0x04},
 	}
 
-	orch := New(stt, llm, tts, DefaultConfig())
+	orch := New(stt, llm, tts, nil, DefaultConfig(), nil)
 	session := NewConversationSession("test_user")
 
 	transcript, audioBytes, err := orch.ProcessAudio(
 		context.Background(),
 		session,
 		[]byte{0xFF, 0xFE},
+		false,
+		nil,
 	)
 
 	if err != nil {
@@ -136,7 +138,7 @@ func TestProcessAudioStream(t *testing.T) {
 		synthesizeResult: []byte{0x01, 0x02},
 	}
 
-	orch := New(stt, llm, tts, DefaultConfig())
+	orch := New(stt, llm, tts, nil, DefaultConfig(), nil)
 	session := NewConversationSession("test_user")
 
 	chunks := [][]byte{}
@@ -169,7 +171,7 @@ func TestConfigManagement(t *testing.T) {
 	tts := &MockTTSProvider{}
 
 	originalConfig := DefaultConfig()
-	orch := New(stt, llm, tts, originalConfig)
+	orch := New(stt, llm, tts, nil, originalConfig, nil)
 
 	cfg := orch.GetConfig()
 	if cfg.SampleRate != originalConfig.SampleRate {
@@ -200,7 +202,7 @@ func TestConcurrentSessionOperations(t *testing.T) {
 	llm := &MockLLMProvider{completeResult: "Hi there"}
 	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
 
-	orch := New(stt, llm, tts, DefaultConfig())
+	orch := New(stt, llm, tts, nil, DefaultConfig(), nil)
 	session := NewConversationSession("concurrent_test")
 
 	numGoroutines := 10
@@ -208,7 +210,7 @@ func TestConcurrentSessionOperations(t *testing.T) {
 
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
-			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"))
+			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"), false, nil)
 			if err != nil {
 				t.Errorf("ProcessAudio failed: %v", err)
 			}
@@ -231,7 +233,7 @@ func TestConfigThreadSafety(t *testing.T) {
 	tts := &MockTTSProvider{}
 
 	config := DefaultConfig()
-	orch := New(stt, llm, tts, config)
+	orch := New(stt, llm, tts, nil, config, nil)
 
 	done := make(chan bool, 20)
 
@@ -266,13 +268,13 @@ func TestContextCancellation(t *testing.T) {
 	llm := &MockLLMProvider{}
 	tts := &MockTTSProvider{}
 
-	orch := New(stt, llm, tts, DefaultConfig())
+	orch := New(stt, llm, tts, nil, DefaultConfig(), nil)
 	session := NewConversationSession("cancel_test")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, _, err := orch.ProcessAudio(ctx, session, []byte("audio"))
+	_, _, err := orch.ProcessAudio(ctx, session, []byte("audio"), false, nil)
 	if err == nil {
 		t.Fatal("ProcessAudio should return error when context is cancelled")
 	}
@@ -297,10 +299,10 @@ func TestCustomErrorTypes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			orch := New(tt.stt, tt.llm, tt.tts, DefaultConfig())
+			orch := New(tt.stt, tt.llm, tt.tts, nil, DefaultConfig(), nil)
 			session := NewConversationSession("error_test")
 
-			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"))
+			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"), false, nil)
 			if !isErrorType(err, tt.expectedErr) {
 				t.Errorf("expected error type %T, got %T: %v", tt.expectedErr, err, err)
 			}
