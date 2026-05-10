@@ -982,9 +982,11 @@ func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 		if o.config.VoiceStyle != "" {
 			voice = o.config.VoiceStyle
 		}
-		if o.config.Language != "" {
-			lang = o.config.Language
-		}
+	}
+	if ms.session != nil && ms.session.CurrentLanguage != "" {
+		lang = ms.session.CurrentLanguage
+	} else if o != nil && o.config.Language != "" {
+		lang = o.config.Language
 	}
 
 	var phrases []string
