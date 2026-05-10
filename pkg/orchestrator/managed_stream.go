@@ -396,6 +396,15 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 					select {
 					case <-t.C:
+						// Check if user resumed speaking during the hold period.
+						// If so, bail out — the user is still mid-turn and we'd
+						// process a partial utterance and race with their continuation.
+						ms.mu.Lock()
+						stillSpeaking := ms.vad != nil && ms.vad.IsSpeaking()
+						ms.mu.Unlock()
+						if stillSpeaking {
+							return
+						}
 						ms.runBatchPipeline(buf)
 					case <-ms.ctx.Done():
 						return
