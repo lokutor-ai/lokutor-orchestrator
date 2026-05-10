@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
 )
 
 type ManagedStream struct {
@@ -61,6 +63,8 @@ type ManagedStream struct {
 	playbackRate     int
 
 	toolRecursionDepth int // Safety counter to prevent infinite tool loops
+
+	prosody *prosody.AdaptiveProcessor
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -89,6 +93,12 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		lastActivityAt: time.Now(),
 		playbackRate:   44100, // Default to hifi
 		turnCompletion: NewTurnCompletionAnalyzer(),
+		prosody: func() *prosody.AdaptiveProcessor {
+			cfg := prosody.DefaultConfig()
+			cfg.ThinkerMode = true
+			cfg.EmphasisLevel = 0.6
+			return prosody.NewAdaptiveProcessor(cfg)
+		}(),
 	}
 
 	go ms.processBackgroundAudio()
@@ -888,6 +898,16 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string) {
+	// Apply prosody to the text before TTS
+	if ms.prosody != nil {
+		prosodyResult := ms.prosody.ProcessText(text)
+		prosodyText := applyProsodyText(prosodyResult)
+		fmt.Printf("[PROSODY] original=%d chars -> prosody=%d chars, estimated=%dms\n",
+			len(text), len(prosodyText), prosodyResult.EstimatedMs)
+		text = prosodyText
+		defer ms.prosody.UpdateContext(text, prosodyResult.EstimatedMs)
+	}
+
 	// Create a sub-context that we can cancel specifically if interrupted
 	sCtx, sCancel := context.WithCancel(ctx)
 	defer sCancel()
@@ -1403,4 +1423,23 @@ func (ms *ManagedStream) runSilenceCheck() {
 
 	// Ask the LLM to handle the silence naturally
 	ms.runLLMAndTTS(ctx, "[USER_SILENCE_TIMEOUT]")
+}
+
+// applyProsodyText converts prosody markers into text modifications that any TTS can interpret
+func applyProsodyText(result prosody.ProsodyResult) string {
+	var out string
+	for _, m := range result.Markers {
+		if m.PauseBefore > 200 {
+			out += "... "
+		}
+		if m.IsEmphasized {
+			out += m.Text + ", "
+		} else {
+			out += m.Text + " "
+		}
+		if m.PauseAfter > 200 {
+			out += "... "
+		}
+	}
+	return out
 }

@@ -218,16 +218,16 @@ func main() {
 	var playbackPaused bool
 	const preRollSize = 44100 * 2 * 60 / 1000 // 60ms pre-roll
 
-	// Audio enhancer for better sound quality - louder and warmer
+	// Audio enhancer for better sound quality
 	audioEnhancer := audio.NewProcessor(audio.Config{
-		TargetLUFS:      -14,    // Louder for better audibility
-		LowShelfGain:   4.0,    // More bass
-		HighShelfGain:  -0.5,   // Slightly smoother highs
-		PresenceGain:   2.0,    // More presence/clarity
-		HarmonicMix:    0.15,   // Warmth
-		ReverbMix:      0.05,   // Slight room
-		CompressRatio:  3,      // Even out volume
-		CompressThreshold: -18,
+		TargetLUFS:      -18,
+		LowShelfGain:    1.5,
+		HighShelfGain:   0,
+		PresenceGain:    0.5,
+		HarmonicMix:     0.05,
+		ReverbMix:       0.02,
+		CompressRatio:   2,
+		CompressThreshold: -24,
 	})
 
 	chunkPool := sync.Pool{
