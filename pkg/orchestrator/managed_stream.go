@@ -987,7 +987,12 @@ func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 		}
 	}
 
-	phrases := []string{"mhm", "uh-huh", "yeah"}
+	var phrases []string
+	if lang == LanguageEs {
+		phrases = []string{"mhm", "ahá", "sí"}
+	} else {
+		phrases = []string{"mhm", "uh-huh", "yeah"}
+	}
 	clips := make([][]byte, 0, len(phrases))
 
 	for _, phrase := range phrases {
