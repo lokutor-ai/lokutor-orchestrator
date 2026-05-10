@@ -216,74 +216,55 @@ func TestManagedStream_ExportLastUserAudio(t *testing.T) {
 	}
 	go ms.processBackgroundAudio()
 
-	played := make([]byte, 44100/10*2)
-	for i := 0; i < len(played)-1; i += 2 {
-		val := int16(10000)
-		played[i] = byte(val)
-		played[i+1] = byte(val >> 8)
-	}
-
-	atten := make([]byte, len(played))
-	for i := 0; i < len(played)-1; i += 2 {
-		s := int16(played[i]) | (int16(played[i+1]) << 8)
-		s = int16(float64(s) * 0.25)
-		atten[i] = byte(s)
-		atten[i+1] = byte(s >> 8)
-	}
-
 	user := make([]byte, 44100/20*2)
 	for i := 0; i < len(user)-1; i += 2 {
 		user[i] = 0x40
 		user[i+1] = 0x00
 	}
 
-	mic := append([]byte{}, atten...)
-	mic = append(mic, user...)
-
-	ms.echoSuppressor = NewEchoSuppressor()
-	ms.echoSuppressor.RecordPlayedAudio(played)
 	ms.mu.Lock()
-	ms.lastUserAudio = make([]byte, len(mic))
-	copy(ms.lastUserAudio, mic)
+	ms.lastUserAudio = make([]byte, len(user))
+	copy(ms.lastUserAudio, user)
 	ms.mu.Unlock()
 
 	raw, processed := ms.ExportLastUserAudio()
 	if raw == nil || processed == nil {
 		t.Fatal("expected non-nil raw and processed")
 	}
-	if len(raw) != len(mic) {
-		t.Fatalf("raw len mismatch: %d vs %d", len(raw), len(mic))
+	if len(raw) != len(user) {
+		t.Fatalf("raw len mismatch: %d vs %d", len(raw), len(user))
 	}
-
-	before := pcmEnergy(raw[:len(played)])
-	after := pcmEnergy(processed[:len(played)])
-	if after > before*0.5 {
-		t.Fatalf("expected echo reduced by >50%%; before=%v after=%v", before, after)
+	if len(processed) != len(user) {
+		t.Fatalf("processed len mismatch: %d vs %d", len(processed), len(user))
 	}
 }
 
-func TestManagedStream_SetEchoSampleRates(t *testing.T) {
-	ms := &ManagedStream{echoSuppressor: NewEchoSuppressor()}
+func TestManagedStream_SetPlaybackRate(t *testing.T) {
+	ms := &ManagedStream{}
 	ms.SetEchoSampleRates(48000, 16000)
-	if ms.echoSuppressor.playbackSampleRate != 48000 || ms.echoSuppressor.inputSampleRate != 16000 {
-		t.Fatalf("rates not propagated to suppressor: %d/%d", ms.echoSuppressor.playbackSampleRate, ms.echoSuppressor.inputSampleRate)
+	if ms.playbackRate != 48000 {
+		t.Fatalf("rate not set: %d", ms.playbackRate)
 	}
 }
 
-func TestManagedStream_DropsEchoBeforeSTT(t *testing.T) {
+func TestManagedStream_StreamsToSTT(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	ms := &ManagedStream{
-		events:         make(chan OrchestratorEvent, 10),
-		session:        &ConversationSession{ID: "test"},
-		ctx:            ctx,
-		echoSuppressor: NewEchoSuppressor(),
-		audioBuf:       new(bytes.Buffer),
-		writeChan:      make(chan []byte, 100),
+		events:    make(chan OrchestratorEvent, 10),
+		session:   &ConversationSession{ID: "test"},
+		ctx:       ctx,
+		audioBuf:  new(bytes.Buffer),
+		writeChan: make(chan []byte, 100),
 	}
 	go ms.processBackgroundAudio()
 	ms.vad = NewRMSVAD(0.02, 50*time.Millisecond)
+
+	ch := make(chan []byte, 4)
+	ms.mu.Lock()
+	ms.sttChan = ch
+	ms.mu.Unlock()
 
 	played := make([]byte, 4410*2)
 	for i := 0; i < len(played)-1; i += 2 {
@@ -292,19 +273,11 @@ func TestManagedStream_DropsEchoBeforeSTT(t *testing.T) {
 		played[i+1] = byte(val >> 8)
 	}
 
-	ms.RecordPlayedOutput(played)
-
-	ch := make(chan []byte, 4)
-	ms.mu.Lock()
-	ms.sttChan = ch
-	ms.mu.Unlock()
-
 	err := ms.Write(played)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Give the background worker a moment to process doWrite
 	time.Sleep(50 * time.Millisecond)
 
 	select {

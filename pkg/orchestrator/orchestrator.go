@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -119,6 +120,33 @@ func (o *Orchestrator) Synthesize(ctx context.Context, text string, voice Voice,
 
 func (o *Orchestrator) SynthesizeStream(ctx context.Context, text string, voice Voice, lang Language, onChunk func([]byte) error) error {
 	return o.tts.StreamSynthesize(ctx, text, voice, lang, onChunk)
+}
+
+func (o *Orchestrator) SetTTSRate(rate float64) {
+	type rateSetter interface {
+		SetSpeechRate(float64)
+	}
+	if rs, ok := o.tts.(rateSetter); ok {
+		rs.SetSpeechRate(rate)
+	}
+}
+
+func (o *Orchestrator) GenerateSilent(ctx context.Context, text string, voice Voice, lang Language) ([]byte, error) {
+	// Try Synthesize (REST) first — avoids WS conflicts with streaming TTS
+	audio, err := o.tts.Synthesize(ctx, text, voice, lang)
+	if err == nil && len(audio) > 0 {
+		return audio, nil
+	}
+
+	// Fall back to buffering StreamSynthesize if Synthesize is unavailable
+	var buf bytes.Buffer
+	if err := o.tts.StreamSynthesize(ctx, text, voice, lang, func(chunk []byte) error {
+		buf.Write(chunk)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (o *Orchestrator) UpdateConfig(cfg Config) {

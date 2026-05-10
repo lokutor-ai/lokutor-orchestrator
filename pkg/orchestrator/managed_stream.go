@@ -51,7 +51,6 @@ type ManagedStream struct {
 	responseCancel   context.CancelFunc
 	ttsCancel        context.CancelFunc
 	userInterrupting bool
-	echoSuppressor   *EchoSuppressor
 	closeOnce        sync.Once
 
 	payloadGen       int
@@ -61,10 +60,16 @@ type ManagedStream struct {
 	inPreemptiveTurn bool
 	lastActivityAt   time.Time
 	playbackRate     int
+	inputSampleRate  int
 
 	toolRecursionDepth int // Safety counter to prevent infinite tool loops
 
-	prosody *prosody.AdaptiveProcessor
+	prosody    *prosody.AdaptiveProcessor
+	backchannel *BackchannelDetector
+	userProfile *prosody.UserSpeechProfile
+	userEnergyBuf []float64
+
+	backchannelClips [][]byte
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
@@ -75,9 +80,9 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		streamVAD = o.vad.Clone()
 	}
 
-	config := DefaultConfig()
+	cfg := DefaultConfig()
 	if o != nil {
-		config = o.GetConfig()
+		cfg = o.GetConfig()
 	}
 
 	ms := &ManagedStream{
@@ -88,10 +93,10 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		events:         make(chan OrchestratorEvent, 1024),
 		audioBuf:       new(bytes.Buffer),
 		vad:            streamVAD,
-		echoSuppressor: NewEchoSuppressorWithConfig(config),
 		writeChan:      make(chan []byte, 512),
 		lastActivityAt: time.Now(),
 		playbackRate:   44100, // Default to hifi
+		inputSampleRate: cfg.SampleRate,
 		turnCompletion: NewTurnCompletionAnalyzer(),
 		prosody: func() *prosody.AdaptiveProcessor {
 			cfg := prosody.DefaultConfig()
@@ -99,10 +104,23 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			cfg.EmphasisLevel = 0.6
 			return prosody.NewAdaptiveProcessor(cfg)
 		}(),
+		userProfile: prosody.NewUserSpeechProfile(),
+		userEnergyBuf: make([]float64, 0, 100),
 	}
 
 	go ms.processBackgroundAudio()
 	go ms.monitorInactivity()
+
+	if ms.backchannel == nil {
+		ms.backchannel = NewBackchannelDetector(DefaultBackchannelConfig(), 44100, func(raw []byte) {
+			ms.emitBackchannel(raw)
+		})
+	}
+
+	// Pre-generate backchannel clips using the actual TTS voice
+	if o != nil && o.tts != nil {
+		go ms.generateBackchannelClips(o)
+	}
 
 	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
 		go func() {
@@ -152,9 +170,6 @@ func (ms *ManagedStream) SetEchoSampleRates(playbackRate, inputRate int) {
 	ms.mu.Lock()
 	ms.playbackRate = playbackRate
 	ms.mu.Unlock()
-	if ms.echoSuppressor != nil {
-		ms.echoSuppressor.SetSampleRates(playbackRate, inputRate)
-	}
 }
 
 func (ms *ManagedStream) Interrupt() {
@@ -170,6 +185,17 @@ func countWords(s string) int {
 		return 0
 	}
 	return len(strings.Fields(s))
+}
+
+func bytesToInt16(buf []byte) []int16 {
+	if len(buf)%2 != 0 {
+		buf = buf[:len(buf)-1]
+	}
+	samples := make([]int16, len(buf)/2)
+	for i := range samples {
+		samples[i] = int16(buf[i*2]) | int16(buf[i*2+1])<<8
+	}
+	return samples
 }
 
 func (ms *ManagedStream) Write(chunk []byte) error {
@@ -196,32 +222,70 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 		return fmt.Errorf("VAD not configured for this stream")
 	}
 
-	// Apply echo suppression BEFORE VAD to prevent the bot from interrupting itself.
-	// We use the "Fast" version to minimize latency impact on the real-time audio loop.
-	vadChunk := chunk
-	if ms.echoSuppressor != nil {
-		vadChunk = ms.echoSuppressor.RemoveEchoRealtime(chunk)
-	}
-
-	event, err := ms.vad.Process(vadChunk)
+	event, err := ms.vad.Process(chunk)
 	if err != nil {
 		return err
 	}
 
 	if event != nil && event.Type != VADSilence {
 		switch event.Type {
-		case VADSpeechPotential:
-			// Instant mute signal disabled to wait for firmer confirmation
-			// ms.emit(UserSpeaking, nil)
-
 		case VADSpeechStart:
 			ms.mu.Lock()
 			if ms.userSpeechStartTime.IsZero() {
 				ms.userSpeechStartTime = time.Now()
 			}
+			botSpeaking := ms.isSpeaking || ms.isThinking
 			ms.mu.Unlock()
 
-			// We now emit UserSpeaking on a confirmed start to prevent glitchy pausing
+			// Notify backchannel detector
+			if ms.backchannel != nil {
+				ms.backchannel.UserStarted()
+			}
+
+			if botSpeaking {
+				// Interrupt immediately — ImprovedRMSVAD already filters out noise,
+				// so no extra debounce needed
+				ms.emit(UserSpeaking, nil)
+				ms.mu.Lock()
+				ms.sttGeneration++
+				pipelineCancel := ms.pipelineCancel
+				sttChan := ms.sttChan
+				ttsCancel := ms.ttsCancel
+				ms.pipelineCancel = nil
+				ms.sttChan = nil
+				ms.ttsCancel = nil
+
+				ms.sttStartTime = time.Now()
+				ms.sttRequestStartTime = time.Time{}
+				ms.sttEndTime = time.Time{}
+				ms.llmStartTime = time.Time{}
+				ms.llmEndTime = time.Time{}
+				ms.ttsStartTime = time.Time{}
+				ms.ttsFirstChunkTime = time.Time{}
+				ms.ttsEndTime = time.Time{}
+				ms.botSpeakStartTime = time.Time{}
+				ms.lastAudioSentAt = time.Time{}
+				ms.mu.Unlock()
+
+				if ttsCancel != nil {
+					ttsCancel()
+				}
+				if pipelineCancel != nil {
+					pipelineCancel()
+				}
+				if sttChan != nil {
+					close(sttChan)
+				}
+				if ms.orch != nil && ms.orch.tts != nil {
+					ms.orch.tts.Abort()
+				}
+
+				if sProvider, ok := ms.orch.stt.(StreamingSTTProvider); ok {
+					ms.startStreamingSTT(sProvider)
+				}
+				break
+			}
+
 			ms.emit(UserSpeaking, nil)
 
 			ms.mu.Lock()
@@ -265,12 +329,24 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 			ms.mu.Unlock()
 			ms.emit(UserStopped, nil)
 
+			// Notify backchannel detector that user stopped speaking
+			if ms.backchannel != nil {
+				ms.backchannel.UserStopped()
+			}
+
 			ms.mu.Lock()
 			sttChan := ms.sttChan
 			if sttChan != nil {
 				ms.sttChan = nil
+				// Capture accumulated streaming STT audio
+				sttAudio := make([]byte, len(ms.lastUserAudio))
+				copy(sttAudio, ms.lastUserAudio)
+				sr := ms.inputSampleRate
 				ms.mu.Unlock()
 				close(sttChan)
+				go func(a []byte, rate int) {
+					captureSTTAudio(a, rate, "stream")
+				}(sttAudio, sr)
 			} else {
 				audioData := make([]byte, ms.audioBuf.Len())
 				copy(audioData, ms.audioBuf.Bytes())
@@ -294,7 +370,6 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 					completionScore := ms.turnCompletion.CombinedCompletionScore(
 						lastTranscript,
 						int(duration.Milliseconds()),
-						ms.vad,
 					)
 
 					// SMART HOLD: completion score gates the response speed.
@@ -321,11 +396,6 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 					select {
 					case <-t.C:
-						// FIX: Check IsSpeaking() via the generic interface so this
-						// works for ALL VAD types, not just ImprovedRMSVAD.
-						if ms.vad != nil && ms.vad.IsSpeaking() {
-							return
-						}
 						ms.runBatchPipeline(buf)
 					case <-ms.ctx.Done():
 						return
@@ -335,6 +405,12 @@ func (ms *ManagedStream) doWrite(chunk []byte) error {
 
 		case VADSilence:
 		}
+	}
+
+	// Feed audio to backchannel detector when user is speaking
+	if ms.backchannel != nil && ms.vad.IsSpeaking() && len(chunk) >= 80 {
+		samples := bytesToInt16(chunk)
+		ms.backchannel.ProcessAudio(samples, time.Now())
 	}
 
 	isUserSpeaking := ms.vad.IsSpeaking()
@@ -559,6 +635,7 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 	ms.mu.Lock()
 	ms.sttRequestStartTime = time.Now()
 	ms.mu.Unlock()
+	captureSTTAudio(audioData, ms.inputSampleRate, "batch")
 	fmt.Printf("\r\033[K[DEBUG] Calling Transcribe for %d bytes\n", len(audioData))
 	result, err := ms.orch.Transcribe(ctx, audioData, ms.session.GetCurrentLanguage())
 	ms.mu.Lock()
@@ -594,17 +671,17 @@ func (ms *ManagedStream) runBatchPipeline(audioData []byte) {
 
 	transcript := result.Text
 
-	// Before committing to interrupt, check if user is still speaking
-	// If they resumed during transcription processing, discard and keep listening
 	ms.mu.Lock()
-	userStillSpeaking := ms.vad != nil && ms.vad.IsSpeaking()
+
+	// Update user prosody profile with speaking rate
+	duration := ms.userSpeechEndTime.Sub(ms.userSpeechStartTime)
 	speaking := ms.isSpeaking
 	thinking := ms.isThinking
 	ms.mu.Unlock()
 
-	if userStillSpeaking {
-		fmt.Printf("\r\033[K[DEBUG] User resumed speaking during transcription processing, discarding result and continuing to listen\n")
-		return
+	if duration > 0 && transcript != "" {
+		wordCount := countWords(transcript)
+		ms.userProfile.RecordUtterance(wordCount, int(duration.Milliseconds()), 0)
 	}
 
 	if speaking {
@@ -897,6 +974,38 @@ func (ms *ManagedStream) runStreamingLLMPipeline(ctx context.Context, provider S
 	}
 }
 
+// Pre-generate backchannel audio clips using the actual TTS voice for natural matching
+func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
+	voice := VoiceF1
+	lang := LanguageEn
+	if o != nil {
+		if o.config.VoiceStyle != "" {
+			voice = o.config.VoiceStyle
+		}
+		if o.config.Language != "" {
+			lang = o.config.Language
+		}
+	}
+
+	phrases := []string{"mhm", "uh-huh", "yeah"}
+	clips := make([][]byte, 0, len(phrases))
+
+	for _, phrase := range phrases {
+		audio, err := o.GenerateSilent(ms.ctx, phrase, voice, lang)
+		if err == nil && len(audio) > 100 {
+			clips = append(clips, audio)
+			fmt.Printf("[BACKCHANNEL] Generated clip for '%s' (%d bytes)\n", phrase, len(audio))
+		}
+	}
+
+	if len(clips) > 0 {
+		ms.backchannel.SetClips(clips)
+		fmt.Printf("[BACKCHANNEL] Using %d TTS-generated clips\n", len(clips))
+	} else {
+		fmt.Printf("[BACKCHANNEL] TTS generation failed, using programmatic sounds\n")
+	}
+}
+
 func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 	// Apply prosody to the text before TTS
 	if ms.prosody != nil {
@@ -906,6 +1015,15 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string) {
 			len(text), len(prosodyText), prosodyResult.EstimatedMs)
 		text = prosodyText
 		defer ms.prosody.UpdateContext(text, prosodyResult.EstimatedMs)
+	}
+
+	// Apply prosodic entrainment: adjust TTS rate to match user's speaking style
+	if ms.userProfile.HasBaseline() {
+		suggestedRate := ms.userProfile.GetSuggestedSpeechRate()
+		fmt.Printf("[ENTRAINMENT] adjusting TTS rate to %.2f\n", suggestedRate)
+		if ms.orch != nil {
+			ms.orch.SetTTSRate(suggestedRate)
+		}
 	}
 
 	// Create a sub-context that we can cancel specifically if interrupted
@@ -1054,12 +1172,7 @@ func (ms *ManagedStream) NotifyAudioPlayed() {
 	ms.mu.Unlock()
 }
 
-func (ms *ManagedStream) RecordPlayedOutput(chunk []byte) {
-	if ms.echoSuppressor == nil || len(chunk) == 0 {
-		return
-	}
-	ms.echoSuppressor.RecordPlayedAudio(chunk)
-}
+func (ms *ManagedStream) RecordPlayedOutput(chunk []byte) {}
 
 func (ms *ManagedStream) GetLatency() int64 {
 	ms.mu.Lock()
@@ -1168,13 +1281,7 @@ func (ms *ManagedStream) ExportLastUserAudio() (raw []byte, processed []byte) {
 	rawCopy := make([]byte, len(ms.lastUserAudio))
 	copy(rawCopy, ms.lastUserAudio)
 	ms.mu.Unlock()
-
-	if ms.echoSuppressor != nil {
-		processed = ms.echoSuppressor.PostProcess(rawCopy)
-	} else {
-		processed = rawCopy
-	}
-	return rawCopy, processed
+	return rawCopy, rawCopy
 }
 
 func (ms *ManagedStream) Events() <-chan OrchestratorEvent {
@@ -1189,8 +1296,6 @@ func (ms *ManagedStream) Close() {
 		ms.isClosed = true
 		ms.audioBuf.Reset()
 		ms.mu.Unlock()
-
-		ms.echoSuppressor.ClearEchoBuffer()
 
 		ms.cancel()
 
@@ -1213,6 +1318,12 @@ func (ms *ManagedStream) emit(eventType EventType, data interface{}) {
 }
 
 func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen int) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("\033[31m[PANIC] emitWithGen recovered: %v\033[0m\n", r)
+		}
+	}()
+
 	select {
 	case <-ms.ctx.Done():
 		return
@@ -1233,34 +1344,49 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 			return
 		}
 	}
-
-	sessionID := ms.session.ID
+	payloadGen := ms.payloadGen
+	generation := gen
+	if generation < 0 {
+		generation = payloadGen
+	}
 	ms.mu.Unlock()
-
-	defer func() {
-		if r := recover(); r != nil {
-		}
-	}()
 
 	event := OrchestratorEvent{
 		Type:       eventType,
-		SessionID:  sessionID,
+		Data:       data,
+		Generation: generation,
+	}
+
+	select {
+	case ms.events <- event:
+	case <-ms.ctx.Done():
+	}
+}
+
+func (ms *ManagedStream) emitBackchannel(data []byte) {
+	select {
+	case <-ms.ctx.Done():
+		return
+	default:
+	}
+
+	ms.mu.Lock()
+	if ms.isClosed {
+		ms.mu.Unlock()
+		return
+	}
+	gen := ms.payloadGen
+	ms.mu.Unlock()
+
+	event := OrchestratorEvent{
+		Type:       AudioChunk,
 		Data:       data,
 		Generation: gen,
 	}
 
-	if eventType == AudioChunk {
-		select {
-		case ms.events <- event:
-		case <-ms.ctx.Done():
-		default:
-			// Only drop AudioChunks if full, but block for other events
-		}
-	} else {
-		select {
-		case ms.events <- event:
-		case <-ms.ctx.Done():
-		}
+	select {
+	case ms.events <- event:
+	case <-ms.ctx.Done():
 	}
 }
 
@@ -1300,8 +1426,6 @@ func (ms *ManagedStream) internalInterrupt() {
 	// keeping it simple and unified.
 	gen := ms.payloadGen
 	ms.mu.Unlock()
-
-	ms.echoSuppressor.ClearEchoBuffer()
 
 	if responseCancel != nil {
 		responseCancel()

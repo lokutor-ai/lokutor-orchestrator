@@ -57,8 +57,9 @@ func NewImprovedRMSVAD(threshold float64, silenceLimit time.Duration, sampleRate
 	return &ImprovedRMSVAD{
 		threshold:         threshold,
 		silenceLimit:      silenceLimit,
-		minConfirmed:      6, // Increased to reduce false starts
+		minConfirmed:      6,
 		noiseFloor:        threshold,
+		emaRMS:            threshold, // Start at threshold so first speech frames aren't missed
 		alphaEMA:          0.25,
 		alphaZCR:          0.1,
 		alphaPeak:         0.05,

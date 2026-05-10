@@ -88,6 +88,14 @@ func NewProcessor(cfg Config) *Processor {
 // Input: 16-bit signed PCM, mono or stereo
 // Output: Enhanced 16-bit PCM
 func (p *Processor) Process(samples []byte, sampleRate int, channels int) []byte {
+	// Skip all processing when no effects are active
+	if p.config.LowShelfGain == 0 && p.config.HighShelfGain == 0 &&
+		p.config.PresenceGain == 0 && p.config.HarmonicMix == 0 &&
+		p.config.ReverbMix == 0 && p.config.CompressRatio <= 1 &&
+		p.config.TargetLUFS == 0 {
+		return samples
+	}
+
 	// Convert to float64
 	floatSamples := p.bytesToFloat(samples, channels)
 

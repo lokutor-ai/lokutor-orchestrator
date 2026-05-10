@@ -148,7 +148,7 @@ func main() {
 	}
 
 	fmt.Printf("Configured: STT=%s | LLM=%s | TTS=Lokutor\n", sttProviderName, llmProviderName)
-	fmt.Printf("VAD Threshold: %.3f | Sample Rate: %dHz | Language: %s\n", config.BargeInVADThreshold, SampleRate, lang)
+	fmt.Printf("VAD: ImprovedRMS | Sample Rate: %dHz | Language: %s\n", SampleRate, lang)
 	fmt.Println("Voice Agent Started! Listening to microphone...")
 	fmt.Println("Press Ctrl+C to exit")
 

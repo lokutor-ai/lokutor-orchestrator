@@ -108,29 +108,7 @@ func (tca *TurnCompletionAnalyzer) IsLikelyComplete(transcribedText string) bool
 	return true
 }
 
-// ProsodyIndicatesCompletion analyzes acoustic features to detect falling vs rising intonation.
-// Returns confidence in range [0, 1]:
-// - 0-0.33: Likely continuing (rising/flat intonation)
-// - 0.33-0.67: Ambiguous
-// - 0.67-1.0: Likely complete (falling intonation)
-func (tca *TurnCompletionAnalyzer) ProsodyIndicatesCompletion(vad VADProvider) float64 {
-	// If VAD supports getting pitch information, analyze it
-	if improvedVAD, ok := vad.(*ImprovedRMSVAD); ok {
-		// Get the energy/RMS trend from the last few frames
-		trend := improvedVAD.GetEnergyTrend()
-
-		// Falling energy at the end = falling intonation = end of turn
-		if trend < -0.05 { // Negative trend = falling
-			return 0.8 // High confidence of completion
-		} else if trend > 0.05 { // Positive trend = rising
-			return 0.2 // Likely continuing
-		}
-		return 0.5 // Neutral
-	}
-	return 0.5 // Default: ambiguous
-}
-
-// CombinedCompletionScore combines semantic, prosodic, and temporal signals.
+// CombinedCompletionScore combines semantic and temporal signals.
 // Returns a score 0-1 where:
 // - < 0.4: Very likely continuing
 // - 0.4-0.6: Ambiguous
@@ -138,7 +116,6 @@ func (tca *TurnCompletionAnalyzer) ProsodyIndicatesCompletion(vad VADProvider) f
 func (tca *TurnCompletionAnalyzer) CombinedCompletionScore(
 	transcribedText string,
 	utteranceDuration int, // in milliseconds
-	vad VADProvider,
 ) float64 {
 	semanticScore := 0.5
 	if tca.IsLikelyComplete(transcribedText) {
@@ -146,9 +123,6 @@ func (tca *TurnCompletionAnalyzer) CombinedCompletionScore(
 	} else {
 		semanticScore = 0.3
 	}
-
-	// Prosodic score
-	prosodyScore := tca.ProsodyIndicatesCompletion(vad)
 
 	// Temporal heuristic: longer utterances are more likely complete
 	temporalScore := 0.5
@@ -162,9 +136,9 @@ func (tca *TurnCompletionAnalyzer) CombinedCompletionScore(
 		temporalScore = 0.3
 	}
 
-	// Weight: Semantic (50%) + Temporal (30%) + Prosody (20%)
-	// Semantic is weighted most because NLU is strongest signal
-	combined := (semanticScore * 0.5) + (temporalScore * 0.3) + (prosodyScore * 0.2)
+	// Weight: Semantic (60%) + Temporal (40%)
+	// Semantic is weighted more because NLU is strongest signal
+	combined := (semanticScore * 0.6) + (temporalScore * 0.4)
 
 	return combined
 }
