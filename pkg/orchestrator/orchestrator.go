@@ -206,7 +206,7 @@ TOOL USE:
 
 func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt string) {
 	langInstruction := "IMPORTANT: Always respond in " + string(session.CurrentLanguage) + ". Never switch to another language, even if the user speaks another language. The entire conversation must be in " + string(session.CurrentLanguage) + "."
-	fullPrompt := prompt + VoiceUXInstructions + "\n\n" + langInstruction
+	fullPrompt := langInstruction + "\n\n" + prompt + "\n\n" + VoiceUXInstructions
 	session.AddMessage("system", fullPrompt)
 }
 
