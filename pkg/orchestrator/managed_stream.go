@@ -1012,7 +1012,6 @@ func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string) {
-	// Apply prosody to the text before TTS
 	if ms.prosody != nil {
 		prosodyResult := ms.prosody.ProcessText(text)
 		prosodyText := applyProsodyText(prosodyResult)
@@ -1554,19 +1553,22 @@ func (ms *ManagedStream) runSilenceCheck() {
 	ms.runLLMAndTTS(ctx, "[USER_SILENCE_TIMEOUT]")
 }
 
-// applyProsodyText converts prosody markers into text modifications that any TTS can interpret
+// applyProsodyText converts prosody markers into text with natural pauses and emphasis.
+// PauseBefore/PauseAfter markers insert an ellipsis-break for longer pauses,
+// but we skip them at the start/end of the result to avoid a weird lead-in.
 func applyProsodyText(result prosody.ProsodyResult) string {
 	var out string
-	for _, m := range result.Markers {
-		if m.PauseBefore > 200 {
+	for i, m := range result.Markers {
+		if m.PauseBefore > 200 && len(out) > 0 {
 			out += "... "
 		}
+		out += m.Text
 		if m.IsEmphasized {
-			out += m.Text + ", "
+			out += " "
 		} else {
-			out += m.Text + " "
+			out += " "
 		}
-		if m.PauseAfter > 200 {
+		if m.PauseAfter > 200 && i < len(result.Markers)-1 {
 			out += "... "
 		}
 	}
