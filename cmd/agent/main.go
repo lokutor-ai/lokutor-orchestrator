@@ -218,6 +218,18 @@ func main() {
 	var playbackPaused bool
 	const preRollSize = 44100 * 2 * 60 / 1000 // 60ms pre-roll
 
+	// Audio enhancer for better sound quality - louder and warmer
+	audioEnhancer := audio.NewProcessor(audio.Config{
+		TargetLUFS:      -14,    // Louder for better audibility
+		LowShelfGain:   4.0,    // More bass
+		HighShelfGain:  -0.5,   // Slightly smoother highs
+		PresenceGain:   2.0,    // More presence/clarity
+		HarmonicMix:    0.15,   // Warmth
+		ReverbMix:      0.05,   // Slight room
+		CompressRatio:  3,      // Even out volume
+		CompressThreshold: -18,
+	})
+
 	chunkPool := sync.Pool{
 		New: func() interface{} {
 			return make([]byte, 8192)
@@ -428,10 +440,13 @@ func main() {
 					continue
 				}
 				chunk := event.Data.([]byte)
+				// Apply audio enhancement for better sound quality
+				enhanced := audioEnhancer.Process(chunk, SampleRate, 1)
 				playbackMu.Lock()
-				playbackBytes = append(playbackBytes, chunk...)
+				playbackBytes = append(playbackBytes, enhanced...)
 				botHasAudio = true
 				playbackMu.Unlock()
+				fmt.Printf("\r\033[K🔊 [AUDIO] received %d bytes, total buffered: %d\n", len(enhanced), len(playbackBytes))
 
 			case orchestrator.ErrorEvent:
 				fmt.Printf("\r\033[K❌ [ERROR] %v\n", event.Data)
