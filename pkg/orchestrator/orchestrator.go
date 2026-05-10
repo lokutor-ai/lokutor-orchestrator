@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -179,32 +180,32 @@ func (o *Orchestrator) NewSessionWithDefaults(userID string) *ConversationSessio
 
 const VoiceUXInstructions = `
 
-IMPORTANT: Real-time voice mode for natural conversation.
+CRITICAL: You are speaking in real-time. The user hears your words as you generate them. Follow these rules strictly.
 
-Speaking Style:
-- Speak naturally and conversationally, like you're talking to someone in person.
-- Use natural pauses and breathing patterns in longer sentences.
-- Be warm, engaged, and genuinely responsive to what the user says.
-- Vary your tone: show curiosity for questions, confidence for statements, warmth for connections.
+FORMATTING (absolutely required):
+- You are SPEAKING, not writing. Never use asterisks, markdown, bullet points, numbered lists, quotes, or any special characters.
+- Never write stage directions like "*laughs*", "*pauses*", "*sighs*". Just speak naturally.
+- Never use emojis, emoticons, or smileys.
+- Say numbers as spoken words: "ten thousand" not "10,000", "twenty dollars" not "$20", "half" not "1/2".
+- Use contractions: "don't" not "do not", "can't" not "cannot", "it's" not "it is".
+- Start responses directly without preambles like "Absolutely!" or "Of course!" or "Great question!"
 
-Fillers & Transitions:
-- If you need to think, use brief natural fillers: "Let me think...", "One moment...", "Hmm, interesting..."
-- Use natural conversation markers: "So", "Well", "Actually", "You know", "Here's the thing"
-- When correcting: "Actually, I should clarify that..." (more human than abrupt changes)
+SPEAKING STYLE:
+- Speak in short, natural sentences like a real person on a phone call. Vary sentence length.
+- Pauses should be natural silences in your speech, not words like "um" or "uh" strung together.
+- Be warm and conversational, not formal or scripted.
+- Match the user's language and energy level naturally.
+- If you don't know something, just say "I don't know" simply and move on.
+- Never explain what you're doing or announce your actions. Just do it.
 
-Avoid:
-- Long silent pauses (always say something natural)
-- Robotic or overly formal language in casual chat
-- Repeating the same response structure (keep it varied)
-
-Tool Use:
-- Before calling a tool, acknowledge it: "Let me look that up for you..."
-- After getting results, naturally integrate them into your response
-- Don't announce that you're using a tool - just do it
+TOOL USE:
+- When you get a tool result, weave it into your response naturally without announcing the lookup.
+- Keep tool-related responses brief and direct.
 `
 
 func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt string) {
-	fullPrompt := prompt + VoiceUXInstructions
+	langInstruction := "IMPORTANT: Always respond in " + string(session.CurrentLanguage) + ". Never switch to another language, even if the user speaks another language. The entire conversation must be in " + string(session.CurrentLanguage) + "."
+	fullPrompt := prompt + VoiceUXInstructions + "\n\n" + langInstruction
 	session.AddMessage("system", fullPrompt)
 }
 
@@ -213,7 +214,21 @@ func (o *Orchestrator) SetVoice(session *ConversationSession, voice Voice) {
 }
 
 func (o *Orchestrator) SetLanguage(session *ConversationSession, lang Language) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
 	session.CurrentLanguage = lang
+	langInstruction := "IMPORTANT: Always respond in " + string(lang) + ". Never switch to another language, even if the user speaks another language. The entire conversation must be in " + string(lang) + "."
+	for i, msg := range session.Context {
+		if msg.Role == "system" {
+			re := regexp.MustCompile(`IMPORTANT: Always respond in[^.]+\.`)
+			if re.MatchString(msg.Content) {
+				session.Context[i].Content = re.ReplaceAllString(msg.Content, langInstruction)
+			} else {
+				session.Context[i].Content = msg.Content + "\n\n" + langInstruction
+			}
+			break
+		}
+	}
 }
 
 func (o *Orchestrator) ResetSession(session *ConversationSession) {
