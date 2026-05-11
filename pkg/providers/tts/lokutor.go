@@ -137,6 +137,21 @@ func (t *LokutorTTS) release(conn *websocket.Conn) {
 	}
 }
 
+func (t *LokutorTTS) evict(conn *websocket.Conn) {
+	if conn == nil {
+		return
+	}
+	conn.Close(websocket.StatusAbnormalClosure, "evicted")
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i, pc := range t.pool {
+		if pc.conn == conn {
+			t.pool = append(t.pool[:i], t.pool[i+1:]...)
+			return
+		}
+	}
+}
+
 func (t *LokutorTTS) Synthesize(ctx context.Context, text string, voice orchestrator.Voice, lang orchestrator.Language) ([]byte, error) {
 	var audio []byte
 	err := t.StreamSynthesize(ctx, text, voice, lang, func(chunk []byte) error {
@@ -154,7 +169,6 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 	if err != nil {
 		return err
 	}
-	defer t.release(conn)
 
 	req := map[string]interface{}{
 		"text":    text,
@@ -166,12 +180,14 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 	}
 
 	if err := wsjson.Write(ctx, conn, req); err != nil {
+		t.evict(conn)
 		return fmt.Errorf("failed to send synthesis request: %w", err)
 	}
 
 	for {
 		messageType, payload, err := conn.Read(ctx)
 		if err != nil {
+			t.evict(conn)
 			return fmt.Errorf("failed to read from lokutor: %w", err)
 		}
 
@@ -180,14 +196,17 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 			chunk := make([]byte, len(payload))
 			copy(chunk, payload)
 			if err := onChunk(chunk); err != nil {
+				t.evict(conn)
 				return err
 			}
 		case websocket.MessageText:
 			msg := string(payload)
 			if msg == "EOS" {
+				t.release(conn)
 				return nil
 			}
 			if len(msg) >= 4 && msg[:4] == "ERR:" {
+				t.evict(conn)
 				return fmt.Errorf("lokutor error: %s", msg)
 			}
 		}
