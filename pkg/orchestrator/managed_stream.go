@@ -108,6 +108,8 @@ type ManagedStream struct {
 	// Used in onVADStart to prepend speech onset that VAD's confirmation window missed.
 	preSpeechBuf *bytes.Buffer
 
+	echoSuppressor *EchoSuppressor
+
 	// Response cache
 	responseCache *ResponseCache
 
@@ -144,6 +146,11 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		logger = &NoOpLogger{}
 	}
 
+	es := NewEchoSuppressorWithRates(44100, cfg.SampleRate)
+	if th := cfg.EchoSuppressionThreshold; th > 0 {
+		es.SetThreshold(th)
+	}
+
 	ms := &ManagedStream{
 		orch:            o,
 		session:         session,
@@ -158,6 +165,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		inputSampleRate: cfg.SampleRate,
 		turnComp:        NewTurnCompletionAnalyzer(),
 		echoRef:         &echoReference{maxSize: 88200},
+		echoSuppressor:  es,
 		userProfile:     prosody.NewUserSpeechProfile(),
 		prosody: func() *prosody.AdaptiveProcessor {
 			c := prosody.DefaultConfig()
@@ -295,6 +303,24 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 	if ms.vad == nil {
 		return
+	}
+
+	if ms.echoSuppressor != nil {
+		chunk = ms.echoSuppressor.RemoveEchoRealtime(chunk)
+		if len(chunk) == 0 {
+			return
+		}
+		// If the chunk was fully zeroed (no remaining energy), skip VAD
+		hasEnergy := false
+		for _, b := range chunk {
+			if b != 0 {
+				hasEnergy = true
+				break
+			}
+		}
+		if !hasEnergy {
+			return
+		}
 	}
 
 	event, err := ms.vad.Process(chunk)
@@ -769,6 +795,9 @@ func (ms *ManagedStream) RecordPlayedOutput(chunk []byte) {
 	buf := make([]byte, len(chunk))
 	copy(buf, chunk)
 	ms.echoRef.Write(buf)
+	if ms.echoSuppressor != nil {
+		ms.echoSuppressor.RecordPlayedAudio(buf)
+	}
 }
 
 func (ms *ManagedStream) NotifyAudioPlayed() {
@@ -778,6 +807,9 @@ func (ms *ManagedStream) NotifyAudioPlayed() {
 func (ms *ManagedStream) SetEchoSampleRates(playbackRate, inputRate int) {
 	ms.playbackRate = playbackRate
 	ms.inputSampleRate = inputRate
+	if ms.echoSuppressor != nil {
+		ms.echoSuppressor.SetSampleRates(playbackRate, inputRate)
+	}
 }
 
 func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration time.Duration) bool {
