@@ -275,6 +275,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.emit(UserStopped, nil)
 
 	if ms.backch != nil {
+		ms.backch.UserStarted()
 		ms.backch.UserStopped()
 	}
 
@@ -282,7 +283,22 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	audioData := ms.userAudio
 	ms.userAudio = nil
 
-	if duration < 200*time.Millisecond || len(audioData) < 160 {
+	// Adaptive VAD: if energy was rising before speech end, the user is likely
+	// pausing mid-thought — extend the minimum duration to avoid splitting
+	// consecutive sentences across separate turns.
+	minDur := 200 * time.Millisecond
+	minLen := 160
+	if trendVAD, ok := ms.vad.(interface{ GetEnergyTrend() float64 }); ok {
+		trend := trendVAD.GetEnergyTrend()
+		if trend > 0.0005 {
+			minDur = 450 * time.Millisecond
+			minLen = 320
+			ms.logger.Debug("Adaptive VAD: energy rising, extending silence window",
+				"trend", trend, "minDur", minDur.String())
+		}
+	}
+
+	if duration < minDur || len(audioData) < minLen {
 		return
 	}
 
@@ -403,12 +419,55 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	}
 	var toolResults []toolRes
 
+	// Sentence-level TTS queue: start speaking individual sentences as they
+	// arrive from the LLM stream, overlapping TTS playback with LLM generation
+	// of subsequent sentences.
+	ttsQueue := make(chan string, 8)
+	ttsWg := sync.WaitGroup{}
+	ttsWg.Add(1)
+	go func() {
+		defer ttsWg.Done()
+		for text := range ttsQueue {
+			ms.speakText(ctx, text, gen)
+		}
+	}()
+
+	// Accumulates incomplete trailing sentence between boundaries
+	var pendingSentence strings.Builder
+
+	flushSentence := func() {
+		s := strings.TrimSpace(pendingSentence.String())
+		if s == "" {
+			return
+		}
+		ttsQueue <- s
+		pendingSentence.Reset()
+	}
+
 	_, err := provider.StreamComplete(ctx, messages, ms.session.GetTools(),
 		func(chunk string) error {
 			fullText.WriteString(chunk)
+			pendingSentence.WriteString(chunk)
+
 			if ms.llmEndTime.IsZero() {
 				ms.llmEndTime = time.Now()
 			}
+
+			// Detect sentence boundaries for early TTS
+			buf := pendingSentence.String()
+			for i, c := range buf {
+				if c == '.' || c == '!' || c == '?' {
+					sentence := strings.TrimSpace(buf[:i+1])
+					if sentence != "" {
+						ttsQueue <- sentence
+					}
+					rest := strings.TrimSpace(buf[i+1:])
+					pendingSentence.Reset()
+					pendingSentence.WriteString(rest)
+					break
+				}
+			}
+
 			return nil
 		},
 		func(tc ToolCallEventData) error {
@@ -441,6 +500,11 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		},
 	)
 
+	// Flush any remaining partial sentence
+	flushSentence()
+	close(ttsQueue)
+	ttsWg.Wait()
+
 	if err != nil {
 		ms.mu.Lock()
 		ms.state = StateIdle
@@ -456,7 +520,6 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	if response != "" && !hasToolCalls {
 		ms.session.AddMessage("assistant", response)
 		ms.emit(BotResponse, response)
-		ms.speakText(ctx, response, gen)
 	}
 
 	if hasToolCalls {

@@ -89,7 +89,8 @@ func TestManagedStream_ToolCalling(t *testing.T) {
 	// Trigger response
 	go ms.runLLMAndTTS(context.Background(), "whats the weather?")
 
-	// We expect multiple events: BotThinking, ToolCall, BotThinking (recursive), BotResponse, BotSpeaking
+	// We wait for BotResponse which is always emitted after
+	// session.AddMessage("assistant", response) completes.
 	timeout := time.After(2 * time.Second)
 	var events []EventType
 loop:
@@ -97,7 +98,7 @@ loop:
 		select {
 		case ev := <-ms.Events():
 			events = append(events, ev.Type)
-			if ev.Type == BotSpeaking {
+			if ev.Type == BotResponse {
 				break loop
 			}
 		case <-timeout:
