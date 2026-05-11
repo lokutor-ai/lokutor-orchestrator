@@ -98,6 +98,8 @@ func TestProcessAudio(t *testing.T) {
 		context.Background(),
 		session,
 		[]byte{0xFF, 0xFE},
+		false,
+		nil,
 	)
 
 	if err != nil {
@@ -208,7 +210,7 @@ func TestConcurrentSessionOperations(t *testing.T) {
 
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
-			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"))
+			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"), false, nil)
 			if err != nil {
 				t.Errorf("ProcessAudio failed: %v", err)
 			}
@@ -272,7 +274,7 @@ func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, _, err := orch.ProcessAudio(ctx, session, []byte("audio"))
+	_, _, err := orch.ProcessAudio(ctx, session, []byte("audio"), false, nil)
 	if err == nil {
 		t.Fatal("ProcessAudio should return error when context is cancelled")
 	}
@@ -300,7 +302,7 @@ func TestCustomErrorTypes(t *testing.T) {
 			orch := New(tt.stt, tt.llm, tt.tts, DefaultConfig())
 			session := NewConversationSession("error_test")
 
-			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"))
+			_, _, err := orch.ProcessAudio(context.Background(), session, []byte("audio"), false, nil)
 			if !isErrorType(err, tt.expectedErr) {
 				t.Errorf("expected error type %T, got %T: %v", tt.expectedErr, err, err)
 			}

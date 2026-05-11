@@ -23,9 +23,27 @@ type Orchestrator struct {
 	toolHandlers map[string]ToolHandler
 }
 
-// New creates an orchestrator with the given providers and optional logger.
-// Logger defaults to NoOpLogger if nil.
-func New(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config, logger Logger) *Orchestrator {
+// New creates an orchestrator with STT, LLM, TTS providers and config.
+// VAD and Logger default to nil/NoOpLogger.
+func New(stt STTProvider, llm LLMProvider, tts TTSProvider, config Config) *Orchestrator {
+	return newOrchestrator(stt, llm, tts, nil, config, nil)
+}
+
+// NewWithVAD creates an orchestrator with all providers including VAD.
+func NewWithVAD(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config) *Orchestrator {
+	return newOrchestrator(stt, llm, tts, vad, config, nil)
+}
+
+// NewWithLogger creates an orchestrator with all providers, VAD, and logger.
+func NewWithLogger(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config, logger Logger) *Orchestrator {
+	return newOrchestrator(stt, llm, tts, vad, config, logger)
+}
+
+func NewWithAllLayers(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config, logger Logger) *Orchestrator {
+	return newOrchestrator(stt, llm, tts, vad, config, logger)
+}
+
+func newOrchestrator(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config, logger Logger) *Orchestrator {
 	if logger == nil {
 		logger = &NoOpLogger{}
 	}
@@ -38,11 +56,6 @@ func New(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, con
 		logger:       logger,
 		toolHandlers: make(map[string]ToolHandler),
 	}
-}
-
-// NewWithVAD is a convenience constructor that uses a NoOpLogger
-func NewWithVAD(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADProvider, config Config) *Orchestrator {
-	return New(stt, llm, tts, vad, config, nil)
 }
 
 func (o *Orchestrator) RegisterTool(name string, handler ToolHandler) {

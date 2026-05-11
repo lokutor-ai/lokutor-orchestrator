@@ -59,8 +59,9 @@ func NewImprovedRMSVAD(threshold float64, silenceLimit time.Duration, sampleRate
 		silenceLimit:      silenceLimit,
 		minConfirmed:      6,
 		noiseFloor:        threshold,
-		emaRMS:            threshold, // Start at threshold so first speech frames aren't missed
+		emaRMS:            threshold,
 		alphaEMA:          0.25,
+		emaZCR:            0.02,
 		alphaZCR:          0.1,
 		alphaPeak:         0.05,
 		adaptiveMode:      true,
@@ -69,7 +70,7 @@ func NewImprovedRMSVAD(threshold float64, silenceLimit time.Duration, sampleRate
 		isWarmup:          true,
 		voiceZCR:          0.02,
 		energyWindow:      make([]float64, 5),
-		energyTrendWindow: make([]float64, 10), // 10-frame window for prosody trend
+		energyTrendWindow: make([]float64, 10),
 		sampleRate:        sampleRate,
 	}
 }
@@ -125,6 +126,7 @@ func (v *ImprovedRMSVAD) Reset() {
 	v.isSpeaking = false
 	v.silenceStart = time.Time{}
 	v.consecutiveFrames = 0
+	v.emaRMS = v.noiseFloor
 }
 
 func (v *ImprovedRMSVAD) Clone() VADProvider {
@@ -246,8 +248,12 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	if effectiveThreshold < 0.005 {
 		effectiveThreshold = 0.005
 	}
-	if effectiveThreshold > 0.35 {
-		effectiveThreshold = 0.35
+	maxThreshold := v.threshold * 2.5
+	if maxThreshold < 0.02 {
+		maxThreshold = 0.02
+	}
+	if effectiveThreshold > maxThreshold {
+		effectiveThreshold = maxThreshold
 	}
 
 	// 3. Filters - stricter for background noise
@@ -255,30 +261,23 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 	if rms > 0.001 {
 		crestFactor = peak / rms
 	}
-	// Coughs, door slams have high crest factor (5.5-8.0), speech is more uniform (~2-4)
 	isImpulsive := crestFactor > 5.5
 
 	penalty := 1.0
+	zcrOk := true
 
-	// ZCR Penalty - Adjusted for potentially higher sample rates (original was 16kHz)
-	zcrLimitLow := 0.001
-	zcrLimitHigh := 0.15
-	if v.sampleRate > 16000 {
-		// Loosen ZCR slightly for higher sample rates
-		zcrLimitHigh = 0.25
+	// Simpler ZCR check: only penalize when ZCR is far from speech range
+	if v.emaZCR > 0.001 && v.emaZCR < 0.35 {
+		zcrOk = true
 	}
-
-	if v.emaZCR < zcrLimitLow || v.emaZCR > zcrLimitHigh {
-		penalty *= 3.0
-	}
-
 	if isImpulsive {
-		penalty *= 4.0 // Stronger rejection of sudden loud sounds
+		penalty *= 2.5
 	}
-
-	// Require Energy Persistence to start
-	if !v.isSpeaking && sustainedEnergy < (effectiveThreshold*0.5) {
+	if !zcrOk {
 		penalty *= 2.0
+	}
+	if !v.isSpeaking && sustainedEnergy < (effectiveThreshold*0.5) {
+		penalty *= 1.5
 	}
 
 	targetThreshold := effectiveThreshold * penalty
@@ -309,13 +308,14 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 			v.silenceStart = now
 		}
 
-		// CRITICAL FIX: Always use the configured silenceLimit.
-		// The 150ms fast-path was causing false SpeechEnd events during
-		// natural pauses in continuous speech, making the bot interrupt
-		// the user while they were still speaking.
 		if now.Sub(v.silenceStart) >= v.silenceLimit {
 			v.isSpeaking = false
 			v.silenceStart = time.Time{}
+			// Reset EMA so post-speech decay doesn't cause false re-trigger
+			v.emaRMS = v.noiseFloor
+			// Reset the min tracker so noise floor adapts from current baseline
+			v.lastMinRMS = 1.0
+			v.minTrackerAt = now
 			return &VADEvent{Type: VADSpeechEnd, Timestamp: now.UnixMilli()}, nil
 		}
 	}

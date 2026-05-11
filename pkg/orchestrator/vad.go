@@ -114,14 +114,17 @@ func (v *RMSVAD) Process(chunk []byte) (*VADEvent, error) {
 			}
 		}
 
-		// Restore sane 2.2x margin for baseline implementation
-		adaptiveThreshold := v.noiseFloor * 2.0
+			adaptiveThreshold := v.noiseFloor * 2.0
 		if adaptiveThreshold > effectiveThreshold {
 			effectiveThreshold = adaptiveThreshold
 		}
 
-		if effectiveThreshold > 0.3 {
-			effectiveThreshold = 0.3
+		maxThreshold := v.threshold * 2.5
+		if maxThreshold < 0.02 {
+			maxThreshold = 0.02
+		}
+		if effectiveThreshold > maxThreshold {
+			effectiveThreshold = maxThreshold
 		}
 	}
 

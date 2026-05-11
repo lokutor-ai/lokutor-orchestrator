@@ -14,7 +14,7 @@ type Conversation struct {
 func NewConversation(stt STTProvider, llm LLMProvider, tts TTSProvider) *Conversation {
 
 	config := DefaultConfig()
-	orch := New(stt, llm, tts, nil, config, nil)
+	orch := newOrchestrator(stt, llm, tts, nil, config, nil)
 
 	session := NewConversationSession("conv_" + fmt.Sprintf("%d", time.Now().UnixNano()))
 
@@ -25,7 +25,7 @@ func NewConversation(stt STTProvider, llm LLMProvider, tts TTSProvider) *Convers
 }
 
 func NewConversationWithConfig(stt STTProvider, llm LLMProvider, tts TTSProvider, config Config) *Conversation {
-	orch := New(stt, llm, tts, nil, config, nil)
+	orch := newOrchestrator(stt, llm, tts, nil, config, nil)
 	session := NewConversationSession("conv_" + fmt.Sprintf("%d", time.Now().UnixNano()))
 
 	return &Conversation{
