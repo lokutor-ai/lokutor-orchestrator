@@ -124,9 +124,13 @@ func main() {
 		llm = llmProvider.NewAnthropicLLM(anthropicKey, "claude-3-5-sonnet-20241022")
 	case "google":
 		if googleKey == "" {
-			log.Fatal("Error: GOOGLE_API_KEY must be set for google LLM")
+			googleKey = os.Getenv("GEMINI_API_KEY")
 		}
-		llm = llmProvider.NewGoogleLLM(googleKey, "gemini-1.5-flash")
+		if googleKey == "" {
+			log.Fatal("Error: GOOGLE_API_KEY or GEMINI_API_KEY must be set for google LLM")
+		}
+		geminiModel := os.Getenv("GEMINI_MODEL")
+		llm = llmProvider.NewGoogleLLM(googleKey, geminiModel)
 	case "groq":
 		fallthrough
 	default:

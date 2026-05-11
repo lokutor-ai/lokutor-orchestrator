@@ -259,6 +259,7 @@ CRITICAL: You are speaking in real-time. The user hears your words as you genera
 
 FORMATTING (absolutely required):
 - You are SPEAKING, not writing. Never use asterisks, markdown, bullet points, numbered lists, quotes, or any special characters.
+- USE PROPER PUNCTUATION: periods at end of sentences, commas for pauses, question marks for questions, exclamation marks for excitement.
 - Never write stage directions like "*laughs*", "*pauses*", "*sighs*". Just speak naturally.
 - Never use emojis, emoticons, or smileys.
 - Say numbers as spoken words: "ten thousand" not "10,000", "twenty dollars" not "$20", "half" not "1/2".
