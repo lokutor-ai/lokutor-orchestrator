@@ -5,46 +5,136 @@ import (
 	"fmt"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
 
+type poolConn struct {
+	conn      *websocket.Conn
+	inUse     bool
+	createdAt time.Time
+}
+
 type LokutorTTS struct {
-	apiKey string
-	host   string
-	scheme string
-	mu     sync.Mutex
-	conn   *websocket.Conn
+	apiKey     string
+	host       string
+	scheme     string
+	mu         sync.Mutex
+	pool       []*poolConn
+	poolSize   int
+	maxConnAge time.Duration
 }
 
 func NewLokutorTTS(apiKey string) *LokutorTTS {
 	return &LokutorTTS{
-		apiKey: apiKey,
-		host:   "api.lokutor.com",
-		scheme: "wss",
+		apiKey:     apiKey,
+		host:       "api.lokutor.com",
+		scheme:     "wss",
+		poolSize:   1,
+		maxConnAge: 25 * time.Second,
 	}
 }
 
-func (t *LokutorTTS) getConn(ctx context.Context) (*websocket.Conn, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if t.conn != nil {
-		return t.conn, nil
+func NewLokutorTTSPool(apiKey string, poolSize int) *LokutorTTS {
+	if poolSize < 1 {
+		poolSize = 1
 	}
+	tts := &LokutorTTS{
+		apiKey:     apiKey,
+		host:       "api.lokutor.com",
+		scheme:     "wss",
+		poolSize:   poolSize,
+		pool:       make([]*poolConn, 0, poolSize),
+		maxConnAge: 25 * time.Second,
+	}
+	tts.warmup()
+	return tts
+}
 
+func (t *LokutorTTS) warmup() {
+	for i := 0; i < t.poolSize; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := t.dial(ctx)
+		cancel()
+		if err == nil {
+			t.pool = append(t.pool, &poolConn{conn: conn, createdAt: time.Now()})
+		}
+	}
+}
+
+func (t *LokutorTTS) dial(ctx context.Context) (*websocket.Conn, error) {
 	u := url.URL{Scheme: t.scheme, Host: t.host, Path: "/ws", RawQuery: "api_key=" + t.apiKey}
-	conn, _, err := websocket.Dial(ctx, u.String(), nil)
+	conn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
+		CompressionMode: websocket.CompressionNoContextTakeover,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to lokutor: %w", err)
 	}
-
 	conn.SetReadLimit(10 * 1024 * 1024)
-
-	t.conn = conn
 	return conn, nil
+}
+
+func (t *LokutorTTS) acquire(ctx context.Context) (*websocket.Conn, error) {
+	t.mu.Lock()
+
+	for _, pc := range t.pool {
+		if !pc.inUse {
+			if time.Since(pc.createdAt) > t.maxConnAge {
+				pc.conn.Close(websocket.StatusNormalClosure, "stale")
+				pc.conn = nil
+			}
+			if pc.conn == nil {
+				var err error
+				pc.conn, err = t.dial(ctx)
+				if err != nil {
+					t.mu.Unlock()
+					return nil, err
+				}
+				pc.createdAt = time.Now()
+			}
+			pc.inUse = true
+			conn := pc.conn
+			t.mu.Unlock()
+			return conn, nil
+		}
+	}
+
+	if len(t.pool) < t.poolSize {
+		conn, err := t.dial(ctx)
+		if err != nil {
+			t.mu.Unlock()
+			return nil, err
+		}
+		pc := &poolConn{conn: conn, inUse: true, createdAt: time.Now()}
+		t.pool = append(t.pool, pc)
+		t.mu.Unlock()
+		return conn, nil
+	}
+
+	t.mu.Unlock()
+
+	conn, err := t.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+func (t *LokutorTTS) release(conn *websocket.Conn) {
+	if conn == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, pc := range t.pool {
+		if pc.conn == conn {
+			pc.inUse = false
+			return
+		}
+	}
 }
 
 func (t *LokutorTTS) Synthesize(ctx context.Context, text string, voice orchestrator.Voice, lang orchestrator.Language) ([]byte, error) {
@@ -60,12 +150,12 @@ func (t *LokutorTTS) Synthesize(ctx context.Context, text string, voice orchestr
 }
 
 func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice orchestrator.Voice, lang orchestrator.Language, onChunk func([]byte) error) error {
-	conn, err := t.getConn(ctx)
+	conn, err := t.acquire(ctx)
 	if err != nil {
 		return err
 	}
+	defer t.release(conn)
 
-	t.mu.Lock()
 	req := map[string]interface{}{
 		"text":    text,
 		"voice":   string(voice),
@@ -76,26 +166,17 @@ func (t *LokutorTTS) StreamSynthesize(ctx context.Context, text string, voice or
 	}
 
 	if err := wsjson.Write(ctx, conn, req); err != nil {
-		t.conn = nil
-		conn.Close(websocket.StatusAbnormalClosure, "failed to write json")
-		t.mu.Unlock()
 		return fmt.Errorf("failed to send synthesis request: %w", err)
 	}
-	t.mu.Unlock()
 
 	for {
 		messageType, payload, err := conn.Read(ctx)
 		if err != nil {
-			t.mu.Lock()
-			t.conn = nil
-			conn.Close(websocket.StatusAbnormalClosure, "failed to read")
-			t.mu.Unlock()
 			return fmt.Errorf("failed to read from lokutor: %w", err)
 		}
 
 		switch messageType {
 		case websocket.MessageBinary:
-			// Make a copy of the payload because the websocket library might reuse the buffer
 			chunk := make([]byte, len(payload))
 			copy(chunk, payload)
 			if err := onChunk(chunk); err != nil {
@@ -120,21 +201,24 @@ func (t *LokutorTTS) Name() string {
 func (t *LokutorTTS) Close() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.conn != nil {
-		err := t.conn.Close(websocket.StatusNormalClosure, "")
-		t.conn = nil
-		return err
+	for _, pc := range t.pool {
+		if pc.conn != nil {
+			pc.conn.Close(websocket.StatusNormalClosure, "")
+		}
 	}
+	t.pool = nil
 	return nil
 }
 
 func (t *LokutorTTS) Abort() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.conn != nil {
-		err := t.conn.Close(websocket.StatusAbnormalClosure, "abort")
-		t.conn = nil
-		return err
+	for _, pc := range t.pool {
+		if pc.inUse && pc.conn != nil {
+			pc.conn.Close(websocket.StatusAbnormalClosure, "abort")
+			pc.conn = nil
+			pc.inUse = false
+		}
 	}
 	return nil
 }

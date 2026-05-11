@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
@@ -13,6 +14,7 @@ import (
 type STTWrapper struct {
 	inner      orchestrator.STTProvider
 	filter     *Filter
+	filterMu   sync.Mutex
 	sampleRate int
 }
 
@@ -44,9 +46,11 @@ func (w *STTWrapper) Transcribe(ctx context.Context, audioPCM []byte, lang orche
 		samples = ResampleLinear(samples, w.sampleRate, SampleRate)
 	}
 
-	// Apply noise suppression at 16kHz
+	// Apply noise suppression at 16kHz (mutex protects shared filter state)
+	w.filterMu.Lock()
 	cleanSamples := w.filter.ProcessChunk(samples)
 	cleanSamples = append(cleanSamples, w.filter.Flush()...)
+	w.filterMu.Unlock()
 
 	// Resample back to original rate if needed
 	if w.sampleRate != SampleRate {
@@ -58,6 +62,12 @@ func (w *STTWrapper) Transcribe(ctx context.Context, audioPCM []byte, lang orche
 
 	// Transcribe clean audio
 	return w.inner.Transcribe(ctx, cleanPCM, lang)
+}
+
+// TranscribeNoFilter skips noise suppression and transcribes raw audio directly.
+// Used by speculative STT where speed matters more than noise suppression quality.
+func (w *STTWrapper) TranscribeNoFilter(ctx context.Context, audioPCM []byte, lang orchestrator.Language) (orchestrator.TranscriptionResult, error) {
+	return w.inner.Transcribe(ctx, audioPCM, lang)
 }
 
 // Destroy cleans up the noise filter.

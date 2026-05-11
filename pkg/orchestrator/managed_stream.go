@@ -95,10 +95,33 @@ type ManagedStream struct {
 	lastNoSpeechProb   float64
 	lastActivityAt     time.Time
 
+	// Client-side VAD support
+	controlChan  chan []byte
+	clientVAD    bool
+
+	// Speculative LLM execution during speech
+	speculator     *SpeculativeExecutor
+	lastSpecAt     time.Time
+	speechAudioBuf []byte
+
+	// preSpeechBuf stores the last ~300ms of audio unconditionally, updated BEFORE VAD.
+	// Used in onVADStart to prepend speech onset that VAD's confirmation window missed.
+	preSpeechBuf *bytes.Buffer
+
+	// Response cache
+	responseCache *ResponseCache
+
+	// Adaptive pacing
+	speakingRateWindow []float64
+
 	// Utterance sequence counter: incremented on each VADSpeechEnd.
 	// Used to skip LLM for older utterances when consecutive speech arrives,
-	// so the newest utterance's LLM call sees all transcripts in context.
+	// so the newest utterance's LLM call sees all accumulated context.
 	utteranceSeq int
+
+	// Bot speech deduplication: tracks the generation of the last BotSpeaking emission
+	// to prevent emitting the same event multiple times for a single generation.
+	lastBotSpeakGen int
 
 	mu sync.Mutex
 }
@@ -144,6 +167,22 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		}(),
 		logger:        logger,
 		lastActivityAt: time.Now(),
+		controlChan:   make(chan []byte, 64),
+		clientVAD:     cfg.ClientVAD,
+		speculator:     NewSpeculativeExecutor(cfg.SpeculativeIntervalMs),
+		speechAudioBuf: make([]byte, 0, 44100),
+		speakingRateWindow: make([]float64, 0, 20),
+		preSpeechBuf:   bytes.NewBuffer(make([]byte, 0, 300*44100*2/1000)),
+	}
+
+	if cfg.ResponseCaching {
+		ms.responseCache = NewResponseCache(5*time.Minute, 100)
+	}
+
+	if cfg.SpeculativeLLM && ms.speculator != nil {
+		ms.speculator.SetOnPartial(func(partial string) {
+			ms.emit(TranscriptPartial, partial)
+		})
 	}
 
 	detector := NewBackchannelDetector(DefaultBackchannelConfig(), 44100, func(raw []byte) {
@@ -189,18 +228,74 @@ func (ms *ManagedStream) audioProcessor() {
 			ms.handleInterrupt()
 		case chunk := <-ms.cmdChan:
 			ms.handleAudio(chunk)
+		case ctrl := <-ms.controlChan:
+			ms.handleControl(ctrl)
 		}
 	}
 }
 
 func (ms *ManagedStream) handleAudio(chunk []byte) {
-	if ms.vad == nil {
+	ms.mu.Lock()
+	state := ms.state
+	clientVAD := ms.clientVAD
+	// Update pre-speech buffer BEFORE VAD processing so it never includes
+	// the current chunk when onVADStart reads it later in this call.
+	ms.preSpeechBuf.Write(chunk)
+	maxPreSpeech := 300 * int(ms.inputSampleRate) * 2 / 1000
+	if ms.preSpeechBuf.Len() > maxPreSpeech {
+		data := ms.preSpeechBuf.Bytes()
+		keep := data[len(data)-maxPreSpeech:]
+		ms.preSpeechBuf.Reset()
+		ms.preSpeechBuf.Write(keep)
+	}
+	ms.mu.Unlock()
+
+	// In client VAD mode, the client sends control frames for speech boundaries.
+	// The audio processor only buffers audio and runs backchannel detection.
+	if clientVAD {
+		ms.mu.Lock()
+		ms.audioBuf.Write(chunk)
+		if ms.audioBuf.Len() > 176400 {
+			data := ms.audioBuf.Bytes()
+			leadIn := data[len(data)-132300:]
+			ms.audioBuf.Reset()
+			ms.audioBuf.Write(leadIn)
+		}
+		ms.mu.Unlock()
+
+		isSpeaking := ms.vadSpeaking
+		if isSpeaking {
+			ms.userAudio = append(ms.userAudio, chunk...)
+			ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+
+			if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
+				speechDuration := time.Since(ms.userSpeakingSince)
+				if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
+					ms.lastSpecAt = time.Now()
+					audioCopy := make([]byte, len(ms.speechAudioBuf))
+					copy(audioCopy, ms.speechAudioBuf)
+					ms.speculator.Start(ms.ctx, ms.orch, audioCopy, ms.session.GetCurrentLanguage())
+				}
+			}
+		}
+
+		if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
+			samples := make([]int16, len(chunk)/2)
+			for i := range samples {
+				samples[i] = int16(chunk[i*2]) | int16(chunk[i*2+1])<<8
+			}
+			ms.backch.ProcessAudio(samples, time.Now())
+		}
+
+		if isSpeaking {
+			ms.updateActivity()
+		}
 		return
 	}
 
-	ms.mu.Lock()
-	state := ms.state
-	ms.mu.Unlock()
+	if ms.vad == nil {
+		return
+	}
 
 	event, err := ms.vad.Process(chunk)
 	if err != nil {
@@ -218,6 +313,17 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 	if isSpeaking {
 		ms.userAudio = append(ms.userAudio, chunk...)
+		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+
+		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
+			speechDuration := time.Since(ms.userSpeakingSince)
+			if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
+				ms.lastSpecAt = time.Now()
+				audioCopy := make([]byte, len(ms.speechAudioBuf))
+				copy(audioCopy, ms.speechAudioBuf)
+				ms.speculator.Start(ms.ctx, ms.orch, audioCopy, ms.session.GetCurrentLanguage())
+			}
+		}
 	}
 
 	ms.mu.Lock()
@@ -253,6 +359,19 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	ms.userSpeakingSince = time.Now()
 
+	// Prepend 300ms of pre-speech audio to capture the speech onset
+	// that VAD may have missed during its confirmation window (first ~1-2 chunks).
+	// preSpeechBuf is updated BEFORE VAD in handleAudio, so it never includes
+	// the current chunk — no duplicates in userAudio.
+	ms.mu.Lock()
+	if ms.preSpeechBuf.Len() > 0 {
+		buf := ms.preSpeechBuf.Bytes()
+		leadIn := make([]byte, len(buf))
+		copy(leadIn, buf)
+		ms.userAudio = append(leadIn, ms.userAudio...)
+	}
+	ms.mu.Unlock()
+
 	if ms.backch != nil {
 		ms.backch.UserStarted()
 	}
@@ -283,23 +402,62 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	audioData := ms.userAudio
 	ms.userAudio = nil
 
+	speechAudio := ms.speechAudioBuf
+	ms.speechAudioBuf = nil
+
 	// Adaptive VAD: if energy was rising before speech end, the user is likely
 	// pausing mid-thought — extend the minimum duration to avoid splitting
 	// consecutive sentences across separate turns.
 	minDur := 200 * time.Millisecond
 	minLen := 160
-	if trendVAD, ok := ms.vad.(interface{ GetEnergyTrend() float64 }); ok {
-		trend := trendVAD.GetEnergyTrend()
-		if trend > 0.0005 {
-			minDur = 450 * time.Millisecond
-			minLen = 320
-			ms.logger.Debug("Adaptive VAD: energy rising, extending silence window",
-				"trend", trend, "minDur", minDur.String())
+	if !ms.clientVAD {
+		if trendVAD, ok := ms.vad.(interface{ GetEnergyTrend() float64 }); ok {
+			trend := trendVAD.GetEnergyTrend()
+			if trend > 0.0005 {
+				minDur = 450 * time.Millisecond
+				minLen = 320
+				ms.logger.Debug("Adaptive VAD: energy rising, extending silence window",
+					"trend", trend, "minDur", minDur.String())
+			}
+		}
+	}
+
+	// Adaptive pacing: adjust silence limit based on speaking rate
+	if ms.orch.config.AdaptivePacing && len(speechAudio) > 0 {
+		words := countWords(string(audioData))
+		if words > 1 {
+			ms.speakingRateWindow = append(ms.speakingRateWindow, float64(words)/duration.Seconds())
+			if len(ms.speakingRateWindow) > 10 {
+				ms.speakingRateWindow = ms.speakingRateWindow[1:]
+			}
+			var avgRate float64
+			for _, r := range ms.speakingRateWindow {
+				avgRate += r
+			}
+			if len(ms.speakingRateWindow) > 0 {
+				avgRate /= float64(len(ms.speakingRateWindow))
+			}
+			if avgRate > 3.5 {
+				minDur = 150 * time.Millisecond
+				minLen = 120
+				ms.logger.Debug("Adaptive pacing: fast talker, shorter silence window",
+					"rate", avgRate, "minDur", minDur.String())
+			} else if avgRate < 1.5 {
+				minDur = 350 * time.Millisecond
+				minLen = 240
+				ms.logger.Debug("Adaptive pacing: slow talker, longer silence window",
+					"rate", avgRate, "minDur", minDur.String())
+			}
 		}
 	}
 
 	if duration < minDur || len(audioData) < minLen {
 		return
+	}
+
+	// Cancel any in-flight speculation before final processing
+	if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
+		ms.speculator.Cancel()
 	}
 
 	ms.mu.Lock()
@@ -408,154 +566,8 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.speakText(rCtx, response, gen)
 }
 
-func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider StreamingLLMProvider, gen int) {
-	var fullText strings.Builder
-	var hasToolCalls bool
-	messages := ms.session.GetContextCopy()
 
-	type toolRes struct {
-		tc     ToolCallEventData
-		result string
-	}
-	var toolResults []toolRes
 
-	// Sentence-level TTS queue: start speaking individual sentences as they
-	// arrive from the LLM stream, overlapping TTS playback with LLM generation
-	// of subsequent sentences.
-	ttsQueue := make(chan string, 8)
-	ttsWg := sync.WaitGroup{}
-	ttsWg.Add(1)
-	go func() {
-		defer ttsWg.Done()
-		for text := range ttsQueue {
-			ms.speakText(ctx, text, gen)
-		}
-	}()
-
-	// Accumulates incomplete trailing sentence between boundaries
-	var pendingSentence strings.Builder
-
-	flushSentence := func() {
-		s := strings.TrimSpace(pendingSentence.String())
-		if s == "" {
-			return
-		}
-		ttsQueue <- s
-		pendingSentence.Reset()
-	}
-
-	_, err := provider.StreamComplete(ctx, messages, ms.session.GetTools(),
-		func(chunk string) error {
-			fullText.WriteString(chunk)
-			pendingSentence.WriteString(chunk)
-
-			if ms.llmEndTime.IsZero() {
-				ms.llmEndTime = time.Now()
-			}
-
-			// Detect sentence boundaries for early TTS
-			buf := pendingSentence.String()
-			for i, c := range buf {
-				if c == '.' || c == '!' || c == '?' {
-					sentence := strings.TrimSpace(buf[:i+1])
-					if sentence != "" {
-						ttsQueue <- sentence
-					}
-					rest := strings.TrimSpace(buf[i+1:])
-					pendingSentence.Reset()
-					pendingSentence.WriteString(rest)
-					break
-				}
-			}
-
-			return nil
-		},
-		func(tc ToolCallEventData) error {
-			hasToolCalls = true
-			ms.emit(ToolCall, tc)
-
-			filler := strings.TrimSpace(fullText.String())
-			if filler != "" {
-				go func(t string) {
-					sCtx, sCancel := context.WithCancel(ctx)
-					defer sCancel()
-					ms.speakText(sCtx, t, gen)
-				}(filler)
-				fullText.Reset()
-			}
-
-			handler, ok := ms.orch.toolHandlers[tc.Name]
-			result := "Error: tool not found"
-			if ok {
-				r, err := handler(tc.Arguments)
-				if err == nil {
-					result = r
-				} else {
-					result = fmt.Sprintf("Error: %v", err)
-				}
-			}
-
-			toolResults = append(toolResults, toolRes{tc: tc, result: result})
-			return nil
-		},
-	)
-
-	// Flush any remaining partial sentence
-	flushSentence()
-	close(ttsQueue)
-	ttsWg.Wait()
-
-	if err != nil {
-		ms.mu.Lock()
-		ms.state = StateIdle
-		ms.mu.Unlock()
-		if ctx.Err() == nil {
-			ms.emit(ErrorEvent, fmt.Sprintf("LLM error: %v", err))
-		}
-		return
-	}
-
-	response := strings.TrimSpace(fullText.String())
-
-	if response != "" && !hasToolCalls {
-		ms.session.AddMessage("assistant", response)
-		ms.emit(BotResponse, response)
-	}
-
-	if hasToolCalls {
-		var tcData []interface{}
-		for _, tr := range toolResults {
-			tcData = append(tcData, map[string]interface{}{
-				"id":   tr.tc.CallID,
-				"type": "function",
-				"function": map[string]interface{}{
-					"name":      tr.tc.Name,
-					"arguments": tr.tc.Arguments,
-				},
-			})
-		}
-
-		ms.session.AddMessageRaw(Message{
-			Role:      "assistant",
-			Content:   response,
-			ToolCalls: tcData,
-		})
-
-		for _, tr := range toolResults {
-			ms.session.AddMessageRaw(Message{
-				Role:       "tool",
-				Content:    tr.result,
-				ToolCallID: tr.tc.CallID,
-			})
-		}
-
-		go func() {
-			freshCtx, c := context.WithCancel(ms.ctx)
-			defer c()
-			ms.runLLMAndTTS(freshCtx, "")
-		}()
-	}
-}
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	if ms.prosody != nil {
@@ -569,7 +581,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		ms.orch.SetTTSRate(rate)
 	}
 
-	sCtx, sCancel := context.WithCancel(ctx)
+	sCtx, sCancel := context.WithCancel(ms.ctx)
 	defer sCancel()
 
 	ms.mu.Lock()
@@ -930,16 +942,22 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 	ms.mu.Lock()
 	closed := ms.isClosed
 	speaking := ms.state == StateSpeaking
+
+	if eventType == BotSpeaking {
+		if gen <= ms.lastBotSpeakGen {
+			ms.mu.Unlock()
+			return
+		}
+		ms.lastBotSpeakGen = gen
+	}
 	ms.mu.Unlock()
 
 	if closed {
 		return
 	}
 
-	if eventType == AudioChunk {
-		if !speaking {
-			return
-		}
+	if eventType == AudioChunk && !speaking {
+		return
 	}
 
 	event := OrchestratorEvent{
@@ -965,13 +983,22 @@ func (ms *ManagedStream) emitBackchannel(data []byte) {
 	gen := ms.payloadGen
 	ms.mu.Unlock()
 
-	if closed {
+	if closed || len(data) == 0 {
 		return
+	}
+
+	// Apply 50% volume reduction to backchannel audio
+	reduced := make([]byte, len(data))
+	for i := 0; i < len(data)-1; i += 2 {
+		sample := int16(data[i]) | int16(data[i+1])<<8
+		sample = int16(float64(sample) * 0.5)
+		reduced[i] = byte(sample)
+		reduced[i+1] = byte(sample >> 8)
 	}
 
 	event := OrchestratorEvent{
 		Type:       AudioChunk,
-		Data:       data,
+		Data:       reduced,
 		Generation: gen,
 	}
 

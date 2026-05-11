@@ -91,6 +91,8 @@ const (
 	BotResumed        EventType = "BOT_RESUMED"
 	AudioChunk        EventType = "AUDIO_CHUNK"
 	ToolCall          EventType = "TOOL_CALL"
+	ToolResult        EventType = "TOOL_RESULT"
+	CacheHit          EventType = "CACHE_HIT"
 	ErrorEvent        EventType = "ERROR"
 )
 
@@ -171,6 +173,41 @@ type Config struct {
 	EchoSuppressionThreshold float64
 	FirstSpeaker             FirstSpeaker
 	SilenceTimeout           time.Duration
+
+	// Client-side VAD: server accepts vad_speech_start/end control frames
+	ClientVAD bool
+
+	// Token-level TTS: send text to TTS on smaller boundaries (N words or after comma)
+	TokenLevelTTS bool
+
+	// Number of words between TTS flushes when TokenLevelTTS is enabled (0 = disabled)
+	TTSMinTokenInterval int
+
+	// Speculative LLM: start LLM during speech based on partial audio
+	SpeculativeLLM bool
+
+	// Interval (in milliseconds) between speculative STT calls during speech
+	SpeculativeIntervalMs int
+
+	// Adaptive pacing: adjust silence timeout based on user speaking rate
+	AdaptivePacing bool
+
+	// Response caching: cache common responses to skip LLM entirely
+	ResponseCaching bool
+
+	// TTS connection pool size
+	TTSConnectionPoolSize int
+
+	// Context summarization: summarize old turns instead of dropping them
+	ContextSummarization bool
+
+	// Summarization prompt for context when MaxContextMessages is exceeded
+	SummarizationPrompt string
+
+	// STT/LLM/TTS region overrides for co-location
+	STTRegion string
+	LLMRegion string
+	TTSRegion string
 }
 
 func DefaultConfig() Config {
@@ -190,6 +227,20 @@ func DefaultConfig() Config {
 		EchoSuppressionThreshold: 0.35,
 		FirstSpeaker:             FirstSpeakerBot,
 		SilenceTimeout:           0,
+
+		ClientVAD:              false,
+		TokenLevelTTS:          true,
+		TTSMinTokenInterval:    4,
+		SpeculativeLLM:         false,
+		SpeculativeIntervalMs:  400,
+		AdaptivePacing:         true,
+		ResponseCaching:        true,
+		TTSConnectionPoolSize:  3,
+		ContextSummarization:   true,
+		SummarizationPrompt:    "Summarize the following conversation turns in 1-2 sentences, keeping key facts and context:",
+		STTRegion:              "",
+		LLMRegion:              "",
+		TTSRegion:              "",
 	}
 }
 
@@ -266,6 +317,40 @@ func (s *ConversationSession) ClearContext() {
 	s.Context = []Message{}
 	s.LastUser = ""
 	s.LastAssistant = ""
+}
+
+// SummarizeContext removes old messages and replaces them with a summary message
+// when the context exceeds the max. Keeps the last keepLast messages intact.
+func (s *ConversationSession) SummarizeContext(summaryText string, keepLast int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Context) <= s.MaxMessages {
+		return
+	}
+	trimCount := len(s.Context) - s.MaxMessages
+	if keepLast > 0 && trimCount > len(s.Context)-keepLast {
+		trimCount = len(s.Context) - keepLast
+	}
+	if trimCount <= 0 {
+		return
+	}
+	removed := s.Context[:trimCount]
+	s.Context = s.Context[trimCount:]
+
+	if summaryText != "" {
+		summaryMsg := Message{
+			Role:    "system",
+			Content: "[Summary of earlier conversation: " + summaryText + "]",
+		}
+		s.Context = append([]Message{summaryMsg}, s.Context...)
+	}
+	_ = removed
+}
+
+func (s *ConversationSession) NeedsSummarization() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.Context) > s.MaxMessages
 }
 
 func (s *ConversationSession) GetContextCopy() []Message {

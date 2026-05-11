@@ -43,7 +43,7 @@ func generateMhm(sampleRate int) []int16 {
 			0.25*math.Sin(2*math.Pi*modFreq*2*t) +
 			0.08*math.Sin(2*math.Pi*modFreq*3*t)
 		val /= 1.33
-		samples[i] = int16(val * env * 7000)
+		samples[i] = int16(val * env * 3500)
 	}
 	return samples
 }
@@ -79,7 +79,7 @@ func generateUhHuh(sampleRate int) []int16 {
 
 		val = math.Sin(2*math.Pi*freq*t) + 0.15*math.Sin(2*math.Pi*freq*2*t)
 		val /= 1.15
-		samples[i] = int16(val * env * 6000)
+		samples[i] = int16(val * env * 3000)
 	}
 	return samples
 }

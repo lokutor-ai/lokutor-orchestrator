@@ -149,10 +149,19 @@ func main() {
 
 	fmt.Printf("Configured: STT=%s | LLM=%s | TTS=Lokutor\n", sttProviderName, llmProviderName)
 	fmt.Printf("VAD: ImprovedRMS | Sample Rate: %dHz | Language: %s\n", SampleRate, lang)
+	fmt.Printf("Features: clientVAD=%v tokenTTS=%v specLLM=%v pacing=%v cache=%v sum=%v pool=%d\n",
+		config.ClientVAD, config.TokenLevelTTS, config.SpeculativeLLM,
+		config.AdaptivePacing, config.ResponseCaching, config.ContextSummarization,
+		config.TTSConnectionPoolSize)
 	fmt.Println("Voice Agent Started! Listening to microphone...")
 	fmt.Println("Press Ctrl+C to exit")
 
-	tts := ttsProvider.NewLokutorTTS(lokutorKey)
+	var tts *ttsProvider.LokutorTTS
+	if config.TTSConnectionPoolSize > 1 {
+		tts = ttsProvider.NewLokutorTTSPool(lokutorKey, config.TTSConnectionPoolSize)
+	} else {
+		tts = ttsProvider.NewLokutorTTS(lokutorKey)
+	}
 
 	// Advanced VAD with ZCR and Peak tracking for better noise rejection.
 	vad := orchestrator.NewImprovedRMSVAD(config.BargeInVADThreshold, 200*time.Millisecond, SampleRate)

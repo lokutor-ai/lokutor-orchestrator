@@ -58,6 +58,54 @@ func newOrchestrator(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADP
 	}
 }
 
+func (o *Orchestrator) GetLLMProvider() LLMProvider {
+	return o.llm
+}
+
+func (o *Orchestrator) SummarizeContext(ctx context.Context, session *ConversationSession) error {
+	if o.llm == nil {
+		return fmt.Errorf("no LLM provider")
+	}
+	messages := session.GetContextCopy()
+
+	var turnsToSummarize []Message
+	for _, msg := range messages {
+		if msg.Role == "system" && strings.HasPrefix(msg.Content, "[Summary") {
+			continue
+		}
+		if msg.Role == "user" || msg.Role == "assistant" {
+			turnsToSummarize = append(turnsToSummarize, msg)
+		}
+	}
+
+	if len(turnsToSummarize) < 2 {
+		return nil
+	}
+
+	var sb strings.Builder
+	for _, msg := range turnsToSummarize {
+		content := msg.Content
+		if len(content) > 200 {
+			content = content[:200] + "..."
+		}
+		sb.WriteString(msg.Role + ": " + content + "\n")
+	}
+
+	prompt := o.config.SummarizationPrompt + "\n\n" + sb.String()
+	summaryMessages := []Message{
+		{Role: "system", Content: "You generate concise summaries of conversations. Keep key facts and context, max 3 sentences."},
+		{Role: "user", Content: prompt},
+	}
+
+	summary, err := o.llm.Complete(ctx, summaryMessages, nil)
+	if err != nil || summary == "" {
+		return err
+	}
+
+	session.SummarizeContext(summary, session.MaxMessages/2)
+	return nil
+}
+
 func (o *Orchestrator) RegisterTool(name string, handler ToolHandler) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -121,6 +169,20 @@ func (o *Orchestrator) ProcessAudioStream(ctx context.Context, session *Conversa
 }
 
 func (o *Orchestrator) Transcribe(ctx context.Context, audioData []byte, lang Language) (TranscriptionResult, error) {
+	return o.stt.Transcribe(ctx, audioData, lang)
+}
+
+// transcribeNoFilter is implemented by STTWrapper to bypass noise suppression.
+type transcribeNoFilter interface {
+	TranscribeNoFilter(ctx context.Context, audio []byte, lang Language) (TranscriptionResult, error)
+}
+
+// TranscribeRaw bypasses noise suppression for fast, unfiltered transcription.
+// Used by speculative STT where speed matters more than full noise suppression.
+func (o *Orchestrator) TranscribeRaw(ctx context.Context, audioData []byte, lang Language) (TranscriptionResult, error) {
+	if nf, ok := o.stt.(transcribeNoFilter); ok {
+		return nf.TranscribeNoFilter(ctx, audioData, lang)
+	}
 	return o.stt.Transcribe(ctx, audioData, lang)
 }
 

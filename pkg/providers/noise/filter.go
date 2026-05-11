@@ -103,12 +103,19 @@ func (f *Filter) ProcessChunk(input []float32) []float32 {
 // Flush processes remaining audio and flushes OLA.
 func (f *Filter) Flush() []float32 {
 	out := f.processZeroFrames(NFFT / HopLength)
-	f.inputBuffer = f.inputBuffer[:f.padSize]
+	if cap(f.inputBuffer) >= f.padSize {
+		f.inputBuffer = f.inputBuffer[:f.padSize]
+	} else {
+		f.inputBuffer = make([]float32, f.padSize, NFFT*3)
+	}
 	f.padded = false
 	f.hiddenState = make([]float32, GRULayers*1*GRUUnits)
 	f.droppedPad = false
 	f.padAccum = nil
 	f.prevBark = make([]float32, NBands)
+	f.olaBuffer = make([]float64, NFFT)
+	f.windowSum = make([]float64, NFFT)
+	f._vadBelow = 0
 	return out
 }
 
