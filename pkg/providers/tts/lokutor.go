@@ -68,7 +68,7 @@ func (t *LokutorTTS) warmup() {
 func (t *LokutorTTS) dial(ctx context.Context) (*websocket.Conn, error) {
 	u := url.URL{Scheme: t.scheme, Host: t.host, Path: "/ws", RawQuery: "api_key=" + t.apiKey}
 	conn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
-		CompressionMode: websocket.CompressionNoContextTakeover,
+		CompressionMode: websocket.CompressionDisabled,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to lokutor: %w", err)
