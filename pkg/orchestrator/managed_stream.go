@@ -581,7 +581,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		ms.orch.SetTTSRate(rate)
 	}
 
-	sCtx, sCancel := context.WithCancel(ms.ctx)
+	sCtx, sCancel := context.WithCancel(ctx)
 	defer sCancel()
 
 	ms.mu.Lock()
