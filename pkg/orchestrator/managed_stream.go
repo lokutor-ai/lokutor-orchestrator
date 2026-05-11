@@ -690,6 +690,16 @@ func (ms *ManagedStream) handleInterrupt() {
 
 func (ms *ManagedStream) cancelPipeline() {
 	ms.mu.Lock()
+
+	// Abort TTS while still holding ms.mu to prevent a new utterance
+	// from acquiring a connection (via speakText → StreamSynthesize)
+	// before we close the old one. Without this guard, Abort() can
+	// close a connection that a concurrent utterance just opened,
+	// causing "received unknown opcode" frame corruption.
+	if ms.orch != nil && ms.orch.tts != nil {
+		ms.orch.tts.Abort()
+	}
+
 	pCancel := ms.pipelineCancel
 	tCancel := ms.ttsCancel
 	ms.pipelineCancel = nil
@@ -701,9 +711,6 @@ func (ms *ManagedStream) cancelPipeline() {
 	}
 	if tCancel != nil {
 		tCancel()
-	}
-	if ms.orch != nil && ms.orch.tts != nil {
-		ms.orch.tts.Abort()
 	}
 }
 

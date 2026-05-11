@@ -232,12 +232,14 @@ func (t *LokutorTTS) Close() error {
 func (t *LokutorTTS) Abort() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	var kept []*poolConn
 	for _, pc := range t.pool {
 		if pc.inUse && pc.conn != nil {
 			pc.conn.Close(websocket.StatusAbnormalClosure, "abort")
-			pc.conn = nil
-			pc.inUse = false
+		} else {
+			kept = append(kept, pc)
 		}
 	}
+	t.pool = kept
 	return nil
 }
