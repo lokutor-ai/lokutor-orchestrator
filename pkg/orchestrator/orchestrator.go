@@ -294,7 +294,11 @@ func (o *Orchestrator) SetLanguage(session *ConversationSession, lang Language) 
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.CurrentLanguage = lang
-	langInstruction := "IMPORTANT: Always respond in " + string(lang) + ". Never switch to another language, even if the user speaks another language. The entire conversation must be in " + string(lang) + "."
+	
+	// Map language code to human-readable name for LLM instruction
+	langName := languageCodeToName(lang)
+	langInstruction := "IMPORTANT: Always respond in " + langName + ". Never switch to another language, even if the user speaks another language. The entire conversation must be in " + langName + "."
+	
 	for i, msg := range session.Context {
 		if msg.Role == "system" {
 			re := regexp.MustCompile(`IMPORTANT: Always respond in[^.]+\.`)
@@ -305,6 +309,30 @@ func (o *Orchestrator) SetLanguage(session *ConversationSession, lang Language) 
 			}
 			break
 		}
+	}
+}
+
+// languageCodeToName maps language codes to human-readable names for LLM prompts.
+func languageCodeToName(lang Language) string {
+	switch lang {
+	case LanguageEn:
+		return "English"
+	case LanguageEs:
+		return "Spanish"
+	case LanguageFr:
+		return "French"
+	case LanguageDe:
+		return "German"
+	case LanguageIt:
+		return "Italian"
+	case LanguagePt:
+		return "Portuguese"
+	case LanguageJa:
+		return "Japanese"
+	case LanguageZh:
+		return "Chinese"
+	default:
+		return string(lang)
 	}
 }
 
