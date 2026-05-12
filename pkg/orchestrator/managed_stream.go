@@ -3,8 +3,10 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,6 +14,14 @@ import (
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
 )
+
+
+var dumpAudioDir = func() string {
+	if d := os.Getenv("DUMP_AUDIO_DIR"); d != "" {
+		return d
+	}
+	return "stt_audio_dump"
+}()
 
 type StreamState int
 
@@ -22,25 +32,6 @@ const (
 	StateSpeaking
 	StateInterrupted
 )
-
-type echoReference struct {
-	mu      sync.Mutex
-	buffer  []int16
-	maxSize int
-}
-
-func (e *echoReference) Write(chunk []byte) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	samples := make([]int16, len(chunk)/2)
-	for i := range samples {
-		samples[i] = int16(chunk[i*2]) | int16(chunk[i*2+1])<<8
-	}
-	e.buffer = append(e.buffer, samples...)
-	if len(e.buffer) > e.maxSize {
-		e.buffer = e.buffer[len(e.buffer)-e.maxSize:]
-	}
-}
 
 type ManagedStream struct {
 	orch    *Orchestrator
@@ -68,8 +59,6 @@ type ManagedStream struct {
 	ttsCancel      context.CancelFunc
 
 	payloadGen int
-
-	echoRef *echoReference
 
 	logger Logger
 
@@ -108,8 +97,6 @@ type ManagedStream struct {
 	// Used in onVADStart to prepend speech onset that VAD's confirmation window missed.
 	preSpeechBuf *bytes.Buffer
 
-	echoSuppressor *EchoSuppressor
-
 	// Response cache
 	responseCache *ResponseCache
 
@@ -124,6 +111,12 @@ type ManagedStream struct {
 	// Bot speech deduplication: tracks the generation of the last BotSpeaking emission
 	// to prevent emitting the same event multiple times for a single generation.
 	lastBotSpeakGen int
+
+	// ttsMu serializes TTS operations within this session to prevent concurrent
+	// WS frame corruption when multiple sentences are queued for synthesis.
+	// Deepgram WS is not thread-safe, so we ensure only one StreamSynthesize
+	// call at a time per session.
+	ttsMu sync.Mutex
 
 	mu sync.Mutex
 }
@@ -146,11 +139,6 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		logger = &NoOpLogger{}
 	}
 
-	es := NewEchoSuppressorWithRates(44100, cfg.SampleRate)
-	if th := cfg.EchoSuppressionThreshold; th > 0 {
-		es.SetThreshold(th)
-	}
-
 	ms := &ManagedStream{
 		orch:            o,
 		session:         session,
@@ -163,9 +151,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		vad:             streamVAD,
 		playbackRate:    44100,
 		inputSampleRate: cfg.SampleRate,
-		turnComp:        NewTurnCompletionAnalyzer(),
-		echoRef:         &echoReference{maxSize: 88200},
-		echoSuppressor:  es,
+		turnComp: NewTurnCompletionAnalyzer(),
 		userProfile:     prosody.NewUserSpeechProfile(),
 		prosody: func() *prosody.AdaptiveProcessor {
 			c := prosody.DefaultConfig()
@@ -303,24 +289,6 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 	if ms.vad == nil {
 		return
-	}
-
-	if ms.echoSuppressor != nil {
-		chunk = ms.echoSuppressor.RemoveEchoRealtime(chunk)
-		if len(chunk) == 0 {
-			return
-		}
-		// If the chunk was fully zeroed (no remaining energy), skip VAD
-		hasEnergy := false
-		for _, b := range chunk {
-			if b != 0 {
-				hasEnergy = true
-				break
-			}
-		}
-		if !hasEnergy {
-			return
-		}
 	}
 
 	event, err := ms.vad.Process(chunk)
@@ -495,7 +463,53 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	go ms.processUtterance(audioData, duration, seq)
 }
 
+func writeWAV(path string, data []byte, sampleRate int) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	byteRate := sampleRate * 2
+	blockAlign := uint16(2)
+	dataSize := len(data)
+
+	header := make([]byte, 44)
+	copy(header[0:4], []byte("RIFF"))
+	binary.LittleEndian.PutUint32(header[4:8], uint32(36+dataSize))
+	copy(header[8:12], []byte("WAVE"))
+	copy(header[12:16], []byte("fmt "))
+	binary.LittleEndian.PutUint32(header[16:20], 16)
+	binary.LittleEndian.PutUint16(header[20:22], 1)
+	binary.LittleEndian.PutUint16(header[22:24], 1)
+	binary.LittleEndian.PutUint32(header[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(header[28:32], uint32(byteRate))
+	binary.LittleEndian.PutUint16(header[32:34], blockAlign)
+	binary.LittleEndian.PutUint16(header[34:36], 16)
+	copy(header[36:40], []byte("data"))
+	binary.LittleEndian.PutUint32(header[40:44], uint32(dataSize))
+
+	if _, err := f.Write(header); err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Duration, seq int) {
+	if dumpAudioDir != "" {
+		dir := filepath.Join(dumpAudioDir, fmt.Sprintf("session_%d", time.Now().Unix()))
+		os.MkdirAll(dir, 0755)
+		path := filepath.Join(dir, fmt.Sprintf("utt_%d_%dms.wav", seq, duration.Milliseconds()))
+		if err := writeWAV(path, audioData, ms.inputSampleRate); err != nil {
+			ms.logger.Warn("failed to dump audio", "path", path, "error", err)
+		} else {
+			ms.logger.Info("dumped utterance audio", "path", path, "bytes", len(audioData), "duration_ms", duration.Milliseconds())
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(ms.ctx, 15*time.Second)
 	defer cancel()
 
@@ -640,6 +654,9 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 
 	ms.ttsFirstChunkTime = time.Now()
 
+	// Serialize TTS operations to prevent concurrent WS frame corruption.
+	// Only one StreamSynthesize call per session at a time.
+	ms.ttsMu.Lock()
 	err := ms.orch.SynthesizeStream(sCtx, text,
 		ms.session.GetCurrentVoice(),
 		ms.session.GetCurrentLanguage(),
@@ -669,6 +686,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 			return nil
 		},
 	)
+	ms.ttsMu.Unlock()
 
 	if !started && len(jitterBuf) > 0 {
 		ms.emitFrames(jitterBuf, frameSize, gen)
@@ -788,28 +806,8 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 	return nil
 }
 
-func (ms *ManagedStream) RecordPlayedOutput(chunk []byte) {
-	if len(chunk) == 0 {
-		return
-	}
-	buf := make([]byte, len(chunk))
-	copy(buf, chunk)
-	ms.echoRef.Write(buf)
-	if ms.echoSuppressor != nil {
-		ms.echoSuppressor.RecordPlayedAudio(buf)
-	}
-}
-
-func (ms *ManagedStream) NotifyAudioPlayed() {
-	ms.lastAudioSentAt = time.Now()
-}
-
-func (ms *ManagedStream) SetEchoSampleRates(playbackRate, inputRate int) {
-	ms.playbackRate = playbackRate
-	ms.inputSampleRate = inputRate
-	if ms.echoSuppressor != nil {
-		ms.echoSuppressor.SetSampleRates(playbackRate, inputRate)
-	}
+func (ms *ManagedStream) IsVADSpeaking() bool {
+	return ms.vadSpeaking
 }
 
 func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration time.Duration) bool {
@@ -834,11 +832,15 @@ func countWords(s string) int {
 	return len(strings.Fields(s))
 }
 
+type rmsProvider interface {
+	LastRMS() float64
+}
+
 func (ms *ManagedStream) LastRMS() float64 {
 	if ms.vad == nil {
 		return 0
 	}
-	if rms, ok := ms.vad.(*RMSVAD); ok {
+	if rms, ok := ms.vad.(rmsProvider); ok {
 		return rms.LastRMS()
 	}
 	return 0

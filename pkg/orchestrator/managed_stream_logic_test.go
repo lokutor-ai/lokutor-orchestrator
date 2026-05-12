@@ -106,13 +106,7 @@ func TestManagedStream_ExportLastUserAudio(t *testing.T) {
 	}
 }
 
-func TestManagedStream_SetPlaybackRate(t *testing.T) {
-	ms := &ManagedStream{}
-	ms.SetEchoSampleRates(48000, 16000)
-	if ms.playbackRate != 48000 {
-		t.Fatalf("rate not set: %d", ms.playbackRate)
-	}
-}
+
 
 func TestManagedStream_InterruptionLogic(t *testing.T) {
 	orch := New(nil, nil, nil, Config{})

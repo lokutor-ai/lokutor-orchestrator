@@ -215,7 +215,6 @@ func main() {
 	defer cancel()
 
 	stream := orch.NewManagedStream(ctx, session)
-	stream.SetEchoSampleRates(SampleRate, SampleRate)
 	defer stream.Close()
 
 	mctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, nil)
@@ -257,13 +256,7 @@ func main() {
 		}
 	}()
 
-	playedChan := make(chan []byte, 64)
-	go func() {
-		for chunk := range playedChan {
-			stream.RecordPlayedOutput(chunk)
-			chunkPool.Put(chunk)
-		}
-	}()
+
 
 	onSamples := func(pOutput, pInput []byte, frameCount uint32) {
 		if pInput != nil {
@@ -285,17 +278,9 @@ func main() {
 					for i := range pOutput {
 						pOutput[i] = 0
 					}
-
-					// Record silence for AEC
-					buf := chunkPool.Get().([]byte)
-					buf = buf[:cap(buf)]
-					nc := copy(buf, pOutput)
-					// Block to ensure AEC timeline integrity
-					playedChan <- buf[:nc]
 					return
 				}
 				preRolling = false
-
 			}
 
 			playedRealAudio := false
@@ -333,16 +318,8 @@ func main() {
 						e2eLogged = true
 					}
 				}
-				stream.NotifyAudioPlayed()
-			}
+				}
 			playbackMu.Unlock()
-
-			// Record EVERYTHING we play (voice AND silence) so AEC timeline stays perfectly synchronized
-			buf := chunkPool.Get().([]byte)
-			buf = buf[:cap(buf)]
-			nc := copy(buf, pOutput)
-			// Block to ensure AEC timeline integrity
-			playedChan <- buf[:nc]
 		}
 	}
 
