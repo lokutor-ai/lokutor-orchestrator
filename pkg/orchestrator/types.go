@@ -245,15 +245,16 @@ func DefaultConfig() Config {
 }
 
 type ConversationSession struct {
-	mu              sync.RWMutex
-	ID              string
-	Context         []Message
-	LastUser        string
-	LastAssistant   string
-	MaxMessages     int
-	CurrentVoice    Voice
-	CurrentLanguage Language
-	Tools           []Tool
+	mu                sync.RWMutex
+	ID                string
+	Context           []Message
+	LastUser          string
+	LastAssistant     string
+	MaxMessages       int
+	CurrentVoice      Voice
+	CurrentLanguage   Language
+	Tools             []Tool
+	toolCallCounts    map[string]int // Track how many times each tool has been called
 }
 
 func NewConversationSession(userID string) *ConversationSession {
@@ -263,6 +264,7 @@ func NewConversationSession(userID string) *ConversationSession {
 		MaxMessages:     20,
 		CurrentVoice:    VoiceF1,
 		CurrentLanguage: LanguageEn,
+		toolCallCounts:  make(map[string]int),
 	}
 }
 
@@ -371,4 +373,21 @@ func (s *ConversationSession) GetCurrentLanguage() Language {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.CurrentLanguage
+}
+
+// RecordToolCall increments the call count for a tool and returns true if within limits,
+// false if the tool has been called too many times (likely infinite loop).
+func (s *ConversationSession) RecordToolCall(toolName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolCallCounts[toolName]++
+	// Limit tool calls to 3 per tool per session to prevent infinite loops
+	return s.toolCallCounts[toolName] <= 3
+}
+
+// ResetToolCallCounts clears the tool call history (useful after user input or long pauses).
+func (s *ConversationSession) ResetToolCallCounts() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolCallCounts = make(map[string]int)
 }

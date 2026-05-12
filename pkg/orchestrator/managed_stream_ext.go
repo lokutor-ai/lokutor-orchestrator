@@ -119,6 +119,12 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			return nil
 		},
 		func(tc ToolCallEventData) error {
+			// Check for infinite tool loop
+			if !ms.session.RecordToolCall(tc.Name) {
+				ms.emit(ErrorEvent, fmt.Sprintf("Tool loop detected: %s called too many times. Aborting to prevent infinite retry.", tc.Name))
+				return fmt.Errorf("tool loop detected: %s", tc.Name)
+			}
+
 			hasToolCalls = true
 			ms.emit(ToolCall, tc)
 
