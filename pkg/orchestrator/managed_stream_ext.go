@@ -231,8 +231,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 			ms.emitWithGen(BotThinking, nil, gen)
 
-			text, err := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), nil)
-			if err != nil || text == "" {
+			text, err := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), ms.session.GetTools())
+			if err != nil {
 				if rCtx.Err() == nil {
 					ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
 				}
@@ -240,6 +240,10 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				ms.state = StateIdle
 				ms.mu.Unlock()
 				return
+			}
+			text = strings.TrimSpace(text)
+			if text == "" {
+				text = "Got it."
 			}
 
 			ms.session.AddMessage("assistant", text)
