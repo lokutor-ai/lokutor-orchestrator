@@ -3,10 +3,8 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,14 +12,6 @@ import (
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
 )
-
-
-var dumpAudioDir = func() string {
-	if d := os.Getenv("DUMP_AUDIO_DIR"); d != "" {
-		return d
-	}
-	return "stt_audio_dump"
-}()
 
 type StreamState int
 
@@ -351,6 +341,15 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 }
 
 func (ms *ManagedStream) onVADStart(prevState StreamState) {
+	// Cooldown: ignore VAD start if a speech end happened <500ms ago.
+	// Prevents VAD from immediately re-triggering on residual audio / echo
+	// after a user utterance ends (causing duplicate STT calls).
+	if !ms.userSpeechEnd.IsZero() && time.Since(ms.userSpeechEnd) < 500*time.Millisecond {
+		ms.logger.Info("VAD start ignored (cooldown)", "since_end_ms", time.Since(ms.userSpeechEnd).Milliseconds())
+		ms.vad.Reset()
+		return
+	}
+
 	ms.userSpeakingSince = time.Now()
 
 	// Prepend 300ms of pre-speech audio to capture the speech onset
@@ -463,55 +462,21 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	go ms.processUtterance(audioData, duration, seq)
 }
 
-func writeWAV(path string, data []byte, sampleRate int) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	byteRate := sampleRate * 2
-	blockAlign := uint16(2)
-	dataSize := len(data)
-
-	header := make([]byte, 44)
-	copy(header[0:4], []byte("RIFF"))
-	binary.LittleEndian.PutUint32(header[4:8], uint32(36+dataSize))
-	copy(header[8:12], []byte("WAVE"))
-	copy(header[12:16], []byte("fmt "))
-	binary.LittleEndian.PutUint32(header[16:20], 16)
-	binary.LittleEndian.PutUint16(header[20:22], 1)
-	binary.LittleEndian.PutUint16(header[22:24], 1)
-	binary.LittleEndian.PutUint32(header[24:28], uint32(sampleRate))
-	binary.LittleEndian.PutUint32(header[28:32], uint32(byteRate))
-	binary.LittleEndian.PutUint16(header[32:34], blockAlign)
-	binary.LittleEndian.PutUint16(header[34:36], 16)
-	copy(header[36:40], []byte("data"))
-	binary.LittleEndian.PutUint32(header[40:44], uint32(dataSize))
-
-	if _, err := f.Write(header); err != nil {
-		return err
-	}
-	if _, err := f.Write(data); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Duration, seq int) {
-	if dumpAudioDir != "" {
-		dir := filepath.Join(dumpAudioDir, fmt.Sprintf("session_%d", time.Now().Unix()))
-		os.MkdirAll(dir, 0755)
-		path := filepath.Join(dir, fmt.Sprintf("utt_%d_%dms.wav", seq, duration.Milliseconds()))
-		if err := writeWAV(path, audioData, ms.inputSampleRate); err != nil {
-			ms.logger.Warn("failed to dump audio", "path", path, "error", err)
-		} else {
-			ms.logger.Info("dumped utterance audio", "path", path, "bytes", len(audioData), "duration_ms", duration.Milliseconds())
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(ms.ctx, 15*time.Second)
 	defer cancel()
+
+	// Skip STT entirely if a newer utterance already superseded this one.
+	ms.mu.Lock()
+	currentSeq := ms.utteranceSeq
+	ms.mu.Unlock()
+	if currentSeq > seq {
+		ms.logger.Info("Skipping STT for superseded utterance", "seq", seq, "currentSeq", currentSeq)
+		ms.mu.Lock()
+		ms.state = StateIdle
+		ms.mu.Unlock()
+		return
+	}
 
 	ms.sttStartTime = time.Now()
 
@@ -520,6 +485,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.mu.Lock()
 		ms.state = StateIdle
 		ms.mu.Unlock()
+		if ctx.Err() == nil {
+			ms.emit(ErrorEvent, fmt.Sprintf("Transcription error: %v", err))
+		}
 		return
 	}
 
@@ -555,7 +523,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// If a newer utterance already arrived, skip LLM — the newest
 	// utterance's pipeline will see all accumulated context.
 	ms.mu.Lock()
-	currentSeq := ms.utteranceSeq
+	currentSeq = ms.utteranceSeq
 	ms.mu.Unlock()
 	if currentSeq > seq {
 		ms.logger.Info("Skipping LLM for older utterance",
