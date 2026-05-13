@@ -216,7 +216,35 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		go func() {
 			freshCtx, c := context.WithCancel(ms.ctx)
 			defer c()
-			ms.runLLMAndTTS(freshCtx, "")
+
+			rCtx, rCancel := context.WithCancel(freshCtx)
+			defer rCancel()
+
+			ms.mu.Lock()
+			if ms.pipelineCancel != nil {
+				ms.pipelineCancel()
+			}
+			ms.pipelineCancel = rCancel
+			ms.payloadGen++
+			gen := ms.payloadGen
+			ms.mu.Unlock()
+
+			ms.emitWithGen(BotThinking, nil, gen)
+
+			text, err := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), nil)
+			if err != nil || text == "" {
+				if rCtx.Err() == nil {
+					ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
+				}
+				ms.mu.Lock()
+				ms.state = StateIdle
+				ms.mu.Unlock()
+				return
+			}
+
+			ms.session.AddMessage("assistant", text)
+			ms.emit(BotResponse, text)
+			ms.speakText(rCtx, text, gen)
 		}()
 	}
 }
