@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
+	"github.com/lokutor-ai/lokutor-orchestrator/pkg/vela"
 )
 
 type StreamState int
@@ -30,6 +31,9 @@ type ManagedStream struct {
 	cancel  context.CancelFunc
 	events  chan OrchestratorEvent
 	vad     VADProvider
+
+	// Vela turn detection model (replaces VAD-based turn detection)
+	vela *vela.Detector
 
 	cmdChan          chan []byte
 	interruptChan    chan struct{}
@@ -159,6 +163,21 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		preSpeechBuf:   bytes.NewBuffer(make([]byte, 0, 300*44100*2/1000)),
 	}
 
+	// Initialize Vela turn detection model if path is configured
+	if cfg.VelaModelPath != "" {
+		if _, err := os.Stat(cfg.VelaModelPath); err == nil {
+			v, err := vela.NewDetector(cfg.VelaModelPath)
+			if err != nil {
+				logger.Warn("failed to load Vela model, falling back to VAD", "error", err)
+			} else {
+				ms.vela = v
+				logger.Info("Vela turn detection loaded", "model", cfg.VelaModelPath)
+			}
+		} else {
+			logger.Warn("Vela model file not found, falling back to VAD", "path", cfg.VelaModelPath)
+		}
+	}
+
 	if cfg.ResponseCaching {
 		ms.responseCache = NewResponseCache(5*time.Minute, 100)
 	}
@@ -277,6 +296,13 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		return
 	}
 
+	// Vela turn detection mode: use neural model instead of VAD
+	if ms.vela != nil {
+		ms.handleAudioVela(chunk, state)
+		return
+	}
+
+	// Legacy VAD mode
 	if ms.vad == nil {
 		return
 	}
@@ -338,6 +364,140 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	if isSpeaking {
 		ms.updateActivity()
 	}
+}
+
+// handleAudioVela processes audio using the Vela neural turn detection model.
+func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
+	// Convert input sample rate to 16kHz for Vela if needed
+	audioChunk := chunk
+	if ms.inputSampleRate != 16000 {
+		// Resample to 16kHz (simple linear interpolation)
+		audioChunk = resampleTo16k(chunk, ms.inputSampleRate)
+	}
+
+	// Vela expects int16 PCM at 16kHz, 320 samples per frame (20ms)
+	// The chunk from the client is at ms.inputSampleRate (typically 44100Hz)
+	// We need to convert and buffer to get exactly 320 samples at 16kHz
+
+	// For now, process the chunk directly - Vela handles the conversion internally
+	event, err := ms.vela.Process(audioChunk)
+	if err != nil {
+		ms.logger.Warn("Vela processing error", "error", err)
+		return
+	}
+
+	isSpeaking := ms.vela.IsSpeaking()
+	ms.vadSpeaking = isSpeaking
+
+	cfg := ms.orch.GetConfig()
+
+	// Vela turn detection logic:
+	// - floor_yield > threshold AND continuation < threshold → user is done
+	// - floor_yield < threshold AND continuation > threshold → user is speaking
+	// - interruption_safety > threshold → safe to interrupt
+
+	if isSpeaking {
+		ms.userAudio = append(ms.userAudio, chunk...)
+		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+
+		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
+			speechDuration := time.Since(ms.userSpeakingSince)
+			if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
+				ms.lastSpecAt = time.Now()
+				audioCopy := make([]byte, len(ms.speechAudioBuf))
+				copy(audioCopy, ms.speechAudioBuf)
+				ms.speculator.Start(ms.ctx, ms.orch, audioCopy, ms.session.GetCurrentLanguage())
+			}
+		}
+	}
+
+	ms.mu.Lock()
+	ms.audioBuf.Write(chunk)
+	if ms.audioBuf.Len() > 176400 {
+		data := ms.audioBuf.Bytes()
+		leadIn := data[len(data)-132300:]
+		ms.audioBuf.Reset()
+		ms.audioBuf.Write(leadIn)
+	}
+	ms.mu.Unlock()
+
+	// Check for turn completion (user is done speaking)
+	if event.FloorYield > cfg.VelaFloorYieldThreshold &&
+		event.Continuation < cfg.VelaContinuationThreshold &&
+		isSpeaking == false {
+		// User has yielded the floor and is not speaking → trigger speech end
+		ms.onVADEnd(prevState)
+		return
+	}
+
+	// Check for speech start (user started speaking)
+	if event.Continuation > cfg.VelaContinuationThreshold && isSpeaking {
+		// User is speaking → trigger speech start if not already
+		if prevState != StateListening && prevState != StateProcessing {
+			ms.onVADStart(prevState)
+		}
+	}
+
+	// Check for safe interruption (user wants to interrupt bot)
+	if event.InterruptionSafety > cfg.VelaInterruptThreshold && isSpeaking {
+		if prevState == StateSpeaking || prevState == StateProcessing {
+			ms.emit(UserSpeaking, nil)
+			ms.cancelPipeline()
+			return
+		}
+	}
+
+	if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
+		samples := make([]int16, len(chunk)/2)
+		for i := range samples {
+			samples[i] = int16(chunk[i*2]) | int16(chunk[i*2+1])<<8
+		}
+		ms.backch.ProcessAudio(samples, time.Now())
+	}
+
+	if isSpeaking {
+		ms.updateActivity()
+	}
+}
+
+// resampleTo16k resamples audio from the input sample rate to 16kHz using linear interpolation.
+func resampleTo16k(audio []byte, inputSampleRate int) []byte {
+	if inputSampleRate == 16000 {
+		return audio
+	}
+
+	// Calculate output length
+	ratio := float64(16000) / float64(inputSampleRate)
+	outLen := int(float64(len(audio)/2) * ratio * 2)
+	if outLen%2 != 0 {
+		outLen--
+	}
+	if outLen <= 0 {
+		return audio
+	}
+
+	out := make([]byte, outLen)
+	inSamples := len(audio) / 2
+
+	for i := 0; i < outLen/2; i++ {
+		srcPos := float64(i) / ratio
+		srcIdx := int(srcPos)
+		frac := srcPos - float64(srcIdx)
+
+		if srcIdx >= inSamples-1 {
+			srcIdx = inSamples - 2
+		}
+
+		// Linear interpolation
+		s0 := int16(audio[srcIdx*2]) | int16(audio[srcIdx*2+1])<<8
+		s1 := int16(audio[(srcIdx+1)*2]) | int16(audio[(srcIdx+1)*2+1])<<8
+		sample := int16(float64(s0)*(1-frac) + float64(s1)*frac)
+
+		out[i*2] = byte(sample)
+		out[i*2+1] = byte(sample >> 8)
+	}
+
+	return out
 }
 
 func (ms *ManagedStream) onVADStart(prevState StreamState) {
@@ -830,6 +990,11 @@ func (ms *ManagedStream) Close() {
 
 		ms.cancelPipeline()
 		ms.cancel()
+
+		// Clean up Vela model
+		if ms.vela != nil {
+			ms.vela.Destroy()
+		}
 
 		time.Sleep(10 * time.Millisecond)
 

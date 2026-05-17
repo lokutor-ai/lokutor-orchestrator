@@ -208,6 +208,14 @@ type Config struct {
 	STTRegion string
 	LLMRegion string
 	TTSRegion string
+
+	// Vela turn detection: ONNX model path for neural turn detection
+	VelaModelPath string
+
+	// Vela thresholds for turn detection decisions
+	VelaFloorYieldThreshold    float32 // floor_yield threshold to consider user done (default 0.5)
+	VelaContinuationThreshold  float32 // continuation threshold below which user is likely done (default 0.4)
+	VelaInterruptThreshold     float32 // interruption_safety threshold to allow barge-in (default 0.6)
 }
 
 func DefaultConfig() Config {
@@ -241,6 +249,11 @@ func DefaultConfig() Config {
 		STTRegion:              "",
 		LLMRegion:              "",
 		TTSRegion:              "",
+
+		VelaModelPath:          "assets/onnx/vela/model.onnx",
+		VelaFloorYieldThreshold:    0.5,
+		VelaContinuationThreshold:  0.4,
+		VelaInterruptThreshold:     0.6,
 	}
 }
 
