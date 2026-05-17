@@ -210,6 +210,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				Role:       "tool",
 				Content:    tr.result,
 				ToolCallID: tr.tc.CallID,
+				Name:       tr.tc.Name,
 			})
 		}
 
@@ -231,7 +232,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 			ms.emitWithGen(BotThinking, nil, gen)
 
-			text, err := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), ms.session.GetTools())
+			text, err := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), nil)
 			if err != nil {
 				if rCtx.Err() == nil {
 					ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
@@ -34,7 +35,9 @@ func NewGoogleLLM(apiKey string, model string) *GoogleLLM {
 }
 
 type googlePart struct {
-	Text string `json:"text,omitempty"`
+	Text             string      `json:"text,omitempty"`
+	FunctionCall     interface{} `json:"functionCall,omitempty"`
+	FunctionResponse interface{} `json:"functionResponse,omitempty"`
 }
 
 type googleContent struct {
@@ -50,6 +53,9 @@ func (l *GoogleLLM) buildRequest(messages []orchestrator.Message, tools []orches
 	var systemInstruction *googleContent
 	var contents []googleContent
 
+	// Track function names by call ID so tool results can reference them
+	fnNameByCallID := make(map[string]string)
+
 	for _, m := range messages {
 		if m.Role == "system" {
 			if systemInstruction == nil {
@@ -62,6 +68,77 @@ func (l *GoogleLLM) buildRequest(messages []orchestrator.Message, tools []orches
 			}
 			continue
 		}
+
+		if m.Role == "assistant" && m.ToolCalls != nil {
+			// Build functionCall parts from the stored tool call data
+			tcList, ok := m.ToolCalls.([]interface{})
+			if !ok {
+				continue
+			}
+			var parts []googlePart
+			if m.Content != "" {
+				parts = append(parts, googlePart{Text: m.Content})
+			}
+			for _, tc := range tcList {
+				tcMap, ok := tc.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				fn, _ := tcMap["function"].(map[string]interface{})
+				if fn == nil {
+					continue
+				}
+				name, _ := fn["name"].(string)
+				argsStr, _ := fn["arguments"].(string)
+				var args interface{}
+				json.Unmarshal([]byte(argsStr), &args)
+				if name == "" {
+					continue
+				}
+				callID, _ := tcMap["id"].(string)
+				if callID != "" {
+					fnNameByCallID[callID] = name
+				}
+				parts = append(parts, googlePart{
+					FunctionCall: map[string]interface{}{
+						"name": name,
+						"args": args,
+					},
+				})
+			}
+			if len(parts) > 0 {
+				contents = append(contents, googleContent{
+					Role:  "model",
+					Parts: parts,
+				})
+			}
+			continue
+		}
+
+		if m.Role == "tool" {
+			// Look up function name by call ID
+			fnName := fnNameByCallID[m.ToolCallID]
+			if fnName == "" {
+				// Fallback: use the Name field if set
+				fnName = m.Name
+			}
+			if fnName == "" {
+				continue
+			}
+			contents = append(contents, googleContent{
+				Role: "function",
+				Parts: []googlePart{{
+					FunctionResponse: map[string]interface{}{
+						"name": fnName,
+						"response": map[string]string{
+							"response": m.Content,
+						},
+					},
+				}},
+			})
+			continue
+		}
+
 		role := m.Role
 		if role == "assistant" {
 			role = "model"
@@ -132,8 +209,10 @@ func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Messag
 		Candidates []struct {
 			Content struct {
 				Parts []struct {
-					Text string `json:"text"`
+					Text         string      `json:"text"`
+					FunctionCall interface{} `json:"functionCall"`
 				} `json:"parts"`
+				Role string `json:"role"`
 			} `json:"content"`
 		} `json:"candidates"`
 	}
@@ -143,6 +222,13 @@ func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Messag
 
 	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
 		return "", fmt.Errorf("no response from google llm")
+	}
+
+	// If the response contains a functionCall, return the text if any, or empty
+	for _, part := range result.Candidates[0].Content.Parts {
+		if part.FunctionCall != nil {
+			return result.Candidates[0].Content.Parts[0].Text, nil
+		}
 	}
 
 	return result.Candidates[0].Content.Parts[0].Text, nil
@@ -201,7 +287,8 @@ func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 			Candidates []struct {
 				Content struct {
 					Parts []struct {
-						Text string `json:"text"`
+						Text         string      `json:"text"`
+						FunctionCall interface{} `json:"functionCall"`
 					} `json:"parts"`
 					Role string `json:"role"`
 				} `json:"content"`
@@ -214,6 +301,33 @@ func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 
 		if len(chunk.Candidates) == 0 || len(chunk.Candidates[0].Content.Parts) == 0 {
 			continue
+		}
+
+		// Check for functionCall in any part
+		for _, part := range chunk.Candidates[0].Content.Parts {
+			if part.FunctionCall != nil {
+				fc, ok := part.FunctionCall.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name, _ := fc["name"].(string)
+				if name == "" {
+					continue
+				}
+				argsBytes, _ := json.Marshal(fc["args"])
+				callID := fmt.Sprintf("fc_%s_%d", name, time.Now().UnixNano())
+				if onToolCall != nil {
+					if err := onToolCall(orchestrator.ToolCallEventData{
+						Name:      name,
+						Arguments: string(argsBytes),
+						CallID:    callID,
+					}); err != nil {
+						return "", err
+					}
+				}
+				// Function call was handled, no text content to stream
+				return "", nil
+			}
 		}
 
 		t := chunk.Candidates[0].Content.Parts[0].Text
