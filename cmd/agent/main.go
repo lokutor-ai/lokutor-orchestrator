@@ -35,6 +35,7 @@ func main() {
 	openaiKey := os.Getenv("OPENAI_API_KEY")
 	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
 	googleKey := os.Getenv("GOOGLE_API_KEY")
+	geminiKey := os.Getenv("GEMINI_API_KEY")
 	deepgramKey := os.Getenv("DEEPGRAM_API_KEY")
 	assemblyKey := os.Getenv("ASSEMBLYAI_API_KEY")
 	lokutorKey := os.Getenv("LOKUTOR_API_KEY")
@@ -45,7 +46,12 @@ func main() {
 	}
 	llmProviderName := os.Getenv("LLM_PROVIDER")
 	if llmProviderName == "" {
-		llmProviderName = "groq"
+		// Default to groq unless GEMINI_API_KEY is set, then prefer Google
+		if geminiKey != "" {
+			llmProviderName = "google"
+		} else {
+			llmProviderName = "groq"
+		}
 	}
 
 	lang := orchestrator.Language(os.Getenv("AGENT_LANGUAGE"))
@@ -123,14 +129,18 @@ func main() {
 		}
 		llm = llmProvider.NewAnthropicLLM(anthropicKey, "claude-3-5-sonnet-20241022")
 	case "google":
-		if googleKey == "" {
-			googleKey = os.Getenv("GEMINI_API_KEY")
+		// Prefer GEMINI_API_KEY, fall back to GOOGLE_API_KEY
+		if geminiKey == "" {
+			geminiKey = googleKey
 		}
-		if googleKey == "" {
-			log.Fatal("Error: GOOGLE_API_KEY or GEMINI_API_KEY must be set for google LLM")
+		if geminiKey == "" {
+			log.Fatal("Error: GEMINI_API_KEY or GOOGLE_API_KEY must be set for google LLM")
 		}
 		geminiModel := os.Getenv("GEMINI_MODEL")
-		llm = llmProvider.NewGoogleLLM(googleKey, geminiModel)
+		if geminiModel == "" {
+			geminiModel = "gemini-2.5-flash"
+		}
+		llm = llmProvider.NewGoogleLLM(geminiKey, geminiModel)
 	case "groq":
 		fallthrough
 	default:
@@ -152,6 +162,22 @@ func main() {
 	}
 
 	fmt.Printf("Configured: STT=%s | LLM=%s | TTS=Lokutor\n", sttProviderName, llmProviderName)
+	
+	// Show LLM model details
+	if llmProviderName == "google" {
+		geminiModel := os.Getenv("GEMINI_MODEL")
+		if geminiModel == "" {
+			geminiModel = "gemini-2.5-flash"
+		}
+		fmt.Printf("  → Using Gemini model: %s\n", geminiModel)
+	} else if llmProviderName == "groq" {
+		fmt.Printf("  → Using Groq model: meta-llama/llama-4-scout-17b-16e-instruct\n")
+	} else if llmProviderName == "openai" {
+		fmt.Printf("  → Using OpenAI model: gpt-4o\n")
+	} else if llmProviderName == "anthropic" {
+		fmt.Printf("  → Using Anthropic model: claude-3-5-sonnet-20241022\n")
+	}
+	
 	fmt.Printf("VAD: ImprovedRMS | Sample Rate: %dHz | Language: %s\n", SampleRate, lang)
 	fmt.Printf("Features: clientVAD=%v tokenTTS=%v specLLM=%v pacing=%v cache=%v sum=%v pool=%d\n",
 		config.ClientVAD, config.TokenLevelTTS, config.SpeculativeLLM,

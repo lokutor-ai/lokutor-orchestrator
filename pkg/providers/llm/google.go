@@ -126,13 +126,11 @@ func (l *GoogleLLM) buildRequest(messages []orchestrator.Message, tools []orches
 				continue
 			}
 			contents = append(contents, googleContent{
-				Role: "function",
+				Role: "user",
 				Parts: []googlePart{{
 					FunctionResponse: map[string]interface{}{
 						"name": fnName,
-						"response": map[string]string{
-							"response": m.Content,
-						},
+						"response": m.Content,
 					},
 				}},
 			})
@@ -224,13 +222,11 @@ func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Messag
 		return "", fmt.Errorf("no response from google llm")
 	}
 
-	// If the response contains a functionCall, return the text if any, or empty
-	for _, part := range result.Candidates[0].Content.Parts {
-		if part.FunctionCall != nil {
-			return result.Candidates[0].Content.Parts[0].Text, nil
-		}
-	}
-
+	// Note: Complete() does not support tool calling. It only returns text.
+	// If the model generates a tool call, it will be ignored and the text will be returned.
+	// For tool calling workflows, use StreamComplete() instead, which properly handles
+	// tool calls via the onToolCall callback.
+	
 	return result.Candidates[0].Content.Parts[0].Text, nil
 }
 
@@ -314,19 +310,31 @@ func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 				if name == "" {
 					continue
 				}
-				argsBytes, _ := json.Marshal(fc["args"])
+				
+				// Handle args: could be already-parsed object or JSON string
+				var argsStr string
+				switch args := fc["args"].(type) {
+				case string:
+					argsStr = args
+				case map[string]interface{}, []interface{}:
+					argsBytes, _ := json.Marshal(args)
+					argsStr = string(argsBytes)
+				default:
+					argsStr = "{}"
+				}
+				
 				callID := fmt.Sprintf("fc_%s_%d", name, time.Now().UnixNano())
 				if onToolCall != nil {
 					if err := onToolCall(orchestrator.ToolCallEventData{
 						Name:      name,
-						Arguments: string(argsBytes),
+						Arguments: argsStr,
 						CallID:    callID,
 					}); err != nil {
 						return "", err
 					}
 				}
-				// Function call was handled, no text content to stream
-				return "", nil
+				// Continue processing to collect any text + tool calls.
+				continue
 			}
 		}
 

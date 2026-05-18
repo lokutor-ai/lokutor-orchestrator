@@ -430,7 +430,15 @@ func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
 	}
 
 	if ms.velaSilenceStart != (time.Time{}) && !isSpeaking {
-		if time.Since(ms.velaSilenceStart) >= 150*time.Millisecond {
+		// Fallback silence threshold: 75ms when Vela neural model didn't detect yield.
+		// This is a fast fallback for cases where floor_yield < 0.5. Can be tuned via env var.
+		fallbackThreshold := 75 * time.Millisecond
+		if envThreshold := os.Getenv("VELA_FALLBACK_SILENCE_MS"); envThreshold != "" {
+			if ms, err := strconv.Atoi(envThreshold); err == nil && ms > 0 {
+				fallbackThreshold = time.Duration(ms) * time.Millisecond
+			}
+		}
+		if time.Since(ms.velaSilenceStart) >= fallbackThreshold {
 			if prevState == StateListening || prevState == StateProcessing {
 				ms.onVADEnd(prevState)
 				ms.velaSilenceStart = time.Time{}
@@ -565,8 +573,8 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	// Adaptive VAD: if energy was rising before speech end, the user is likely
 	// pausing mid-thought — extend the minimum duration to avoid splitting
 	// consecutive sentences across separate turns.
-	minDur := 200 * time.Millisecond
-	minLen := 160
+	minDur := 100 * time.Millisecond
+	minLen := 80
 	if !ms.clientVAD {
 		if trendVAD, ok := ms.vad.(interface{ GetEnergyTrend() float64 }); ok {
 			trend := trendVAD.GetEnergyTrend()
