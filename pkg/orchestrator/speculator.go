@@ -51,7 +51,7 @@ func (se *SpeculativeExecutor) ShouldSpeculate(speechDuration time.Duration, las
 	if se.state != SpecIdle {
 		return false
 	}
-	if speechDuration < 300*time.Millisecond {
+	if speechDuration < 1500*time.Millisecond {
 		return false
 	}
 	if !lastSpecAt.IsZero() && time.Since(lastSpecAt) < se.interval {

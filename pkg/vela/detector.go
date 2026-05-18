@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 
 	ort "github.com/yalue/onnxruntime_go"
@@ -67,7 +68,11 @@ func NewDetector(modelPath string) (*Detector, error) {
 	ort.SetSharedLibraryPath(libPath)
 
 	if err := ort.InitializeEnvironment(); err != nil {
-		return nil, fmt.Errorf("init onnx: %w", err)
+		if !strings.Contains(err.Error(), "already been initialized") {
+			return nil, fmt.Errorf("init onnx: %w", err)
+		}
+		// ONNX Runtime already initialized by another component (e.g. Silero VAD)
+		// — proceed without error.
 	}
 
 	input, err := ort.NewEmptyTensor[float32]([]int64{1, FeatureDim})
@@ -214,6 +219,20 @@ func (d *Detector) IsSpeaking() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.vadState
+}
+
+// GetSilenceDuration returns the current silence duration in seconds.
+func (d *Detector) GetSilenceDuration() float32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.silenceDuration
+}
+
+// GetSpeechDuration returns the current speech duration in seconds.
+func (d *Detector) GetSpeechDuration() float32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.speechDuration
 }
 
 // Reset clears all state.

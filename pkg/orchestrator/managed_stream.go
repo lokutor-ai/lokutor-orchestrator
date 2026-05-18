@@ -34,6 +34,8 @@ type ManagedStream struct {
 
 	// Vela turn detection model (replaces VAD-based turn detection)
 	vela *vela.Detector
+	velaSilenceStart time.Time // Tracks silence start after speech end
+	velaPeakFloorYield float32 // Peak floor_yield during current speech period
 
 	cmdChan          chan []byte
 	interruptChan    chan struct{}
@@ -267,20 +269,10 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		ms.mu.Unlock()
 
 		isSpeaking := ms.vadSpeaking
-		if isSpeaking {
-			ms.userAudio = append(ms.userAudio, chunk...)
-			ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
-
-			if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
-				speechDuration := time.Since(ms.userSpeakingSince)
-				if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
-					ms.lastSpecAt = time.Now()
-					audioCopy := make([]byte, len(ms.speechAudioBuf))
-					copy(audioCopy, ms.speechAudioBuf)
-					ms.speculator.Start(ms.ctx, ms.orch, audioCopy, ms.session.GetCurrentLanguage())
-				}
-			}
-		}
+	if isSpeaking {
+		ms.userAudio = append(ms.userAudio, chunk...)
+		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+	}
 
 		if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
 			samples := make([]int16, len(chunk)/2)
@@ -368,33 +360,27 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 // handleAudioVela processes audio using the Vela neural turn detection model.
 func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
-	// Convert input sample rate to 16kHz for Vela if needed
 	audioChunk := chunk
 	if ms.inputSampleRate != 16000 {
-		// Resample to 16kHz (simple linear interpolation)
 		audioChunk = resampleTo16k(chunk, ms.inputSampleRate)
 	}
 
-	// Vela expects int16 PCM at 16kHz, 320 samples per frame (20ms)
-	// The chunk from the client is at ms.inputSampleRate (typically 44100Hz)
-	// We need to convert and buffer to get exactly 320 samples at 16kHz
-
-	// For now, process the chunk directly - Vela handles the conversion internally
 	event, err := ms.vela.Process(audioChunk)
 	if err != nil {
 		ms.logger.Warn("Vela processing error", "error", err)
 		return
 	}
 
+	wasSpeaking := ms.vadSpeaking
 	isSpeaking := ms.vela.IsSpeaking()
 	ms.vadSpeaking = isSpeaking
 
 	cfg := ms.orch.GetConfig()
 
-	// Vela turn detection logic:
-	// - floor_yield > threshold AND continuation < threshold → user is done
-	// - floor_yield < threshold AND continuation > threshold → user is speaking
-	// - interruption_safety > threshold → safe to interrupt
+	// Track peak floor_yield during speech period
+	if isSpeaking && event.FloorYield > ms.velaPeakFloorYield {
+		ms.velaPeakFloorYield = event.FloorYield
+	}
 
 	if isSpeaking {
 		ms.userAudio = append(ms.userAudio, chunk...)
@@ -421,24 +407,42 @@ func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
 	}
 	ms.mu.Unlock()
 
-	// Check for turn completion (user is done speaking)
-	if event.FloorYield > cfg.VelaFloorYieldThreshold &&
-		event.Continuation < cfg.VelaContinuationThreshold &&
-		isSpeaking == false {
-		// User has yielded the floor and is not speaking → trigger speech end
-		ms.onVADEnd(prevState)
-		return
-	}
-
-	// Check for speech start (user started speaking)
-	if event.Continuation > cfg.VelaContinuationThreshold && isSpeaking {
-		// User is speaking → trigger speech start if not already
+	// Speech start detection
+	if isSpeaking && !wasSpeaking {
+		ms.velaPeakFloorYield = 0
 		if prevState != StateListening && prevState != StateProcessing {
 			ms.onVADStart(prevState)
 		}
 	}
 
-	// Check for safe interruption (user wants to interrupt bot)
+	// Neural turn end: when VAD drops to silence, check if model detected yield intent
+	if wasSpeaking && !isSpeaking && ms.velaPeakFloorYield > 0.5 {
+		ms.logger.Info("Vela: neural turn completion", "peak_floor_yield", ms.velaPeakFloorYield)
+		ms.onVADEnd(prevState)
+		ms.velaPeakFloorYield = 0
+		ms.velaSilenceStart = time.Time{}
+		return
+	}
+
+	// Fallback: silence timer only if model didn't produce a yield signal
+	if wasSpeaking && !isSpeaking {
+		ms.velaSilenceStart = time.Now()
+	}
+
+	if ms.velaSilenceStart != (time.Time{}) && !isSpeaking {
+		if time.Since(ms.velaSilenceStart) >= 150*time.Millisecond {
+			if prevState == StateListening || prevState == StateProcessing {
+				ms.onVADEnd(prevState)
+				ms.velaSilenceStart = time.Time{}
+				return
+			}
+		}
+	}
+
+	if isSpeaking {
+		ms.velaSilenceStart = time.Time{}
+	}
+
 	if event.InterruptionSafety > cfg.VelaInterruptThreshold && isSpeaking {
 		if prevState == StateSpeaking || prevState == StateProcessing {
 			ms.emit(UserSpeaking, nil)
@@ -606,11 +610,6 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 
 	if duration < minDur || len(audioData) < minLen {
 		return
-	}
-
-	// Cancel any in-flight speculation before final processing
-	if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
-		ms.speculator.Cancel()
 	}
 
 	ms.mu.Lock()
