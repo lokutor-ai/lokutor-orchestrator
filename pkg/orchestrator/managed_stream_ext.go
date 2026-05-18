@@ -143,13 +143,39 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				defer toolWg.Done()
 
 				handler, ok := ms.orch.toolHandlers[tcData.Name]
-				result := "Error: tool not found"
+				var result string
 				if ok {
 					r, err := handler(tcData.Arguments)
 					if err == nil {
 						result = r
 					} else {
-						result = fmt.Sprintf("Error: %v", err)
+						result = fmt.Sprintf(`{"error": "%s"}`, err)
+					}
+				} else {
+					// Client-side tool: create a channel and wait for the client to respond
+					ch := make(chan string, 1)
+					ms.clientToolResultsMu.Lock()
+					ms.clientToolResults[tcData.CallID] = ch
+					ms.clientToolResultsMu.Unlock()
+
+					// Clean up channel from map when done
+					defer func() {
+						ms.clientToolResultsMu.Lock()
+						delete(ms.clientToolResults, tcData.CallID)
+						ms.clientToolResultsMu.Unlock()
+					}()
+
+					// Wait for client response with 10-second timeout
+					resultCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					defer cancel()
+
+					select {
+					case res := <-ch:
+						result = res
+					case <-resultCtx.Done():
+						result = `{"error": "client tool request timed out after 10 seconds"}`
+					case <-ms.ctx.Done():
+						result = `{"error": "cancelled"}`
 					}
 				}
 

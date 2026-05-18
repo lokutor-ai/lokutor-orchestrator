@@ -125,15 +125,43 @@ func (l *GoogleLLM) buildRequest(messages []orchestrator.Message, tools []orches
 			if fnName == "" {
 				continue
 			}
-			contents = append(contents, googleContent{
-				Role: "user",
-				Parts: []googlePart{{
-					FunctionResponse: map[string]interface{}{
-						"name": fnName,
-						"response": m.Content,
-					},
-				}},
-			})
+			// Parse response as JSON object if possible, otherwise wrap in result object.
+			// Gemini requires functionResponse.response to be a JSON object (protobuf Struct),
+			// not a string, number, array, or null.
+			var respObj interface{}
+			if json.Unmarshal([]byte(m.Content), &respObj) == nil {
+				if obj, ok := respObj.(map[string]interface{}); ok {
+					contents = append(contents, googleContent{
+						Role: "user",
+						Parts: []googlePart{{
+							FunctionResponse: map[string]interface{}{
+								"name": fnName,
+								"response": obj,
+							},
+						}},
+					})
+				} else {
+					contents = append(contents, googleContent{
+						Role: "user",
+						Parts: []googlePart{{
+							FunctionResponse: map[string]interface{}{
+								"name": fnName,
+								"response": map[string]interface{}{"result": m.Content},
+							},
+						}},
+					})
+				}
+			} else {
+				contents = append(contents, googleContent{
+					Role: "user",
+					Parts: []googlePart{{
+						FunctionResponse: map[string]interface{}{
+							"name": fnName,
+							"response": map[string]interface{}{"result": m.Content},
+						},
+					}},
+				})
+			}
 			continue
 		}
 

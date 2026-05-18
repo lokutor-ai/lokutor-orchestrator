@@ -331,8 +331,56 @@ func languageCodeToName(lang Language) string {
 		return "Portuguese"
 	case LanguageJa:
 		return "Japanese"
+	case LanguageKo:
+		return "Korean"
 	case LanguageZh:
 		return "Chinese"
+	case LanguageAr:
+		return "Arabic"
+	case LanguageBg:
+		return "Bulgarian"
+	case LanguageHr:
+		return "Croatian"
+	case LanguageCs:
+		return "Czech"
+	case LanguageDa:
+		return "Danish"
+	case LanguageNl:
+		return "Dutch"
+	case LanguageEt:
+		return "Estonian"
+	case LanguageFi:
+		return "Finnish"
+	case LanguageEl:
+		return "Greek"
+	case LanguageHi:
+		return "Hindi"
+	case LanguageHu:
+		return "Hungarian"
+	case LanguageId:
+		return "Indonesian"
+	case LanguageLv:
+		return "Latvian"
+	case LanguageLt:
+		return "Lithuanian"
+	case LanguagePl:
+		return "Polish"
+	case LanguageRo:
+		return "Romanian"
+	case LanguageRu:
+		return "Russian"
+	case LanguageSk:
+		return "Slovak"
+	case LanguageSl:
+		return "Slovenian"
+	case LanguageSv:
+		return "Swedish"
+	case LanguageTr:
+		return "Turkish"
+	case LanguageUk:
+		return "Ukrainian"
+	case LanguageVi:
+		return "Vietnamese"
 	default:
 		return string(lang)
 	}

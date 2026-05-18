@@ -114,6 +114,10 @@ type ManagedStream struct {
 	// call at a time per session.
 	ttsMu sync.Mutex
 
+	// Client-side tool calls: map of callID -> result channels
+	clientToolResults   map[string]chan string
+	clientToolResultsMu sync.Mutex
+
 	mu sync.Mutex
 }
 
@@ -162,7 +166,8 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		speculator:     NewSpeculativeExecutor(cfg.SpeculativeIntervalMs),
 		speechAudioBuf: make([]byte, 0, 44100),
 		speakingRateWindow: make([]float64, 0, 20),
-		preSpeechBuf:   bytes.NewBuffer(make([]byte, 0, 300*44100*2/1000)),
+		preSpeechBuf:        bytes.NewBuffer(make([]byte, 0, 300*44100*2/1000)),
+		clientToolResults:   make(map[string]chan string),
 	}
 
 	// Initialize Vela turn detection model if path is configured
@@ -543,6 +548,9 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 
 	ms.mu.Lock()
 	ms.state = StateListening
+	if ms.clientVAD {
+		ms.vadSpeaking = true
+	}
 	ms.mu.Unlock()
 
 	if prevState == StateSpeaking || prevState == StateProcessing {
@@ -557,6 +565,12 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.userSpeechEnd = time.Now()
 	ms.emit(UserStopped, nil)
+
+	ms.mu.Lock()
+	if ms.clientVAD {
+		ms.vadSpeaking = false
+	}
+	ms.mu.Unlock()
 
 	if ms.backch != nil {
 		ms.backch.UserStarted()
@@ -989,6 +1003,55 @@ func (ms *ManagedStream) Events() <-chan OrchestratorEvent {
 	return ms.events
 }
 
+func (ms *ManagedStream) SubmitToolResult(callID string, result string) {
+	ms.clientToolResultsMu.Lock()
+	ch, ok := ms.clientToolResults[callID]
+	if ok {
+		delete(ms.clientToolResults, callID)
+	}
+	ms.clientToolResultsMu.Unlock()
+	if ok {
+		select {
+		case ch <- result:
+		default:
+		}
+	}
+}
+
+func (ms *ManagedStream) RegenerateBackchannelClips(o *Orchestrator) {
+	if o == nil || o.tts == nil || ms.backch == nil {
+		return
+	}
+	go func() {
+		voice := VoiceF1
+		lang := LanguageEn
+		if ms.session != nil && ms.session.GetCurrentVoice() != "" {
+			voice = ms.session.GetCurrentVoice()
+		} else if o != nil && o.config.VoiceStyle != "" {
+			voice = o.config.VoiceStyle
+		}
+		if ms.session != nil && ms.session.CurrentLanguage != "" {
+			lang = ms.session.CurrentLanguage
+		} else if o != nil && o.config.Language != "" {
+			lang = o.config.Language
+		}
+
+		phrases := backchannelPhrasesForLang(lang)
+		clips := make([][]byte, 0, len(phrases))
+
+		for _, phrase := range phrases {
+			audio, err := o.GenerateSilent(ms.ctx, phrase, voice, lang)
+			if err == nil && len(audio) > 100 {
+				clips = append(clips, audio)
+			}
+		}
+
+		if len(clips) > 0 {
+			ms.backch.SetClips(clips)
+		}
+	}()
+}
+
 func (ms *ManagedStream) Close() {
 	ms.closeOnce.Do(func() {
 		ms.mu.Lock()
@@ -1189,10 +1252,81 @@ func (ms *ManagedStream) emitBackchannel(data []byte) {
 	}
 }
 
+func backchannelPhrasesForLang(lang Language) []string {
+	switch lang {
+	case LanguageEs:
+		return []string{"mhm", "ahá", "sí"}
+	case LanguageFr:
+		return []string{"mhm", "uh-huh", "oui"}
+	case LanguageDe:
+		return []string{"mhm", "aha", "ja"}
+	case LanguageIt:
+		return []string{"mhm", "uh-huh", "sì"}
+	case LanguagePt:
+		return []string{"mhm", "uh-huh", "sim"}
+	case LanguageJa:
+		return []string{"un", "hai", "ee"}
+	case LanguageKo:
+		return []string{"eum", "eo", "ne"}
+	case LanguageZh:
+		return []string{"en", "a", "shi"}
+	case LanguageAr:
+		return []string{"hmm", "ah", "naam"}
+	case LanguageBg:
+		return []string{"mhm", "ahah", "da"}
+	case LanguageHr:
+		return []string{"mhm", "aha", "da"}
+	case LanguageCs:
+		return []string{"mhm", "aha", "ano"}
+	case LanguageDa:
+		return []string{"mhm", "naa", "ja"}
+	case LanguageNl:
+		return []string{"mhm", "uh-huh", "ja"}
+	case LanguageEt:
+		return []string{"mhm", "ahah", "jah"}
+	case LanguageFi:
+		return []string{"mhm", "ahaa", "niin"}
+	case LanguageEl:
+		return []string{"mmm", "aha", "ne"}
+	case LanguageHi:
+		return []string{"hmm", "haan", "accha"}
+	case LanguageHu:
+		return []string{"mhm", "aha", "igen"}
+	case LanguageId:
+		return []string{"mhm", "uh-huh", "ya"}
+	case LanguageLv:
+		return []string{"mhm", "aha", "jaa"}
+	case LanguageLt:
+		return []string{"mhm", "aha", "taip"}
+	case LanguagePl:
+		return []string{"mhm", "aha", "tak"}
+	case LanguageRo:
+		return []string{"mhm", "aha", "da"}
+	case LanguageRu:
+		return []string{"mhm", "aha", "da"}
+	case LanguageSk:
+		return []string{"mhm", "aha", "ano"}
+	case LanguageSl:
+		return []string{"mhm", "aha", "ja"}
+	case LanguageSv:
+		return []string{"mhm", "uh-huh", "ja"}
+	case LanguageTr:
+		return []string{"mhm", "hihi", "evet"}
+	case LanguageUk:
+		return []string{"mhm", "aha", "tak"}
+	case LanguageVi:
+		return []string{"um", "u", "vang"}
+	default:
+		return []string{"mhm", "uh-huh", "yeah"}
+	}
+}
+
 func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 	voice := VoiceF1
 	lang := LanguageEn
-	if o != nil && o.config.VoiceStyle != "" {
+	if ms.session != nil && ms.session.GetCurrentVoice() != "" {
+		voice = ms.session.GetCurrentVoice()
+	} else if o != nil && o.config.VoiceStyle != "" {
 		voice = o.config.VoiceStyle
 	}
 	if ms.session != nil && ms.session.CurrentLanguage != "" {
@@ -1201,12 +1335,7 @@ func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 		lang = o.config.Language
 	}
 
-	var phrases []string
-	if lang == LanguageEs {
-		phrases = []string{"mhm", "ahá", "sí"}
-	} else {
-		phrases = []string{"mhm", "uh-huh", "yeah"}
-	}
+	phrases := backchannelPhrasesForLang(lang)
 	clips := make([][]byte, 0, len(phrases))
 
 	for _, phrase := range phrases {

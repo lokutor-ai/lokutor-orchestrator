@@ -67,7 +67,13 @@ func (c *Conversation) SetLanguageByString(language string) error {
 
 	validLanguages := map[Language]bool{
 		LanguageEn: true, LanguageEs: true, LanguageFr: true, LanguageDe: true,
-		LanguageIt: true, LanguagePt: true, LanguageJa: true, LanguageZh: true,
+		LanguageIt: true, LanguagePt: true, LanguageJa: true, LanguageKo: true,
+		LanguageZh: true, LanguageAr: true, LanguageBg: true, LanguageHr: true,
+		LanguageCs: true, LanguageDa: true, LanguageNl: true, LanguageEt: true,
+		LanguageFi: true, LanguageEl: true, LanguageHi: true, LanguageHu: true,
+		LanguageId: true, LanguageLv: true, LanguageLt: true, LanguagePl: true,
+		LanguageRo: true, LanguageRu: true, LanguageSk: true, LanguageSl: true,
+		LanguageSv: true, LanguageTr: true, LanguageUk: true, LanguageVi: true,
 	}
 	if !validLanguages[lang] {
 		return fmt.Errorf("invalid language: %s", language)

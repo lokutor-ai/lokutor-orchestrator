@@ -43,6 +43,9 @@ type Config struct {
 	CompressRatio     float64 // 2-10, default 4
 	AttackMs          float64 // ms, default 10
 	ReleaseMs         float64 // ms, default 100
+
+	// Pitch modification (conversational intonation)
+	PitchShift float64 // semitones, 0 = disabled, -3 to +3 typical range
 }
 
 // DeviceType represents output device characteristics
@@ -92,7 +95,7 @@ func (p *Processor) Process(samples []byte, sampleRate int, channels int) []byte
 	if p.config.LowShelfGain == 0 && p.config.HighShelfGain == 0 &&
 		p.config.PresenceGain == 0 && p.config.HarmonicMix == 0 &&
 		p.config.ReverbMix == 0 && p.config.CompressRatio <= 1 &&
-		p.config.TargetLUFS == 0 {
+		p.config.TargetLUFS == 0 && p.config.PitchShift == 0 {
 		return samples
 	}
 
@@ -100,6 +103,7 @@ func (p *Processor) Process(samples []byte, sampleRate int, channels int) []byte
 	floatSamples := p.bytesToFloat(samples, channels)
 
 	// Apply processing chain
+	floatSamples = p.applyPitchShift(floatSamples, sampleRate)
 	floatSamples = p.applyEQ(floatSamples, sampleRate)
 	floatSamples = p.applyCompression(floatSamples)
 	floatSamples = p.applyHarmonicEnhancement(floatSamples)
@@ -116,12 +120,14 @@ func (p *Processor) ProcessStereo(left, right []byte, sampleRate int) ([]byte, [
 	rightFloat := p.bytesToFloat(right, 1)
 
 	// Process each channel
+	leftFloat = p.applyPitchShift(leftFloat, sampleRate)
 	leftFloat = p.applyEQ(leftFloat, sampleRate)
 	leftFloat = p.applyCompression(leftFloat)
 	leftFloat = p.applyHarmonicEnhancement(leftFloat)
 	leftFloat = p.applyReverb(leftFloat, sampleRate)
 	leftFloat = p.applyLoudnessNormalization(leftFloat)
 
+	rightFloat = p.applyPitchShift(rightFloat, sampleRate)
 	rightFloat = p.applyEQ(rightFloat, sampleRate)
 	rightFloat = p.applyCompression(rightFloat)
 	rightFloat = p.applyHarmonicEnhancement(rightFloat)
@@ -333,6 +339,197 @@ func softClip(x float64) float64 {
 	return x
 }
 
+func (p *Processor) applyPitchShift(samples []float64, sampleRate int) []float64 {
+	if p.config.PitchShift == 0 {
+		return samples
+	}
+	ratio := math.Pow(2, p.config.PitchShift/12)
+	return pitchShiftPSOLA(samples, ratio, sampleRate)
+}
+
+// pitchShiftPSOLA shifts pitch using Pitch-Synchronous Overlap-Add.
+// ratio > 1 raises pitch, ratio < 1 lowers pitch.
+func pitchShiftPSOLA(input []float64, ratio float64, sampleRate int) []float64 {
+	if len(input) < 256 {
+		return simpleResampleShift(input, ratio)
+	}
+
+	// Detect pitch periods
+	minPeriod := sampleRate / 600 // ~73 at 44.1kHz (600Hz max)
+	maxPeriod := sampleRate / 50  // ~882 at 44.1kHz (50Hz min)
+	periods := detectPitchPeriods(input, minPeriod, maxPeriod, sampleRate)
+
+	if len(periods) < 4 {
+		return simpleResampleShift(input, ratio)
+	}
+
+	// Build pitch marks (cumulative sum of periods)
+	marks := make([]int, 0, len(periods)+1)
+	pos := periods[0] / 2
+	if pos < 0 {
+		pos = 0
+	}
+	marks = append(marks, pos)
+	for _, p := range periods {
+		pos += p
+		if pos >= len(input) {
+			break
+		}
+		marks = append(marks, pos)
+	}
+	if len(marks) < 3 {
+		return simpleResampleShift(input, ratio)
+	}
+
+	outputLen := len(input)
+	output := make([]float64, outputLen)
+	overlap := make([]float64, outputLen) // track normalization
+
+	synthPos := 0.0
+	for i := 0; i < len(marks)-1; i++ {
+		center := marks[i]
+		origPeriod := marks[i+1] - marks[i]
+		if origPeriod < 2 {
+			continue
+		}
+
+		// Analysis window: 2 periods wide, centered on pitch mark
+		halfWin := origPeriod
+		winStart := center - halfWin
+		if winStart < 0 {
+			winStart = 0
+		}
+		winEnd := center + halfWin
+		if winEnd > len(input) {
+			winEnd = len(input)
+		}
+		winLen := winEnd - winStart
+
+		// Place at synthesis position and overlap-add
+		outStart := int(synthPos) - halfWin
+		if outStart < 0 {
+			outStart = 0
+		}
+		outEnd := outStart + winLen
+		if outEnd > outputLen {
+			outEnd = outputLen
+		}
+		// Adjust if we shifted relative to center
+		offset := int(synthPos) - halfWin - outStart
+		for j := outStart; j < outEnd; j++ {
+			srcIdx := winStart + (j - outStart) + offset
+			if srcIdx < 0 || srcIdx >= len(input) {
+				continue
+			}
+			// Hanning window
+			rel := float64(j-outStart) / float64(winLen)
+			win := 0.5 * (1 - math.Cos(2*math.Pi*rel))
+			output[j] += input[srcIdx] * win
+			overlap[j] += win
+		}
+
+		synthPos += float64(origPeriod) / ratio
+		if int(synthPos) >= len(input) {
+			break
+		}
+	}
+
+	// Normalize by overlap count
+	for i := range output {
+		if overlap[i] > 0.001 {
+			output[i] /= overlap[i]
+		}
+		// Soft clip
+		output[i] = softClip(output[i])
+	}
+
+	return output
+}
+
+// detectPitchPeriods finds approximate pitch periods using autocorrelation.
+func detectPitchPeriods(input []float64, minPeriod, maxPeriod, sampleRate int) []int {
+	var periods []int
+	hop := maxPeriod / 4
+	if hop < 1 {
+		hop = 1
+	}
+
+	for start := 0; start < len(input)-maxPeriod; start += hop {
+		bestLag := minPeriod
+		bestCorr := 0.0
+
+		for lag := minPeriod; lag <= maxPeriod && start+lag+maxPeriod < len(input); lag++ {
+			var corr float64
+			var energy float64
+			for i := 0; i < maxPeriod && start+i < len(input) && start+i+lag < len(input); i++ {
+				corr += input[start+i] * input[start+i+lag]
+				energy += input[start+i] * input[start+i]
+			}
+			if energy > 1e-10 {
+				corr /= energy
+			}
+			if corr > bestCorr {
+				bestCorr = corr
+				bestLag = lag
+			}
+		}
+
+		if bestCorr > 0.3 {
+			// Check for octave errors: prefer shorter period if it also has high correlation
+			for lag := minPeriod; lag < bestLag; lag++ {
+				var corr float64
+				var energy float64
+				for i := 0; i < maxPeriod && start+i < len(input) && start+i+lag < len(input); i++ {
+					corr += input[start+i] * input[start+i+lag]
+					energy += input[start+i] * input[start+i]
+				}
+				if energy > 1e-10 {
+					corr /= energy
+				}
+				if corr > 0.7 && bestLag%lag == 0 {
+					bestLag = lag
+					break
+				}
+			}
+			periods = append(periods, bestLag)
+		} else {
+			// Unvoiced: use a fallback period
+			periods = append(periods, maxPeriod/2)
+		}
+	}
+
+	if len(periods) == 0 {
+		periods = append(periods, maxPeriod/2)
+	}
+	return periods
+}
+
+// simpleResampleShift is a fallback for unvoiced or short audio.
+// Resamples by ratio using linear interpolation (pitch shift with duration change).
+func simpleResampleShift(input []float64, ratio float64) []float64 {
+	if math.Abs(ratio-1) < 0.001 {
+		return input
+	}
+	n := len(input)
+	if n < 2 {
+		return input
+	}
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		srcPos := float64(i) / ratio
+		srcIdx := int(srcPos)
+		frac := srcPos - float64(srcIdx)
+		if srcIdx >= n-1 {
+			out[i] = input[n-1]
+		} else if srcIdx < 0 {
+			out[i] = input[0]
+		} else {
+			out[i] = input[srcIdx]*(1-frac) + input[srcIdx+1]*frac
+		}
+	}
+	return out
+}
+
 // AdaptiveProcessor adjusts processing based on audio content
 type AdaptiveProcessor struct {
 	baseConfig Config
@@ -398,6 +595,12 @@ func (ap *AdaptiveProcessor) bytesToFloatSimple(data []byte, channels int) []flo
 }
 
 // SetDevice adjusts config for specific output device
+func (p *Processor) SetPitchShift(semitones float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.config.PitchShift = semitones
+}
+
 func (p *Processor) SetDevice(device DeviceType) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
