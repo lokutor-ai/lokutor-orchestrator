@@ -223,6 +223,12 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 	return ms
 }
 
+// SetPlaybackRate configures the playback sample rate used for frame sizing.
+// Must be called before audio processing begins (before audioProcessor goroutine).
+func (ms *ManagedStream) SetPlaybackRate(rate int) {
+	ms.playbackRate = rate
+}
+
 func (ms *ManagedStream) audioProcessor() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -759,11 +765,9 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
-	if ms.prosody != nil {
-		pr := ms.prosody.ProcessText(text)
-		text = applyProsodyText(pr)
-		defer ms.prosody.UpdateContext(text, pr.EstimatedMs)
-	}
+	// Prosody processor: disabled — it modifies text in unpredictable ways
+	// (adds filler words, inserts "...", changes pacing) which causes the TTS
+	// model to skip or repeat words. Raw LLM text goes directly to TTS.
 
 	if ms.userProfile.HasBaseline() {
 		rate := ms.userProfile.GetSuggestedSpeechRate()
