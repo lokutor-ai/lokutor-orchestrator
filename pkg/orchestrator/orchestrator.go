@@ -284,7 +284,11 @@ func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt stri
 	// Map language code to human-readable name for LLM instruction
 	langName := languageCodeToName(session.CurrentLanguage)
 	langInstruction := "IMPORTANT: Always respond in " + langName + ". Never switch to another language, even if the user speaks another language. The entire conversation must be in " + langName + "."
-	fullPrompt := langInstruction + "\n\n" + prompt + "\n\n" + VoiceUXInstructions
+	uxInstructions := o.config.VoiceUXInstructions
+	if uxInstructions == "" {
+		uxInstructions = VoiceUXInstructions
+	}
+	fullPrompt := langInstruction + "\n\n" + prompt + "\n\n" + uxInstructions
 	session.AddMessage("system", fullPrompt)
 }
 

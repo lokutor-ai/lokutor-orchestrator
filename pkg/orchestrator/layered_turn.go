@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 )
@@ -51,8 +50,6 @@ func (l *Layer3LLMAnalyzer) EvaluateContext(ctx context.Context, session *Conver
 	if err != nil {
 		return TurnComplete, "", err
 	}
-
-fmt.Printf("\n[LAYER 3 DEBUG]: %s\n", resp)
 
 	resp = strings.TrimSpace(resp)
 	if strings.HasPrefix(resp, string(TurnComplete)) {

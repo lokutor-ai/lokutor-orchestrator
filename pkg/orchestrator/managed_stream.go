@@ -40,9 +40,7 @@ type ManagedStream struct {
 	cmdChan          chan []byte
 	interruptChan    chan struct{}
 	state            StreamState
-	stateMu          sync.Mutex
 
-	audioBuf  *bytes.Buffer
 	userAudio []byte
 
 	userSpeakingSince time.Time
@@ -147,7 +145,6 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		events:          make(chan OrchestratorEvent, 1024),
 		cmdChan:         make(chan []byte, 512),
 		interruptChan:   make(chan struct{}, 1),
-		audioBuf:        new(bytes.Buffer),
 		vad:             streamVAD,
 		playbackRate:    44100,
 		inputSampleRate: cfg.SampleRate,
@@ -166,7 +163,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		speculator:     NewSpeculativeExecutor(cfg.SpeculativeIntervalMs),
 		speechAudioBuf: make([]byte, 0, 44100),
 		speakingRateWindow: make([]float64, 0, 20),
-		preSpeechBuf:        bytes.NewBuffer(make([]byte, 0, 300*44100*2/1000)),
+		preSpeechBuf:        bytes.NewBuffer(make([]byte, 0, 300*cfg.SampleRate*2/1000)),
 		clientToolResults:   make(map[string]chan string),
 	}
 
@@ -230,12 +227,6 @@ func (ms *ManagedStream) SetPlaybackRate(rate int) {
 }
 
 func (ms *ManagedStream) audioProcessor() {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("[PANIC] audioProcessor: %v\n", r)
-		}
-	}()
-
 	for {
 		select {
 		case <-ms.ctx.Done():
@@ -243,9 +234,23 @@ func (ms *ManagedStream) audioProcessor() {
 		case <-ms.interruptChan:
 			ms.handleInterrupt()
 		case chunk := <-ms.cmdChan:
-			ms.handleAudio(chunk)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						ms.logger.Error("audioProcessor: recovered panic in handleAudio", "panic", r)
+					}
+				}()
+				ms.handleAudio(chunk)
+			}()
 		case ctrl := <-ms.controlChan:
-			ms.handleControl(ctrl)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						ms.logger.Error("audioProcessor: recovered panic in handleControl", "panic", r)
+					}
+				}()
+				ms.handleControl(ctrl)
+			}()
 		}
 	}
 }
@@ -269,16 +274,6 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	// In client VAD mode, the client sends control frames for speech boundaries.
 	// The audio processor only buffers audio and runs backchannel detection.
 	if clientVAD {
-		ms.mu.Lock()
-		ms.audioBuf.Write(chunk)
-		if ms.audioBuf.Len() > 176400 {
-			data := ms.audioBuf.Bytes()
-			leadIn := data[len(data)-132300:]
-			ms.audioBuf.Reset()
-			ms.audioBuf.Write(leadIn)
-		}
-		ms.mu.Unlock()
-
 		isSpeaking := ms.vadSpeaking
 	if isSpeaking {
 		ms.userAudio = append(ms.userAudio, chunk...)
@@ -339,16 +334,6 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		}
 	}
 
-	ms.mu.Lock()
-	ms.audioBuf.Write(chunk)
-	if ms.audioBuf.Len() > 176400 {
-		data := ms.audioBuf.Bytes()
-		leadIn := data[len(data)-132300:]
-		ms.audioBuf.Reset()
-		ms.audioBuf.Write(leadIn)
-	}
-	ms.mu.Unlock()
-
 	switch {
 	case event != nil && event.Type == VADSpeechStart:
 		ms.onVADStart(state)
@@ -407,16 +392,6 @@ func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
 			}
 		}
 	}
-
-	ms.mu.Lock()
-	ms.audioBuf.Write(chunk)
-	if ms.audioBuf.Len() > 176400 {
-		data := ms.audioBuf.Bytes()
-		leadIn := data[len(data)-132300:]
-		ms.audioBuf.Reset()
-		ms.audioBuf.Write(leadIn)
-	}
-	ms.mu.Unlock()
 
 	// Speech start detection
 	if isSpeaking && !wasSpeaking {
@@ -529,7 +504,6 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	// after a user utterance ends (causing duplicate STT calls).
 	if !ms.userSpeechEnd.IsZero() && time.Since(ms.userSpeechEnd) < 500*time.Millisecond {
 		ms.logger.Info("VAD start ignored (cooldown)", "since_end_ms", time.Since(ms.userSpeechEnd).Milliseconds())
-		ms.vad.Reset()
 		return
 	}
 
@@ -588,7 +562,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.userAudio = nil
 
 	speechAudio := ms.speechAudioBuf
-	ms.speechAudioBuf = nil
+	ms.speechAudioBuf = make([]byte, 0, 44100)
 
 	// Adaptive VAD: if energy was rising before speech end, the user is likely
 	// pausing mid-thought — extend the minimum duration to avoid splitting
@@ -660,7 +634,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	if currentSeq > seq {
 		ms.logger.Info("Skipping STT for superseded utterance", "seq", seq, "currentSeq", currentSeq)
 		ms.mu.Lock()
-		ms.state = StateIdle
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
 		ms.mu.Unlock()
 		return
 	}
@@ -670,7 +646,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	result, err := ms.orch.Transcribe(ctx, audioData, ms.session.GetCurrentLanguage())
 	if err != nil {
 		ms.mu.Lock()
-		ms.state = StateIdle
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
 		ms.mu.Unlock()
 		if ctx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("Transcription error: %v", err))
@@ -683,7 +661,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 
 	if ms.isLikelyNoise(result, duration) {
 		ms.mu.Lock()
-		ms.state = StateIdle
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
 		ms.mu.Unlock()
 		ms.emit(BotResumed, nil)
 		return
@@ -692,7 +672,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	transcript := strings.TrimSpace(result.Text)
 	if transcript == "" {
 		ms.mu.Lock()
-		ms.state = StateIdle
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
 		ms.mu.Unlock()
 		return
 	}
@@ -718,6 +700,19 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		return
 	}
 
+	// Check response cache before calling LLM
+	if response, audio, ok := ms.checkResponseCache(transcript); ok {
+		ms.emit(BotResponse, response)
+		if audio != nil {
+			frameSize := int(float64(ms.playbackRate) * 0.06) * 2
+			if frameSize <= 0 {
+				frameSize = 5292
+			}
+			ms.emitFrames(audio, frameSize, 0)
+		}
+		return
+	}
+
 	ms.runLLMAndTTS(ctx, transcript)
 }
 
@@ -739,14 +734,16 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.llmStartTime = time.Now()
 
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
-		ms.runStreamingLLM(rCtx, sProvider, gen)
+		ms.runStreamingLLM(rCtx, sProvider, gen, transcript)
 		return
 	}
 
 	response, err := ms.orch.GenerateResponse(rCtx, ms.session)
 	if err != nil {
 		ms.mu.Lock()
-		ms.state = StateIdle
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
 		ms.mu.Unlock()
 		if rCtx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("LLM error: %v", err))
@@ -757,6 +754,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.llmEndTime = time.Now()
 	ms.session.AddMessage("assistant", response)
 	ms.emit(BotResponse, response)
+	ms.cacheResponse(transcript, response, nil)
 
 	ms.speakText(rCtx, response, gen)
 }
@@ -814,7 +812,9 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		ms.session.GetCurrentVoice(),
 		ms.session.GetCurrentLanguage(),
 		func(chunk []byte) error {
+			ms.mu.Lock()
 			ms.lastAudioSentAt = time.Now()
+			ms.mu.Unlock()
 
 			if ms.ttsFirstChunkTime.IsZero() {
 				ms.ttsFirstChunkTime = time.Now()
@@ -850,7 +850,9 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	}
 
 	ms.mu.Lock()
-	ms.state = StateIdle
+	if ms.state != StateInterrupted {
+		ms.state = StateIdle
+	}
 	ms.ttsCancel = nil
 	ms.ttsEndTime = time.Now()
 	ms.mu.Unlock()
@@ -1080,13 +1082,7 @@ func (ms *ManagedStream) ExportLastUserAudio() (raw []byte, processed []byte) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	if len(ms.userAudio) == 0 {
-		userAudioLen := len(ms.userAudio)
-		if userAudioLen == 0 {
-			return nil, nil
-		}
-		rawCopy := make([]byte, userAudioLen)
-		copy(rawCopy, ms.userAudio)
-		return rawCopy, rawCopy
+		return nil, nil
 	}
 	rawCopy := make([]byte, len(ms.userAudio))
 	copy(rawCopy, ms.userAudio)
@@ -1253,6 +1249,7 @@ func (ms *ManagedStream) emitBackchannel(data []byte) {
 	select {
 	case ms.events <- event:
 	default:
+		ms.logger.Warn("backchannel drop (channel full)")
 	}
 }
 
@@ -1408,17 +1405,4 @@ func (ms *ManagedStream) monitorInactivity() {
 	}
 }
 
-func applyProsodyText(result prosody.ProsodyResult) string {
-	var out string
-	for i, m := range result.Markers {
-		if m.PauseBefore > 200 && len(out) > 0 {
-			out += "... "
-		}
-		out += m.Text
-		out += " "
-		if m.PauseAfter > 200 && i < len(result.Markers)-1 {
-			out += "... "
-		}
-	}
-	return out
-}
+

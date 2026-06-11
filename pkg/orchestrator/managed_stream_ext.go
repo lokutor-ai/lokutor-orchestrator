@@ -56,7 +56,7 @@ func (ms *ManagedStream) handleControl(data []byte) {
 	}
 }
 
-func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider StreamingLLMProvider, gen int) {
+func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider StreamingLLMProvider, gen int, userTranscript string) {
 	var fullText strings.Builder
 	var hasToolCalls bool
 	messages := ms.session.GetContextCopy()
@@ -196,7 +196,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	if err != nil {
 		ms.mu.Lock()
-		ms.state = StateIdle
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
 		ms.mu.Unlock()
 		if ctx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("LLM error: %v", err))
@@ -209,6 +211,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	if response != "" && !hasToolCalls {
 		ms.session.AddMessage("assistant", response)
 		ms.emit(BotResponse, response)
+		ms.cacheResponse(userTranscript, response, nil)
 	}
 
 	if hasToolCalls {
@@ -264,7 +267,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
 				}
 				ms.mu.Lock()
-				ms.state = StateIdle
+				if ms.state != StateInterrupted {
+					ms.state = StateIdle
+				}
 				ms.mu.Unlock()
 				return
 			}

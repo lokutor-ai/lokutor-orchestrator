@@ -240,6 +240,10 @@ type Config struct {
 	VelaFloorYieldThreshold    float32 // floor_yield threshold to consider user done (default 0.5)
 	VelaContinuationThreshold  float32 // continuation threshold below which user is likely done (default 0.4)
 	VelaInterruptThreshold     float32 // interruption_safety threshold to allow barge-in (default 0.6)
+
+	// VoiceUXInstructions are appended to the system prompt to instruct the LLM
+	// how to format speech for a real-time voice interface. Override for custom behavior.
+	VoiceUXInstructions string
 }
 
 func DefaultConfig() Config {
@@ -278,6 +282,7 @@ func DefaultConfig() Config {
 		VelaFloorYieldThreshold:    0.5,
 		VelaContinuationThreshold:  0.4,
 		VelaInterruptThreshold:     0.6,
+		VoiceUXInstructions:        VoiceUXInstructions,
 	}
 }
 
