@@ -74,7 +74,7 @@ func (s *GroqSTT) Transcribe(ctx context.Context, audioPCM []byte, lang orchestr
 		return orchestrator.TranscriptionResult{}, err
 	}
 
-	if lang != "" {
+	if lang != "" && lang != "na" {
 		if err := writer.WriteField("language", string(lang)); err != nil {
 			return orchestrator.TranscriptionResult{}, err
 		}

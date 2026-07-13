@@ -50,15 +50,15 @@ type ResourceStats struct {
 // DefaultARM64Config returns optimized settings for ARM64 processors
 func DefaultARM64Config() *ARM64OptimizationConfig {
 	return &ARM64OptimizationConfig{
-		ThreadLimit:           2,      // Match hardware threads (Cobalt 100 has 2 cores)
+		ThreadLimit:           runtime.NumCPU(), // Match actual CPU count
 		CPUQuota:              0.7,    // Use 70% CPU to leave headroom
 		BufferReuse:          true,
 		MaxBufferSize:         32768,  // 32KB max buffer (small for ARM64)
 		GCPercent:            30,      // Aggressive GC for low memory
-		AudioProcessingThreads: 1,    // Single thread for audio processing
+		AudioProcessingThreads: runtime.NumCPU(), // Match CPU count
 		PitchShiftQuality:    2,        // Medium quality (balance performance/quality)
 		EQComplexity:         2,        // Medium quality EQ — preserves presence boost
-		MaxConcurrentSessions: 2,      // Conservative session limit
+		MaxConcurrentSessions: runtime.NumCPU(), // Match CPU count
 		ConnectionBacklog:    5,        // Small connection queue
 		WorkerTimeout:       30,        // 30 second timeout
 	}
