@@ -414,6 +414,9 @@ func (s *ConversationSession) GetCurrentVoice() Voice {
 func (s *ConversationSession) GetCurrentLanguage() Language {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.CurrentLanguage == "na" || s.CurrentLanguage == "auto" {
+		return ""
+	}
 	return s.CurrentLanguage
 }
 
