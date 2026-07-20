@@ -624,6 +624,16 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 }
 
 func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Duration, seq int) {
+	defer func() {
+		if r := recover(); r != nil {
+			ms.logger.Error("processUtterance: recovered panic", "panic", r)
+			ms.mu.Lock()
+			if ms.state != StateInterrupted {
+				ms.state = StateIdle
+			}
+			ms.mu.Unlock()
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ms.ctx, 15*time.Second)
 	defer cancel()
 
@@ -756,6 +766,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.emit(BotResponse, response)
 	ms.cacheResponse(transcript, response, nil)
 
+	// Full-response TTS (single pass, no sentence pipelining — avoids residual audio on interrupt)
 	ms.speakText(rCtx, response, gen)
 }
 
@@ -1056,6 +1067,31 @@ func (ms *ManagedStream) RegenerateBackchannelClips(o *Orchestrator) {
 			ms.backch.SetClips(clips)
 		}
 	}()
+}
+
+// splitSentences splits text on sentence-ending punctuation (.!?)
+// while preserving the punctuation. Returns at least one sentence.
+func splitSentences(text string) []string {
+	var res []string
+	var cur strings.Builder
+	for _, c := range text {
+		cur.WriteRune(c)
+		if c == '.' || c == '!' || c == '?' {
+			s := strings.TrimSpace(cur.String())
+			if s != "" {
+				res = append(res, s)
+			}
+			cur.Reset()
+		}
+	}
+	remaining := strings.TrimSpace(cur.String())
+	if remaining != "" {
+		res = append(res, remaining)
+	}
+	if len(res) == 0 {
+		res = []string{text}
+	}
+	return res
 }
 
 func (ms *ManagedStream) Close() {

@@ -1,15 +1,11 @@
 package llm
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
-	"time"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
@@ -258,137 +254,6 @@ func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Messag
 	return result.Candidates[0].Content.Parts[0].Text, nil
 }
 
-func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
-	payload := l.buildRequest(messages, tools)
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", l.streamURL+"&key="+l.apiKey, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var errResp interface{}
-		json.NewDecoder(resp.Body).Decode(&errResp)
-		return "", fmt.Errorf("google llm stream error (status %d): %v", resp.StatusCode, errResp)
-	}
-
-	reader := bufio.NewReader(resp.Body)
-	var fullContent strings.Builder
-	var prevText string
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return "", err
-		}
-
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		raw := strings.TrimPrefix(line, "data: ")
-		if raw == "" {
-			continue
-		}
-
-		var chunk struct {
-			Candidates []struct {
-				Content struct {
-					Parts []struct {
-						Text         string      `json:"text"`
-						FunctionCall interface{} `json:"functionCall"`
-					} `json:"parts"`
-					Role string `json:"role"`
-				} `json:"content"`
-			} `json:"candidates"`
-		}
-
-		if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
-			continue
-		}
-
-		if len(chunk.Candidates) == 0 || len(chunk.Candidates[0].Content.Parts) == 0 {
-			continue
-		}
-
-		// Check for functionCall in any part
-		for _, part := range chunk.Candidates[0].Content.Parts {
-			if part.FunctionCall != nil {
-				fc, ok := part.FunctionCall.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				name, _ := fc["name"].(string)
-				if name == "" {
-					continue
-				}
-				
-				// Handle args: could be already-parsed object or JSON string
-				var argsStr string
-				switch args := fc["args"].(type) {
-				case string:
-					argsStr = args
-				case map[string]interface{}, []interface{}:
-					argsBytes, _ := json.Marshal(args)
-					argsStr = string(argsBytes)
-				default:
-					argsStr = "{}"
-				}
-				
-				callID := fmt.Sprintf("fc_%s_%d", name, time.Now().UnixNano())
-				if onToolCall != nil {
-					if err := onToolCall(orchestrator.ToolCallEventData{
-						Name:      name,
-						Arguments: argsStr,
-						CallID:    callID,
-					}); err != nil {
-						return "", err
-					}
-				}
-				// Continue processing to collect any text + tool calls.
-				continue
-			}
-		}
-
-		t := chunk.Candidates[0].Content.Parts[0].Text
-
-		var delta string
-		if len(t) > len(prevText) && strings.HasPrefix(t, prevText) {
-			delta = t[len(prevText):]
-			prevText = t
-		} else if len(t) > 0 && !strings.HasPrefix(t, prevText) {
-			delta = t
-			prevText = t
-		}
-		if delta == "" {
-			continue
-		}
-		fullContent.WriteString(delta)
-		if onChunk != nil {
-			if err := onChunk(delta); err != nil {
-				return "", err
-			}
-		}
-	}
-
-	return fullContent.String(), nil
-}
 
 func (l *GoogleLLM) Name() string {
 	return "google-llm"
