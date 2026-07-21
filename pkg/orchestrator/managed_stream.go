@@ -499,12 +499,14 @@ func resampleTo16k(audio []byte, inputSampleRate int) []byte {
 }
 
 func (ms *ManagedStream) onVADStart(prevState StreamState) {
-	// Cooldown: ignore VAD start if a speech end happened <500ms ago.
-	// Prevents VAD from immediately re-triggering on residual audio / echo
-	// after a user utterance ends (causing duplicate STT calls).
-	if !ms.userSpeechEnd.IsZero() && time.Since(ms.userSpeechEnd) < 500*time.Millisecond {
-		ms.logger.Info("VAD start ignored (cooldown)", "since_end_ms", time.Since(ms.userSpeechEnd).Milliseconds())
-		return
+	// Cooldown: ignore VAD start if a speech end happened <200ms ago AND the
+	// bot hasn't started speaking yet. If the bot is already processing/speaking,
+	// allow immediate barge-in — the user didn't actually finish speaking.
+	if prevState != StateSpeaking && prevState != StateProcessing {
+		if !ms.userSpeechEnd.IsZero() && time.Since(ms.userSpeechEnd) < 200*time.Millisecond {
+			ms.logger.Info("VAD start ignored (cooldown)", "since_end_ms", time.Since(ms.userSpeechEnd).Milliseconds())
+			return
+		}
 	}
 
 	ms.userSpeakingSince = time.Now()
