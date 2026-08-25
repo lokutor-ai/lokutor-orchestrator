@@ -15,9 +15,9 @@ require github.com/joho/godotenv v1.5.1
 require (
 	github.com/coder/websocket v1.8.14
 	github.com/gen2brain/malgo v0.11.24
+	github.com/stretchr/testify v1.12.1
+	github.com/yalue/onnxruntime_go v1.12.0
+	gonum.org/v1/gonum v0.15.0
 )
 
-require (
-	github.com/yalue/onnxruntime_go v1.12.0 // indirect
-	gonum.org/v1/gonum v0.15.0 // indirect
-)
+require go.yaml.in/yaml/v3 v3.0.5 // indirect

@@ -114,7 +114,7 @@ func (v *RMSVAD) Process(chunk []byte) (*VADEvent, error) {
 			}
 		}
 
-			adaptiveThreshold := v.noiseFloor * 2.0
+		adaptiveThreshold := v.noiseFloor * 2.0
 		if adaptiveThreshold > effectiveThreshold {
 			effectiveThreshold = adaptiveThreshold
 		}

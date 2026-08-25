@@ -51,6 +51,7 @@ func (se *SpeculativeExecutor) ShouldSpeculate(speechDuration time.Duration, las
 	if se.state != SpecIdle {
 		return false
 	}
+	// Only speculate after 1.5s of speech — short utterances run the full pipeline
 	if speechDuration < 1500*time.Millisecond {
 		return false
 	}

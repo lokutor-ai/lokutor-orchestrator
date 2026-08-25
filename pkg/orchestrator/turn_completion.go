@@ -72,6 +72,13 @@ func (tca *TurnCompletionAnalyzer) IsLikelyComplete(text string) bool {
 		return false
 	}
 
+	// Trailing ellipsis ALWAYS means mid-thought. It must be checked before
+	// completionMarkers because the generic `\.\s*$` marker would otherwise
+	// match the final dot of "..." and misclassify the utterance as complete.
+	if regexp.MustCompile(`\.{3,}\s*$`).MatchString(text) {
+		return false
+	}
+
 	for _, p := range tca.completionMarkers {
 		if p.MatchString(text) {
 			return true

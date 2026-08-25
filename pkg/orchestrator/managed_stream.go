@@ -14,10 +14,36 @@ import (
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/vela"
 )
 
+// byteBufPool recycles byte slices to reduce GC pressure in the audio hot path.
+var byteBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
+
+func getByteBuf(size int) []byte {
+	bp := byteBufPool.Get().(*[]byte)
+	b := *bp
+	if cap(b) < size {
+		b = make([]byte, size)
+	} else {
+		b = b[:size]
+	}
+	return b
+}
+
+func putByteBuf(b []byte) {
+	if cap(b) > 0 {
+		b = b[:0]
+		byteBufPool.Put(&b)
+	}
+}
+
 type StreamState int
 
 const (
-	StateIdle       StreamState = iota
+	StateIdle StreamState = iota
 	StateListening
 	StateProcessing
 	StateSpeaking
@@ -33,13 +59,13 @@ type ManagedStream struct {
 	vad     VADProvider
 
 	// Vela turn detection model (replaces VAD-based turn detection)
-	vela *vela.Detector
-	velaSilenceStart time.Time // Tracks silence start after speech end
-	velaPeakFloorYield float32 // Peak floor_yield during current speech period
+	vela               *vela.Detector
+	velaSilenceStart   time.Time // Tracks silence start after speech end
+	velaPeakFloorYield float32   // Peak floor_yield during current speech period
 
-	cmdChan          chan []byte
-	interruptChan    chan struct{}
-	state            StreamState
+	cmdChan       chan []byte
+	interruptChan chan struct{}
+	state         StreamState
 
 	userAudio []byte
 
@@ -66,21 +92,33 @@ type ManagedStream struct {
 	isClosed        bool
 	closeOnce       sync.Once
 
-	sttStartTime       time.Time
-	sttEndTime         time.Time
-	llmStartTime       time.Time
-	llmEndTime         time.Time
-	ttsStartTime       time.Time
-	ttsFirstChunkTime  time.Time
-	ttsEndTime         time.Time
-	botSpeakStart      time.Time
-	lastAudioSentAt    time.Time
-	lastNoSpeechProb   float64
-	lastActivityAt     time.Time
+	sttStartTime      time.Time
+	sttEndTime        time.Time
+	llmStartTime      time.Time
+	llmEndTime        time.Time
+	ttsStartTime      time.Time
+	ttsFirstChunkTime time.Time
+	ttsEndTime        time.Time
+	botSpeakStart     time.Time
+	lastAudioSentAt   time.Time
+	lastNoSpeechProb  float64
+	lastActivityAt    time.Time
+
+	// Spoken-truth context tracking: the last assistant response and how much
+	// of it was actually synthesized/played before an interruption. On interrupt,
+	// the context is truncated to only what the user heard (Pipecat/OpenAI pattern).
+	lastResponseText   string
+	spokenTextPrefix   string
+	spokenTextLocked   bool
+	responseChunksSent int
+
+	// Post-interrupt backoff: block bot output for a short window after a
+	// barge-in so it doesn't talk over the user (Vapi backoffSeconds pattern).
+	interruptedAt time.Time
 
 	// Client-side VAD support
-	controlChan  chan []byte
-	clientVAD    bool
+	controlChan chan []byte
+	clientVAD   bool
 
 	// Speculative LLM execution during speech
 	speculator     *SpeculativeExecutor
@@ -90,6 +128,12 @@ type ManagedStream struct {
 	// preSpeechBuf stores the last ~300ms of audio unconditionally, updated BEFORE VAD.
 	// Used in onVADStart to prepend speech onset that VAD's confirmation window missed.
 	preSpeechBuf *bytes.Buffer
+
+	// Streaming STT: process audio incrementally instead of full buffer
+	sttChan       chan []byte
+	sttResultChan chan string
+	sttStarted    bool
+	sttAudioChan  chan<- []byte
 
 	// Response cache
 	responseCache *ResponseCache
@@ -148,7 +192,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		vad:             streamVAD,
 		playbackRate:    44100,
 		inputSampleRate: cfg.SampleRate,
-		turnComp: NewTurnCompletionAnalyzer(),
+		turnComp:        NewTurnCompletionAnalyzer(),
 		userProfile:     prosody.NewUserSpeechProfile(),
 		prosody: func() *prosody.AdaptiveProcessor {
 			c := prosody.DefaultConfig()
@@ -156,15 +200,15 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			c.EmphasisLevel = 0.6
 			return prosody.NewAdaptiveProcessor(c)
 		}(),
-		logger:        logger,
-		lastActivityAt: time.Now(),
-		controlChan:   make(chan []byte, 64),
-		clientVAD:     cfg.ClientVAD,
-		speculator:     NewSpeculativeExecutor(cfg.SpeculativeIntervalMs),
-		speechAudioBuf: make([]byte, 0, 44100),
+		logger:             logger,
+		lastActivityAt:     time.Now(),
+		controlChan:        make(chan []byte, 64),
+		clientVAD:          cfg.ClientVAD,
+		speculator:         NewSpeculativeExecutor(cfg.SpeculativeIntervalMs),
+		speechAudioBuf:     make([]byte, 0, 44100),
 		speakingRateWindow: make([]float64, 0, 20),
-		preSpeechBuf:        bytes.NewBuffer(make([]byte, 0, 300*cfg.SampleRate*2/1000)),
-		clientToolResults:   make(map[string]chan string),
+		preSpeechBuf:       bytes.NewBuffer(make([]byte, 0, 300*cfg.SampleRate*2/1000)),
+		clientToolResults:  make(map[string]chan string),
 	}
 
 	// Initialize Vela turn detection model if path is configured
@@ -275,10 +319,10 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	// The audio processor only buffers audio and runs backchannel detection.
 	if clientVAD {
 		isSpeaking := ms.vadSpeaking
-	if isSpeaking {
-		ms.userAudio = append(ms.userAudio, chunk...)
-		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
-	}
+		if isSpeaking {
+			ms.userAudio = append(ms.userAudio, chunk...)
+			ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+		}
 
 		if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
 			samples := make([]int16, len(chunk)/2)
@@ -322,6 +366,14 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	if isSpeaking {
 		ms.userAudio = append(ms.userAudio, chunk...)
 		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+
+		// Feed audio to streaming STT for incremental processing
+		if ms.sttStarted && ms.sttAudioChan != nil {
+			select {
+			case ms.sttAudioChan <- chunk:
+			default:
+			}
+		}
 
 		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
 			speechDuration := time.Since(ms.userSpeakingSince)
@@ -511,6 +563,37 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 
 	ms.userSpeakingSince = time.Now()
 
+	ms.userSpeakingSince = time.Now()
+
+	// Reset tool call counts for a new user turn — prevents the 3-call-per-tool
+	// limit from aborting legitimate repeated tool use in long sessions.
+	ms.session.ResetToolCallCounts()
+
+	// Start streaming STT session — process audio incrementally
+	// This saves ~400ms by not waiting for VAD speech end
+	if streamingSTT, ok := ms.orch.stt.(StreamingSTTProvider); ok {
+		ms.sttResultChan = make(chan string, 10) // Buffer for partials
+		audioChan, err := streamingSTT.StreamTranscribe(ms.ctx, ms.session.GetCurrentLanguage(), func(transcript string, isFinal bool) error {
+			// Store partials in channel — processUtterance will read the latest
+			select {
+			case ms.sttResultChan <- transcript:
+			default:
+				// Channel full, discard old partial
+				select {
+				case <-ms.sttResultChan:
+				default:
+				}
+				ms.sttResultChan <- transcript
+			}
+			return nil
+		})
+		if err == nil && audioChan != nil {
+			ms.sttAudioChan = audioChan
+			ms.sttStarted = true
+			ms.logger.Info("Streaming STT session started")
+		}
+	}
+
 	// Prepend 300ms of pre-speech audio to capture the speech onset
 	// that VAD may have missed during its confirmation window (first ~1-2 chunks).
 	// preSpeechBuf is updated BEFORE VAD in handleAudio, so it never includes
@@ -547,6 +630,12 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.userSpeechEnd = time.Now()
 	ms.emit(UserStopped, nil)
+
+	// Finalize streaming STT session
+	if ms.sttStarted && ms.sttResultChan != nil {
+		close(ms.sttResultChan)
+		ms.sttStarted = false
+	}
 
 	ms.mu.Lock()
 	if ms.clientVAD {
@@ -655,7 +744,35 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 
 	ms.sttStartTime = time.Now()
 
-	result, err := ms.orch.Transcribe(ctx, audioData, ms.session.GetCurrentLanguage())
+	// Read the LATEST streaming partial — don't wait, just grab what's available
+	var result TranscriptionResult
+	var err error
+	if ms.sttResultChan != nil {
+		// Drain channel to get the latest partial
+		var latestPartial string
+		for {
+			select {
+			case transcript := <-ms.sttResultChan:
+				if transcript != "" {
+					latestPartial = transcript
+				}
+			default:
+				// No more partials available
+				goto gotPartial
+			}
+		}
+	gotPartial:
+		if latestPartial != "" {
+			result = TranscriptionResult{Text: latestPartial}
+			ms.logger.Info("Using streaming STT partial", "text", latestPartial)
+		}
+		ms.sttResultChan = nil
+	}
+
+	// Use batch STT if streaming didn't produce a result (more accurate)
+	if result.Text == "" {
+		result, err = ms.orch.Transcribe(ctx, audioData, ms.session.GetCurrentLanguage())
+	}
 	if err != nil {
 		ms.mu.Lock()
 		if ms.state != StateInterrupted {
@@ -716,7 +833,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	if response, audio, ok := ms.checkResponseCache(transcript); ok {
 		ms.emit(BotResponse, response)
 		if audio != nil {
-			frameSize := int(float64(ms.playbackRate) * 0.06) * 2
+			frameSize := int(float64(ms.playbackRate)*0.06) * 2
 			if frameSize <= 0 {
 				frameSize = 5292
 			}
@@ -725,7 +842,24 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		return
 	}
 
+	// Turn-time RAG: if a RAG provider is configured, retrieve relevant context
+	// for the user's transcript and inject it into context before the LLM call
+	// (LiveKit pattern — avoids extra tool round-trips).
+	ms.injectRagContext(transcript)
+
 	ms.runLLMAndTTS(ctx, transcript)
+
+	// Log latency breakdown for observability
+	bd := ms.GetLatencyBreakdown()
+	ms.logger.Info("utterance_latency",
+		"stt_ms", bd.STT,
+		"llm_ms", bd.LLM,
+		"tts_first_ms", bd.LLMToTTSFirstByte,
+		"tts_total_ms", bd.TTSTotal,
+		"e2e_ms", bd.UserToPlay,
+		"bot_start_ms", bd.BotStartLatency,
+		"transcript", transcript,
+	)
 }
 
 func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
@@ -764,6 +898,9 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	}
 
 	ms.llmEndTime = time.Now()
+	ms.lastResponseText = response
+	ms.spokenTextPrefix = ""
+	ms.spokenTextLocked = false
 	ms.session.AddMessage("assistant", response)
 	ms.emit(BotResponse, response)
 	ms.cacheResponse(transcript, response, nil)
@@ -772,13 +909,21 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.speakText(rCtx, response, gen)
 }
 
-
-
-
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// Prosody processor: disabled — it modifies text in unpredictable ways
 	// (adds filler words, inserts "...", changes pacing) which causes the TTS
 	// model to skip or repeat words. Raw LLM text goes directly to TTS.
+
+	// Post-interrupt backoff: if the user just barged in, wait ~1s before
+	// speaking so we don't talk over them (Vapi backoffSeconds pattern).
+	ms.mu.Lock()
+	sinceInterrupt := time.Since(ms.interruptedAt)
+	ms.mu.Unlock()
+	if sinceInterrupt > 0 && sinceInterrupt < 1*time.Second {
+		ms.logger.Info("Post-interrupt backoff: delaying speech",
+			"since_interrupt_ms", sinceInterrupt.Milliseconds())
+		time.Sleep(1*time.Second - sinceInterrupt)
+	}
 
 	if ms.userProfile.HasBaseline() {
 		rate := ms.userProfile.GetSuggestedSpeechRate()
@@ -808,7 +953,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		}
 	}
 
-	frameSize := int(float64(ms.playbackRate) * 0.06) * 2
+	frameSize := int(float64(ms.playbackRate)*0.06) * 2
 	if frameSize <= 0 {
 		frameSize = 5292
 	}
@@ -827,6 +972,13 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		func(chunk []byte) error {
 			ms.mu.Lock()
 			ms.lastAudioSentAt = time.Now()
+			ms.responseChunksSent++
+			// Once the first audio chunk is delivered, mark the spoken prefix as
+			// locked — the user has started hearing the response.
+			if ms.spokenTextLocked == false && ms.lastResponseText == text {
+				ms.spokenTextPrefix = text
+				ms.spokenTextLocked = true
+			}
 			ms.mu.Unlock()
 
 			if ms.ttsFirstChunkTime.IsZero() {
@@ -886,9 +1038,15 @@ func (ms *ManagedStream) emitFrames(data []byte, frameSize, gen int) {
 func (ms *ManagedStream) handleInterrupt() {
 	ms.cancelPipeline()
 
+	// Spoken-truth context: if the bot was interrupted mid-response, truncate
+	// the last assistant message to only the text that was actually spoken.
+	// This prevents the model from "remembering" things it never said.
+	ms.truncateSpokenContext()
+
 	ms.mu.Lock()
 	oldState := ms.state
 	ms.state = StateInterrupted
+	ms.interruptedAt = time.Now()
 	ms.mu.Unlock()
 
 	if oldState == StateSpeaking || oldState == StateProcessing {
@@ -897,6 +1055,89 @@ func (ms *ManagedStream) handleInterrupt() {
 		gen := ms.payloadGen
 		ms.mu.Unlock()
 		ms.emitWithGen(Interrupted, nil, gen)
+	}
+}
+
+// truncateSpokenContext replaces the last assistant message in the session
+// context with the portion of the response that was actually spoken, if any.
+// This keeps the LLM's understanding aligned with what the user actually heard.
+func (ms *ManagedStream) truncateSpokenContext() {
+	ms.mu.Lock()
+	prefix := ms.spokenTextPrefix
+	locked := ms.spokenTextLocked
+	chunksSent := ms.responseChunksSent
+	ms.mu.Unlock()
+
+	// If no audio chunks were delivered for the current response, the bot was
+	// interrupted before speaking anything — remove the assistant message from
+	// context so the model doesn't "remember" a response it never gave.
+	if chunksSent == 0 {
+		ms.removeLastAssistantMessage()
+		return
+	}
+
+	if prefix == "" || !locked {
+		return
+	}
+
+	trimmed := strings.TrimSpace(prefix)
+	if trimmed == "" {
+		ms.removeLastAssistantMessage()
+		return
+	}
+
+	// Update the last assistant message in context
+	ms.session.mu.Lock()
+	defer ms.session.mu.Unlock()
+	for i := len(ms.session.Context) - 1; i >= 0; i-- {
+		msg := &ms.session.Context[i]
+		if msg.Role == "assistant" && msg.Content == ms.lastResponseText {
+			// Keep only what was actually spoken
+			msg.Content = trimmed
+			ms.session.LastAssistant = trimmed
+			ms.logger.Info("Spoken-truth context truncated",
+				"full_len", len(ms.lastResponseText), "spoken_len", len(trimmed))
+			break
+		}
+	}
+}
+
+// injectRagContext retrieves relevant knowledge-base context for the user's
+// transcript and injects it into the session context before the LLM call.
+// This is a no-op unless a RAG provider is configured on the orchestrator.
+func (ms *ManagedStream) injectRagContext(transcript string) {
+	if ms.orch == nil || ms.orch.rag == nil {
+		return
+	}
+	// Retrieve context asynchronously so it doesn't block the turn
+	go func(query string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		contextText, err := ms.orch.rag.Retrieve(ctx, query)
+		if err != nil || contextText == "" {
+			return
+		}
+		// Inject as a system message so the LLM sees it as reference material
+		ms.session.AddMessageRaw(Message{
+			Role:    "system",
+			Content: "[Relevant context: " + contextText + "]",
+		})
+		ms.logger.Info("RAG context injected", "query_len", len(query), "context_len", len(contextText))
+	}(transcript)
+}
+
+// removeLastAssistantMessage removes the most recent assistant message from
+// context (used when the bot was interrupted before speaking anything).
+func (ms *ManagedStream) removeLastAssistantMessage() {
+	ms.session.mu.Lock()
+	defer ms.session.mu.Unlock()
+	for i := len(ms.session.Context) - 1; i >= 0; i-- {
+		if ms.session.Context[i].Role == "assistant" {
+			ms.session.Context = append(ms.session.Context[:i], ms.session.Context[i+1:]...)
+			ms.session.LastAssistant = ""
+			ms.logger.Info("Removed unspoken assistant message from context")
+			return
+		}
 	}
 }
 
@@ -1105,6 +1346,10 @@ func (ms *ManagedStream) Close() {
 		ms.cancelPipeline()
 		ms.cancel()
 
+		// Cross-call memory: extract key facts from the conversation so the next
+		// session with this user can start with context (Retell/ElevenLabs pattern).
+		ms.extractUserMemory()
+
 		// Clean up Vela model
 		if ms.vela != nil {
 			ms.vela.Destroy()
@@ -1114,6 +1359,54 @@ func (ms *ManagedStream) Close() {
 
 		close(ms.events)
 	})
+}
+
+// extractUserMemory runs a cheap LLM extraction over the conversation to capture
+// key facts (name, preferences, identifiers) for cross-call memory. Non-blocking.
+func (ms *ManagedStream) extractUserMemory() {
+	if ms.orch == nil || ms.orch.llm == nil {
+		return
+	}
+	messages := ms.session.GetContextCopy()
+	if len(messages) < 2 {
+		return
+	}
+
+	// Build a compact transcript for the extraction call
+	var sb strings.Builder
+	for _, msg := range messages {
+		if msg.Role == "user" || msg.Role == "assistant" {
+			content := msg.Content
+			if len(content) > 300 {
+				content = content[:300] + "..."
+			}
+			sb.WriteString(msg.Role + ": " + content + "\n")
+		}
+	}
+
+	go func(transcript string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		prompt := "Extract key facts about this user from the conversation transcript. " +
+			"Return a concise list of facts: name, preferences, identifiers, or important context. " +
+			"Format as plain text, max 5 lines.\n\nTranscript:\n" + transcript
+
+		extractionMessages := []Message{
+			{Role: "system", Content: "You extract structured user facts from conversations. Be concise and factual."},
+			{Role: "user", Content: prompt},
+		}
+		facts, err := ms.orch.llm.Complete(ctx, extractionMessages, nil)
+		if err != nil || facts == "" {
+			return
+		}
+
+		// Store the extracted facts in the session for use by the next session
+		ms.session.mu.Lock()
+		ms.session.UserMemory = strings.TrimSpace(facts)
+		ms.session.mu.Unlock()
+		ms.logger.Info("Cross-call memory extracted", "facts_len", len(facts))
+	}(sb.String())
 }
 
 func (ms *ManagedStream) ExportLastUserAudio() (raw []byte, processed []byte) {
@@ -1442,5 +1735,3 @@ func (ms *ManagedStream) monitorInactivity() {
 		}
 	}
 }
-
-

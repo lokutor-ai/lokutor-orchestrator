@@ -43,6 +43,13 @@ type LLMProvider interface {
 	Name() string
 }
 
+// RAGProvider is an optional interface for injecting knowledge-base context
+// at turn time (LiveKit pattern: retrieve and inject before the LLM call,
+// avoiding extra tool round-trips).
+type RAGProvider interface {
+	Retrieve(ctx context.Context, query string) (string, error)
+}
+
 type StreamingLLMProvider interface {
 	LLMProvider
 	StreamComplete(ctx context.Context, messages []Message, tools []Tool, onChunk func(string) error, onToolCall func(ToolCallEventData) error) (string, error)
@@ -237,9 +244,9 @@ type Config struct {
 	VelaModelPath string
 
 	// Vela thresholds for turn detection decisions
-	VelaFloorYieldThreshold    float32 // floor_yield threshold to consider user done (default 0.5)
-	VelaContinuationThreshold  float32 // continuation threshold below which user is likely done (default 0.4)
-	VelaInterruptThreshold     float32 // interruption_safety threshold to allow barge-in (default 0.6)
+	VelaFloorYieldThreshold   float32 // floor_yield threshold to consider user done (default 0.5)
+	VelaContinuationThreshold float32 // continuation threshold below which user is likely done (default 0.4)
+	VelaInterruptThreshold    float32 // interruption_safety threshold to allow barge-in (default 0.6)
 
 	// VoiceUXInstructions are appended to the system prompt to instruct the LLM
 	// how to format speech for a real-time voice interface. Override for custom behavior.
@@ -264,39 +271,40 @@ func DefaultConfig() Config {
 		FirstSpeaker:             FirstSpeakerBot,
 		SilenceTimeout:           0,
 
-		ClientVAD:              false,
-		TokenLevelTTS:          true,
-		TTSMinTokenInterval:    4,
-		SpeculativeLLM:         true,
-		SpeculativeIntervalMs:  300,
-		AdaptivePacing:         true,
-		ResponseCaching:        true,
-		TTSConnectionPoolSize:  3,
-		ContextSummarization:   true,
-		SummarizationPrompt:    "Summarize the following conversation turns in 1-2 sentences, keeping key facts and context:",
-		STTRegion:              "",
-		LLMRegion:              "",
-		TTSRegion:              "",
+		ClientVAD:             false,
+		TokenLevelTTS:         true,
+		TTSMinTokenInterval:   4,
+		SpeculativeLLM:        true,
+		SpeculativeIntervalMs: 300,
+		AdaptivePacing:        true,
+		ResponseCaching:       true,
+		TTSConnectionPoolSize: 3,
+		ContextSummarization:  true,
+		SummarizationPrompt:   "Summarize the following conversation turns in 1-2 sentences, keeping key facts and context:",
+		STTRegion:             "",
+		LLMRegion:             "",
+		TTSRegion:             "",
 
-		VelaModelPath:          "assets/onnx/vela/model.onnx",
-		VelaFloorYieldThreshold:    0.5,
-		VelaContinuationThreshold:  0.4,
-		VelaInterruptThreshold:     0.6,
-		VoiceUXInstructions:        VoiceUXInstructions,
+		VelaModelPath:             "assets/onnx/vela/model.onnx",
+		VelaFloorYieldThreshold:   0.5,
+		VelaContinuationThreshold: 0.4,
+		VelaInterruptThreshold:    0.6,
+		VoiceUXInstructions:       "",
 	}
 }
 
 type ConversationSession struct {
-	mu                sync.RWMutex
-	ID                string
-	Context           []Message
-	LastUser          string
-	LastAssistant     string
-	MaxMessages       int
-	CurrentVoice      Voice
-	CurrentLanguage   Language
-	Tools             []Tool
-	toolCallCounts    map[string]int // Track how many times each tool has been called
+	mu              sync.RWMutex
+	ID              string
+	Context         []Message
+	LastUser        string
+	LastAssistant   string
+	MaxMessages     int
+	CurrentVoice    Voice
+	CurrentLanguage Language
+	Tools           []Tool
+	toolCallCounts  map[string]int // Track how many times each tool has been called
+	UserMemory      string         // Cross-call memory extracted from previous sessions
 }
 
 func NewConversationSession(userID string) *ConversationSession {

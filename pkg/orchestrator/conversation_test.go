@@ -120,7 +120,7 @@ func TestConversation(t *testing.T) {
 	t.Run("ClearContext", func(t *testing.T) {
 		conv.ClearContext()
 		conv.session.mu.RLock()
-		
+
 		if len(conv.session.Context) != 1 {
 			t.Errorf("expected 1 message (system prompt), got %d", len(conv.session.Context))
 		}

@@ -51,6 +51,29 @@ func (l *AnthropicLLM) Complete(ctx context.Context, messages []orchestrator.Mes
 	if system != "" {
 		payload["system"] = system
 	}
+	if len(tools) > 0 {
+		// Anthropic expects tools in a specific format: {"name", "description", "input_schema"}
+		var anthropicTools []map[string]interface{}
+		for _, t := range tools {
+			if fn, ok := t.Function.(map[string]interface{}); ok {
+				// The function map uses OpenAI-style {name, description, parameters}.
+				// Map to Anthropic's {name, description, input_schema} format.
+				inputSchema, _ := fn["parameters"].(map[string]interface{})
+				if inputSchema == nil {
+					inputSchema = map[string]interface{}{
+						"type":       "object",
+						"properties": map[string]interface{}{},
+					}
+				}
+				anthropicTools = append(anthropicTools, map[string]interface{}{
+					"name":         fn["name"],
+					"description":  fn["description"],
+					"input_schema": inputSchema,
+				})
+			}
+		}
+		payload["tools"] = anthropicTools
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -80,7 +103,11 @@ func (l *AnthropicLLM) Complete(ctx context.Context, messages []orchestrator.Mes
 
 	var result struct {
 		Content []struct {
-			Text string `json:"text"`
+			Text    string `json:"text"`
+			Type    string `json:"type"`
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Input   interface{} `json:"input"`
 		} `json:"content"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -89,6 +116,27 @@ func (l *AnthropicLLM) Complete(ctx context.Context, messages []orchestrator.Mes
 
 	if len(result.Content) == 0 {
 		return "", fmt.Errorf("no content returned from anthropic")
+	}
+
+	// If the model requested tool use, serialize it as JSON so the caller can dispatch.
+	var toolUses []map[string]interface{}
+	for _, block := range result.Content {
+		if block.Type == "tool_use" {
+			toolUses = append(toolUses, map[string]interface{}{
+				"id":    block.ID,
+				"type":  "function",
+				"function": map[string]interface{}{
+					"name":      block.Name,
+					"arguments": block.Input,
+				},
+			})
+		}
+	}
+	if len(toolUses) > 0 {
+		b, err := json.Marshal(toolUses)
+		if err == nil {
+			return fmt.Sprintf(`[TOOL_CALLS] %s`, string(b)), nil
+		}
 	}
 
 	return result.Content[0].Text, nil

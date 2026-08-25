@@ -31,13 +31,20 @@ func TestManagedStream_Interruption(t *testing.T) {
 		stream.Write(loudChunk)
 	}
 
-	select {
-	case ev := <-stream.Events():
-		if ev.Type != UserSpeaking {
-			t.Errorf("Expected USER_SPEAKING, got %v", ev.Type)
+	// The streaming STT may emit TRANSCRIPT_PARTIAL before USER_SPEAKING.
+	// Skip partials and wait for the USER_SPEAKING event.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-stream.Events():
+			if ev.Type == UserSpeaking {
+				return // success
+			}
+			// Ignore TRANSCRIPT_PARTIAL and other non-terminal events
+		case <-deadline:
+			t.Error("Timed out waiting for USER_SPEAKING")
+			return
 		}
-	case <-time.After(2 * time.Second):
-		t.Error("Timed out waiting for USER_SPEAKING")
 	}
 }
 

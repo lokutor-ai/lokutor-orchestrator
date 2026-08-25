@@ -8,10 +8,10 @@ import (
 
 func TestManagedStream_LatencyBreakdown(t *testing.T) {
 	ms := &ManagedStream{
-		events: make(chan OrchestratorEvent, 10),
-		session: &ConversationSession{ID: "test"},
-		ctx:    context.Background(),
-		cmdChan: make(chan []byte, 10),
+		events:        make(chan OrchestratorEvent, 10),
+		session:       &ConversationSession{ID: "test"},
+		ctx:           context.Background(),
+		cmdChan:       make(chan []byte, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 
@@ -60,10 +60,10 @@ func TestManagedStream_LatencyBreakdown(t *testing.T) {
 
 func TestManagedStream_EndToEndLatency(t *testing.T) {
 	ms := &ManagedStream{
-		events: make(chan OrchestratorEvent, 10),
-		session: &ConversationSession{ID: "test"},
-		ctx:    context.Background(),
-		cmdChan: make(chan []byte, 10),
+		events:        make(chan OrchestratorEvent, 10),
+		session:       &ConversationSession{ID: "test"},
+		ctx:           context.Background(),
+		cmdChan:       make(chan []byte, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 
@@ -78,10 +78,10 @@ func TestManagedStream_EndToEndLatency(t *testing.T) {
 
 func TestManagedStream_ExportLastUserAudio(t *testing.T) {
 	ms := &ManagedStream{
-		events: make(chan OrchestratorEvent, 10),
-		session: &ConversationSession{ID: "test"},
-		ctx:    context.Background(),
-		cmdChan: make(chan []byte, 10),
+		events:        make(chan OrchestratorEvent, 10),
+		session:       &ConversationSession{ID: "test"},
+		ctx:           context.Background(),
+		cmdChan:       make(chan []byte, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 
@@ -105,8 +105,6 @@ func TestManagedStream_ExportLastUserAudio(t *testing.T) {
 		t.Fatalf("processed len mismatch: %d vs %d", len(processed), len(user))
 	}
 }
-
-
 
 func TestManagedStream_InterruptionLogic(t *testing.T) {
 	orch := New(nil, nil, nil, Config{})
@@ -146,10 +144,10 @@ func TestManagedStream_InterruptionLogic(t *testing.T) {
 
 func TestManagedStream_StaleAudioDiscard(t *testing.T) {
 	ms := &ManagedStream{
-		events: make(chan OrchestratorEvent, 10),
-		session: &ConversationSession{ID: "test"},
-		ctx:    context.Background(),
-		cmdChan: make(chan []byte, 10),
+		events:        make(chan OrchestratorEvent, 10),
+		session:       &ConversationSession{ID: "test"},
+		ctx:           context.Background(),
+		cmdChan:       make(chan []byte, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 

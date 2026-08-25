@@ -10,17 +10,17 @@ import (
 type BackchannelState int
 
 const (
-	bcIdle       BackchannelState = iota
+	bcIdle BackchannelState = iota
 	bcListening
 	bcLowPitch
 )
 
 type BackchannelConfig struct {
-	MinSpeechDuration    time.Duration
-	MinInterval          time.Duration
-	LowPitchThresholdHz  float64
-	LowPitchPlateauMs    int
-	PitchWindowFrames    int
+	MinSpeechDuration   time.Duration
+	MinInterval         time.Duration
+	LowPitchThresholdHz float64
+	LowPitchPlateauMs   int
+	PitchWindowFrames   int
 }
 
 func DefaultBackchannelConfig() BackchannelConfig {
@@ -34,16 +34,16 @@ func DefaultBackchannelConfig() BackchannelConfig {
 }
 
 type BackchannelDetector struct {
-	mu       sync.Mutex
-	cfg      BackchannelConfig
+	mu         sync.Mutex
+	cfg        BackchannelConfig
 	sampleRate int
 
-	state            BackchannelState
+	state             BackchannelState
 	userSpeakingSince time.Time
-	lastBackchannel  time.Time
-	pitchHistory     []float64
-	plateauStart     time.Time
-	lastPitchTime    time.Time
+	lastBackchannel   time.Time
+	pitchHistory      []float64
+	plateauStart      time.Time
+	lastPitchTime     time.Time
 
 	onBackchannel func([]byte)
 	clips         [][]byte
@@ -51,10 +51,10 @@ type BackchannelDetector struct {
 
 func NewBackchannelDetector(cfg BackchannelConfig, sampleRate int, onBackchannel func([]byte)) *BackchannelDetector {
 	return &BackchannelDetector{
-		cfg:          cfg,
-		sampleRate:   sampleRate,
-		state:        bcIdle,
-		pitchHistory: make([]float64, 0, cfg.PitchWindowFrames),
+		cfg:           cfg,
+		sampleRate:    sampleRate,
+		state:         bcIdle,
+		pitchHistory:  make([]float64, 0, cfg.PitchWindowFrames),
 		onBackchannel: onBackchannel,
 	}
 }

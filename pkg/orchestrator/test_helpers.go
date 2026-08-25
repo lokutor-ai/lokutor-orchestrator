@@ -49,5 +49,5 @@ func (m *MockTTSProvider) StreamSynthesize(ctx context.Context, text string, voi
 	return onChunk(m.synthesizeResult)
 }
 
-func (m *MockTTSProvider) Abort() error   { return nil }
-func (m *MockTTSProvider) Name() string   { return "MockTTS" }
+func (m *MockTTSProvider) Abort() error { return nil }
+func (m *MockTTSProvider) Name() string { return "MockTTS" }

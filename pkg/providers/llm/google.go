@@ -1,11 +1,14 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
@@ -246,15 +249,121 @@ func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Messag
 		return "", fmt.Errorf("no response from google llm")
 	}
 
-	// Note: Complete() does not support tool calling. It only returns text.
-	// If the model generates a tool call, it will be ignored and the text will be returned.
-	// For tool calling workflows, use StreamComplete() instead, which properly handles
-	// tool calls via the onToolCall callback.
-	
+// If the model generated a function call, serialize it as JSON so the
+	// caller can dispatch it (the orchestrator uses StreamComplete for full
+	// tool calling, but Complete() should not silently drop the call).
+	for _, part := range result.Candidates[0].Content.Parts {
+		if part.FunctionCall != nil {
+			b, err := json.Marshal(part.FunctionCall)
+			if err == nil {
+				return fmt.Sprintf(`[TOOL_CALL] %s`, string(b)), nil
+			}
+		}
+	}
+
 	return result.Candidates[0].Content.Parts[0].Text, nil
 }
 
 
 func (l *GoogleLLM) Name() string {
 	return "google-llm"
+}
+
+// StreamComplete implements StreamingLLMProvider for Gemini. It streams text
+// chunks via SSE and invokes onToolCall for any functionCall parts.
+func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
+	payload := l.buildRequest(messages, tools)
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", l.streamURL+"&key="+l.apiKey, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp interface{}
+		json.NewDecoder(resp.Body).Decode(&errResp)
+		return "", fmt.Errorf("google llm error (status %d): %v", resp.StatusCode, errResp)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var fullContent strings.Builder
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return "", err
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Gemini SSE format: data: {...}\n
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+
+		var chunk struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text         string `json:"text"`
+						FunctionCall struct {
+							Name string      `json:"name"`
+							Args interface{} `json:"args"`
+						} `json:"functionCall"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		if len(chunk.Candidates) == 0 || len(chunk.Candidates[0].Content.Parts) == 0 {
+			continue
+		}
+
+		for _, part := range chunk.Candidates[0].Content.Parts {
+			if part.Text != "" {
+				fullContent.WriteString(part.Text)
+				if onChunk != nil {
+					if err := onChunk(part.Text); err != nil {
+						return "", err
+					}
+				}
+			}
+			if part.FunctionCall.Name != "" {
+				if onToolCall != nil {
+					argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+					err := onToolCall(orchestrator.ToolCallEventData{
+						Name:      part.FunctionCall.Name,
+						Arguments: string(argsJSON),
+						CallID:    part.FunctionCall.Name, // Gemini doesn't provide call IDs; use name
+					})
+					if err != nil {
+						return "", err
+					}
+				}
+			}
+		}
+	}
+
+	return fullContent.String(), nil
 }

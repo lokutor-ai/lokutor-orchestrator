@@ -6,8 +6,16 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// toolHandlerResult carries the result of a server-side tool handler invocation,
+// including the error if the handler failed.
+type toolHandlerResult struct {
+	res string
+	err error
+}
 
 func (ms *ManagedStream) WriteControl(data []byte) error {
 	select {
@@ -62,8 +70,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	messages := ms.session.GetContextCopy()
 
 	type toolRes struct {
-		tc     ToolCallEventData
-		result string
+		TC     ToolCallEventData `json:"tool_call"`
+		Result string            `json:"result"`
 	}
 	var toolResults []toolRes
 	var toolMu sync.Mutex
@@ -91,10 +99,33 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	var toolWg sync.WaitGroup
 
+	// Soft-timeout filler: if the LLM hasn't produced a first token within ~3s,
+	// speak a short filler to avoid dead air (ElevenLabs pattern). Fires once.
+	firstToken := make(chan struct{})
+	var fillerSpoken atomic.Bool
+	go func() {
+		select {
+		case <-firstToken:
+			return
+		case <-time.After(3 * time.Second):
+			if fillerSpoken.CompareAndSwap(false, true) {
+				ms.speakText(ctx, "Hmm, let me think about that for a second.", gen)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}()
+
 	_, err := provider.StreamComplete(ctx, messages, ms.session.GetTools(),
 		func(chunk string) error {
 			fullText.WriteString(chunk)
 			pendingSentence.WriteString(chunk)
+
+			// Signal first token arrival (stops the filler timer)
+			select {
+			case firstToken <- struct{}{}:
+			default:
+			}
 
 			if ms.llmEndTime.IsZero() {
 				ms.llmEndTime = time.Now()
@@ -136,6 +167,18 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					ms.speakText(sCtx, t, gen)
 				}(filler)
 				fullText.Reset()
+			} else {
+				// No pending text — speak a deterministic filler so there's no dead air
+				// while the tool executes (Vapi/Pipecat pattern: platform speaks the
+				// acknowledgment, not the LLM).
+				fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
+				if fillerPhrase != "" {
+					go func(t string) {
+						sCtx, sCancel := context.WithCancel(ctx)
+						defer sCancel()
+						ms.speakText(sCtx, t, gen)
+					}(fillerPhrase)
+				}
 			}
 
 			toolWg.Add(1)
@@ -145,11 +188,24 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				handler, ok := ms.orch.toolHandlers[tcData.Name]
 				var result string
 				if ok {
-					r, err := handler(tcData.Arguments)
-					if err == nil {
-						result = r
-					} else {
-						result = fmt.Sprintf(`{"error": "%s"}`, err)
+					// Run server-side handler with a timeout so a slow handler
+					// doesn't freeze the turn (Vapi/industry pattern).
+					hrCh := make(chan toolHandlerResult, 1)
+					go func() {
+						r, err := handler(tcData.Arguments)
+						hrCh <- toolHandlerResult{res: r, err: err}
+					}()
+					select {
+					case hr := <-hrCh:
+						if hr.err == nil {
+							result = hr.res
+						} else {
+							result = fmt.Sprintf(`{"error": %s}`, jsonQuote(hr.err.Error()))
+						}
+					case <-time.After(15 * time.Second):
+						result = `{"error": "tool handler timed out after 15 seconds"}`
+					case <-ms.ctx.Done():
+						result = `{"error": "cancelled"}`
 					}
 				} else {
 					// Client-side tool: create a channel and wait for the client to respond
@@ -180,7 +236,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				}
 
 				toolMu.Lock()
-				toolResults = append(toolResults, toolRes{tc: tcData, result: result})
+				toolResults = append(toolResults, toolRes{TC: tcData, Result: result})
 				toolMu.Unlock()
 			}(tc)
 
@@ -218,11 +274,11 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		var tcData []interface{}
 		for _, tr := range toolResults {
 			tcData = append(tcData, map[string]interface{}{
-				"id":   tr.tc.CallID,
+				"id":   tr.TC.CallID,
 				"type": "function",
 				"function": map[string]interface{}{
-					"name":      tr.tc.Name,
-					"arguments": tr.tc.Arguments,
+					"name":      tr.TC.Name,
+					"arguments": tr.TC.Arguments,
 				},
 			})
 			ms.emit(ToolResult, tr)
@@ -235,11 +291,20 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		})
 
 		for _, tr := range toolResults {
+			// Handle empty/malformed results: give the LLM something actionable
+			// rather than an empty tool message it can't use.
+			resultContent := strings.TrimSpace(tr.Result)
+			if resultContent == "" {
+				resultContent = `{"result": "no result"}`
+			} else if !strings.HasPrefix(resultContent, "{") && !strings.HasPrefix(resultContent, "[") {
+				// Wrap non-JSON results so the LLM can parse them consistently
+				resultContent = fmt.Sprintf(`{"result": %s}`, jsonQuote(resultContent))
+			}
 			ms.session.AddMessageRaw(Message{
 				Role:       "tool",
-				Content:    tr.result,
-				ToolCallID: tr.tc.CallID,
-				Name:       tr.tc.Name,
+				Content:    resultContent,
+				ToolCallID: tr.TC.CallID,
+				Name:       tr.TC.Name,
 			})
 		}
 
@@ -261,7 +326,54 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 			ms.emitWithGen(BotThinking, nil, gen)
 
-			text, err := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), nil)
+			// Pass tools so the LLM can make further tool calls (multi-step chains).
+			// Use streaming if available so we get real-time text + tool callbacks.
+			tools := ms.session.GetTools()
+			responseText := ""
+			if sProv, ok := ms.orch.llm.(StreamingLLMProvider); ok && len(tools) > 0 {
+				responseText, err = sProv.StreamComplete(rCtx, ms.session.GetContextCopy(), tools,
+					func(chunk string) error { return nil }, // text handled below
+					func(tc ToolCallEventData) error {
+						// Multi-step tool chain: execute and append result to context
+						ms.emit(ToolCall, tc)
+						if !ms.session.RecordToolCall(tc.Name) {
+							return fmt.Errorf("tool loop detected: %s", tc.Name)
+						}
+						var res string
+						if handler, ok := ms.orch.toolHandlers[tc.Name]; ok {
+							hrCh := make(chan toolHandlerResult, 1)
+							go func() { r, e := handler(tc.Arguments); hrCh <- toolHandlerResult{res: r, err: e} }()
+							select {
+							case hr := <-hrCh:
+								if hr.err == nil {
+									res = hr.res
+								} else {
+									res = fmt.Sprintf(`{"error": %s}`, jsonQuote(hr.err.Error()))
+								}
+							case <-time.After(15 * time.Second):
+								res = `{"error": "tool handler timed out"}`
+							}
+						} else {
+							res = `{"error": "unknown tool"}`
+						}
+						ms.session.AddMessageRaw(Message{
+							Role:       "tool",
+							Content:    res,
+							ToolCallID: tc.CallID,
+							Name:       tc.Name,
+						})
+						ms.emit(ToolResult, map[string]interface{}{
+							"tool_call": tc,
+							"result":    res,
+						})
+						return nil
+					})
+				if err != nil {
+					responseText = ""
+				}
+			} else {
+				responseText, err = ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), tools)
+			}
 			if err != nil {
 				if rCtx.Err() == nil {
 					ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
@@ -273,7 +385,17 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				ms.mu.Unlock()
 				return
 			}
-			text = strings.TrimSpace(text)
+			// If the response is a tool-call marker, skip speaking it (tool results
+			// are handled by the chain above).
+			if strings.HasPrefix(responseText, "[TOOL_CALL") {
+				ms.mu.Lock()
+				if ms.state != StateInterrupted {
+					ms.state = StateIdle
+				}
+				ms.mu.Unlock()
+				return
+			}
+			text := strings.TrimSpace(responseText)
 			if text == "" {
 				text = "Got it."
 			}
@@ -316,11 +438,22 @@ func (ms *ManagedStream) summarizeContextIfNeeded() {
 	if !ms.orch.config.ContextSummarization {
 		return
 	}
-	if !ms.session.NeedsSummarization() {
+
+	messages := ms.session.GetContextCopy()
+
+	// Trigger on message count OR estimated token count (research best practice:
+	// token-based triggers catch long single messages that message-count misses).
+	const maxContextTokens = 8000
+	var totalTokens int
+	for _, msg := range messages {
+		totalTokens += estimateTokens(msg.Content)
+	}
+	overTokenBudget := totalTokens > maxContextTokens
+
+	if !ms.session.NeedsSummarization() && !overTokenBudget {
 		return
 	}
 
-	messages := ms.session.GetContextCopy()
 	var turnsToSummarize []Message
 	for _, msg := range messages {
 		if msg.Role == "system" && strings.HasPrefix(msg.Content, "[Summary") {
@@ -336,6 +469,13 @@ func (ms *ManagedStream) summarizeContextIfNeeded() {
 	}
 
 	summarizeCount := len(turnsToSummarize) / 2
+	if overTokenBudget {
+		// If over token budget, summarize more aggressively
+		summarizeCount = int(float64(len(turnsToSummarize)) * 0.6)
+		if summarizeCount < 2 {
+			summarizeCount = 2
+		}
+	}
 	oldTurns := turnsToSummarize[:summarizeCount]
 
 	var sb strings.Builder
@@ -359,11 +499,46 @@ func (ms *ManagedStream) summarizeContextIfNeeded() {
 	}(sb.String())
 }
 
+// estimateTokens approximates token count for a string (~4 chars/token on average
+// for English; a reasonable proxy across languages).
+func estimateTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	return len(s) / 4
+}
+
 func (ms *ManagedStream) SetClientVAD(enabled bool) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	ms.clientVAD = enabled
 	ms.logger.Info("Client VAD mode", "enabled", enabled)
+}
+
+// toolFillerForLang returns a short, deterministic verbal acknowledgment to speak
+// while a tool is executing. This avoids dead air without an LLM round-trip.
+func toolFillerForLang(lang Language) string {
+	switch lang {
+	case LanguageEs:
+		return "Un momento, déjame buscarlo."
+	case LanguageFr:
+		return "Un instant, je vérifie ça."
+	case LanguageDe:
+		return "Einen Moment, ich schaue das nach."
+	case LanguageIt:
+		return "Un momento, lo controllo."
+	case LanguagePt:
+		return "Um momento, deixa eu verificar."
+	default:
+		return "Let me look that up for you."
+	}
+}
+
+// jsonQuote safely quotes a string for inclusion in a JSON value, escaping any
+// quotes, backslashes, and control characters so the resulting JSON is valid.
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 func (ms *ManagedStream) IsClientVAD() bool {
