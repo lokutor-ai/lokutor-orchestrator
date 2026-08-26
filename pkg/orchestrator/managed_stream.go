@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
@@ -67,6 +68,17 @@ type ManagedStream struct {
 	interruptChan chan struct{}
 	state         StreamState
 
+	// pendingBargeIn tracks a tentative barge-in: raw VAD fired while the bot
+	// was speaking/processing, so audio delivery is already suppressed (state
+	// left StateSpeaking), but the underlying TTS/LLM pipeline is deliberately
+	// NOT torn down yet. Once STT confirms real speech, confirmBargeInIfPending
+	// commits to the interrupt; if it turns out to be noise or too short,
+	// resolvePendingBargeIn resumes playback instead of leaving dead air.
+	// pendingBargeGen pins this to the response generation active when the
+	// tentative mute began, so a resume/confirm can't act on a stale turn.
+	pendingBargeIn  bool
+	pendingBargeGen int
+
 	userAudio []byte
 
 	userSpeakingSince time.Time
@@ -89,8 +101,16 @@ type ManagedStream struct {
 
 	playbackRate    int
 	inputSampleRate int
-	isClosed        bool
-	closeOnce       sync.Once
+	// isClosed and eventsMu guard ms.events: isClosed is atomic so any hot
+	// path can check it cheaply, and eventsMu (deliberately separate from the
+	// general-purpose mu below, which is contended by most of the pipeline)
+	// serializes the isClosed-recheck-then-send in emit/emitBackchannel/
+	// drainAudioChunks against Close()'s close(ms.events) — without that,
+	// a goroutine can read isClosed as false, get pre-empted, and send on
+	// ms.events after Close() has already closed it (send-on-closed-channel).
+	isClosed  atomic.Bool
+	eventsMu  sync.Mutex
+	closeOnce sync.Once
 
 	sttStartTime      time.Time
 	sttEndTime        time.Time
@@ -491,8 +511,16 @@ func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
 
 	if event.InterruptionSafety > cfg.VelaInterruptThreshold && isSpeaking {
 		if prevState == StateSpeaking || prevState == StateProcessing {
+			// Same tentative-mute pattern as onVADStart: suppress audio via
+			// state immediately, defer the destructive cancel to onVADEnd's
+			// confirmation so a false-positive neural trigger can resume
+			// instead of leaving the caller with dead air.
+			ms.mu.Lock()
+			ms.state = StateListening
+			ms.pendingBargeIn = true
+			ms.pendingBargeGen = ms.payloadGen
+			ms.mu.Unlock()
 			ms.emit(UserSpeaking, nil)
-			ms.cancelPipeline()
 			return
 		}
 	}
@@ -619,12 +647,69 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	ms.mu.Unlock()
 
 	if prevState == StateSpeaking || prevState == StateProcessing {
+		// Tentative barge-in only: ms.state was already set to StateListening
+		// above, which makes emitWithGen's AudioChunk gate suppress outbound
+		// audio immediately (as fast as the old cancelPipeline() call was) —
+		// but we deliberately do NOT cancel the pipeline here. If this turns
+		// out to be a false alarm (noise, too short, or too few words), the
+		// still-running TTS goroutine can resume delivering audio with no
+		// re-synthesis and no gap in generation. The pipeline is only
+		// destructively cancelled once onVADEnd/processUtterance below
+		// confirms real speech via confirmBargeInIfPending.
+		ms.mu.Lock()
+		ms.pendingBargeIn = true
+		ms.pendingBargeGen = ms.payloadGen
+		ms.mu.Unlock()
 		ms.emit(UserSpeaking, nil)
-		ms.cancelPipeline()
 		return
 	}
 
 	ms.emit(UserSpeaking, nil)
+}
+
+// resolvePendingBargeIn reverts a tentative barge-in that turned out to be a
+// false alarm. If the previous turn's pipeline is still alive, playback
+// resumes (state goes back to whatever it was actively doing); otherwise it
+// falls back to the normal idle reset. No-ops if there is no pending barge-in
+// for the current response generation (e.g. it was already confirmed, or a
+// newer turn has since started).
+func (ms *ManagedStream) resolvePendingBargeIn() {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if !ms.pendingBargeIn || ms.pendingBargeGen != ms.payloadGen {
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
+		return
+	}
+	ms.pendingBargeIn = false
+	switch {
+	case ms.ttsCancel != nil:
+		ms.state = StateSpeaking
+	case ms.pipelineCancel != nil:
+		ms.state = StateProcessing
+	default:
+		ms.state = StateIdle
+	}
+}
+
+// confirmBargeInIfPending finalizes a tentative barge-in once STT confirms the
+// interrupting audio was real speech, running the same cancel + spoken-truth
+// truncation + Interrupted-event bookkeeping as handleInterrupt(), but
+// synchronously at the point of confirmation rather than depending on a
+// separate async re-signal from the transport layer (which is what produced
+// the double-cancellation race this replaces). No-ops if there's no pending
+// barge-in for the current generation.
+func (ms *ManagedStream) confirmBargeInIfPending() {
+	ms.mu.Lock()
+	pending := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
+	if pending {
+		ms.pendingBargeIn = false
+	}
+	ms.mu.Unlock()
+	if pending {
+		ms.handleInterrupt()
+	}
 }
 
 func (ms *ManagedStream) onVADEnd(prevState StreamState) {
@@ -702,6 +787,9 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	}
 
 	if duration < minDur || len(audioData) < minLen {
+		// Too brief to even bother with STT — if this cut off a tentative
+		// barge-in, resume the bot rather than leaving it silent.
+		ms.resolvePendingBargeIn()
 		return
 	}
 
@@ -789,24 +877,37 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.lastNoSpeechProb = result.NoSpeechProb
 
 	if ms.isLikelyNoise(result, duration) {
-		ms.mu.Lock()
-		if ms.state != StateInterrupted {
-			ms.state = StateIdle
-		}
-		ms.mu.Unlock()
+		// False alarm — if this cut off a tentative barge-in, resume the bot
+		// instead of leaving the caller with dead air.
+		ms.resolvePendingBargeIn()
 		ms.emit(BotResumed, nil)
 		return
 	}
 
 	transcript := strings.TrimSpace(result.Text)
 	if transcript == "" {
-		ms.mu.Lock()
-		if ms.state != StateInterrupted {
-			ms.state = StateIdle
-		}
-		ms.mu.Unlock()
+		ms.resolvePendingBargeIn()
 		return
 	}
+
+	// Barge-in confirmation gate: if this utterance tentatively interrupted a
+	// still-speaking/processing bot, require at least MinWordsToInterrupt
+	// words before committing to the interrupt — short interjections ("uh",
+	// "yeah") that don't trip isLikelyNoise still shouldn't cut the bot off.
+	// Below the threshold, resume instead of committing.
+	ms.mu.Lock()
+	pendingBarge := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
+	ms.mu.Unlock()
+	if pendingBarge {
+		if minWords := ms.orch.config.MinWordsToInterrupt; minWords > 0 && countWords(transcript) < minWords {
+			ms.resolvePendingBargeIn()
+			return
+		}
+	}
+	// Real, sufficient speech — commit to the interrupt now (cancels the old
+	// pipeline, truncates spoken-truth context, emits Interrupted). No-op if
+	// there was no pending barge-in for this generation.
+	ms.confirmBargeInIfPending()
 
 	ms.lastUserText = transcript
 
@@ -894,6 +995,17 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 		if rCtx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("LLM error: %v", err))
 		}
+		return
+	}
+
+	// Non-streaming providers (Anthropic, OpenAI) signal a tool call by
+	// returning a "[TOOL_CALLS] <json>" marker string instead of invoking a
+	// callback, since they don't implement StreamingLLMProvider. Previously
+	// this marker was never checked here — it went straight to speakText, so
+	// the caller heard the tool-call JSON read aloud verbatim and the tool
+	// itself never ran.
+	if calls, isToolCall := parseToolCallMarker(response); isToolCall {
+		ms.handleNonStreamingToolCalls(rCtx, gen, transcript, calls)
 		return
 	}
 
@@ -1185,6 +1297,14 @@ func (ms *ManagedStream) drainAudioChunks() {
 		}
 	}
 DrainDone:
+	// Same eventsMu guard as emitWithGen/emitBackchannel: a concurrent
+	// Close() may have closed ms.events between the drain loop above and
+	// this resend.
+	ms.eventsMu.Lock()
+	defer ms.eventsMu.Unlock()
+	if ms.isClosed.Load() {
+		return
+	}
 	for _, ev := range controlEvents {
 		select {
 		case ms.events <- ev:
@@ -1339,9 +1459,7 @@ func splitSentences(text string) []string {
 
 func (ms *ManagedStream) Close() {
 	ms.closeOnce.Do(func() {
-		ms.mu.Lock()
-		ms.isClosed = true
-		ms.mu.Unlock()
+		ms.isClosed.Store(true)
 
 		ms.cancelPipeline()
 		ms.cancel()
@@ -1357,7 +1475,15 @@ func (ms *ManagedStream) Close() {
 
 		time.Sleep(10 * time.Millisecond)
 
+		// Closing under eventsMu (the same lock emit/emitBackchannel/
+		// drainAudioChunks hold across their isClosed-recheck-and-send) makes
+		// this safe without relying on the sleep above as the only guard: any
+		// of those calls that started before this point either finishes its
+		// send while holding eventsMu (channel still open) or observes
+		// isClosed=true and returns before ever reaching the send.
+		ms.eventsMu.Lock()
 		close(ms.events)
+		ms.eventsMu.Unlock()
 	})
 }
 
@@ -1514,10 +1640,12 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 	default:
 	}
 
-	ms.mu.Lock()
-	closed := ms.isClosed
-	speaking := ms.state == StateSpeaking
+	if ms.isClosed.Load() {
+		return
+	}
 
+	ms.mu.Lock()
+	speaking := ms.state == StateSpeaking
 	if eventType == BotSpeaking {
 		if gen <= ms.lastBotSpeakGen {
 			ms.mu.Unlock()
@@ -1526,10 +1654,6 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		ms.lastBotSpeakGen = gen
 	}
 	ms.mu.Unlock()
-
-	if closed {
-		return
-	}
 
 	if eventType == AudioChunk && !speaking {
 		return
@@ -1541,6 +1665,17 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		Generation: gen,
 	}
 
+	// eventsMu (not the general-purpose ms.mu above) serializes this send
+	// against Close()'s close(ms.events) — see the eventsMu field comment.
+	// Re-checking isClosed here (not just the cheap check above) closes the
+	// actual race: without a shared lock across "check" and "send", a
+	// goroutine can observe isClosed=false, get pre-empted, and send after
+	// Close() has since closed the channel.
+	ms.eventsMu.Lock()
+	defer ms.eventsMu.Unlock()
+	if ms.isClosed.Load() {
+		return
+	}
 	select {
 	case ms.events <- event:
 	default:
@@ -1553,12 +1688,7 @@ func (ms *ManagedStream) emitBackchannel(data []byte) {
 		}
 	}()
 
-	ms.mu.Lock()
-	closed := ms.isClosed
-	gen := ms.payloadGen
-	ms.mu.Unlock()
-
-	if closed || len(data) == 0 {
+	if len(data) == 0 {
 		return
 	}
 
@@ -1571,12 +1701,27 @@ func (ms *ManagedStream) emitBackchannel(data []byte) {
 		reduced[i+1] = byte(sample >> 8)
 	}
 
+	if ms.isClosed.Load() {
+		return
+	}
+
+	ms.mu.Lock()
+	gen := ms.payloadGen
+	ms.mu.Unlock()
+
 	event := OrchestratorEvent{
 		Type:       AudioChunk,
 		Data:       reduced,
 		Generation: gen,
 	}
 
+	// eventsMu serializes this send against Close()'s close(ms.events) — see
+	// the eventsMu field comment and emitWithGen.
+	ms.eventsMu.Lock()
+	defer ms.eventsMu.Unlock()
+	if ms.isClosed.Load() {
+		return
+	}
 	select {
 	case ms.events <- event:
 	default:
@@ -1711,10 +1856,9 @@ func (ms *ManagedStream) monitorInactivity() {
 			speaking := ms.state == StateSpeaking
 			userSpeaking := ms.vadSpeaking
 			lastActivity := ms.lastActivityAt
-			closed := ms.isClosed
 			ms.mu.Unlock()
 
-			if closed {
+			if ms.isClosed.Load() {
 				return
 			}
 
@@ -1723,7 +1867,11 @@ func (ms *ManagedStream) monitorInactivity() {
 					ms.updateActivity()
 					go func() {
 						ms.mu.Lock()
-						if ms.state != StateIdle || ms.vadSpeaking {
+						// Also recover from StateInterrupted: a stuck/wedged
+						// interrupt should never leave the caller in permanent
+						// silence — this is the last-resort net for that case.
+						recoverable := ms.state == StateIdle || ms.state == StateInterrupted
+						if !recoverable || ms.vadSpeaking {
 							ms.mu.Unlock()
 							return
 						}

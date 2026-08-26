@@ -269,7 +269,11 @@ func DefaultConfig() Config {
 		BargeInVADTrailWindow:    1500 * time.Millisecond,
 		EchoSuppressionThreshold: 0.35,
 		FirstSpeaker:             FirstSpeakerBot,
-		SilenceTimeout:           0,
+		// Last-resort recovery net: if the session sits idle (or stuck after an
+		// interrupt) this long with no user input, monitorInactivity prompts the
+		// user again instead of leaving the call silent indefinitely. Previously
+		// left at 0 (disabled) except where Telnyx explicitly overrode it.
+		SilenceTimeout: 10 * time.Second,
 
 		ClientVAD:             false,
 		TokenLevelTTS:         true,

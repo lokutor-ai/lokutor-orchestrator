@@ -64,6 +64,215 @@ func (ms *ManagedStream) handleControl(data []byte) {
 	}
 }
 
+// parseToolCallMarker detects the "[TOOL_CALLS] <json>" / "[TOOL_CALL] <json>"
+// marker that non-streaming LLM providers (Anthropic, OpenAI) return when
+// they want to call a tool but have no StreamComplete/onToolCall callback to
+// invoke directly, and parses it back into ToolCallEventData. The marker's
+// JSON is an array of {id, type:"function", function:{name, arguments}}
+// objects; arguments may be a raw JSON value (Anthropic) or a JSON-encoded
+// string (OpenAI) — both are normalized to a plain argument string here.
+func parseToolCallMarker(response string) ([]ToolCallEventData, bool) {
+	if !strings.HasPrefix(response, "[TOOL_CALL") {
+		return nil, false
+	}
+	tagEnd := strings.Index(response, "] ")
+	if tagEnd < 0 {
+		return nil, false
+	}
+	raw := strings.TrimSpace(response[tagEnd+2:])
+
+	var parsed []struct {
+		ID       string `json:"id"`
+		Function struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		} `json:"function"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, false
+	}
+
+	calls := make([]ToolCallEventData, 0, len(parsed))
+	for i, p := range parsed {
+		if p.Function.Name == "" {
+			continue
+		}
+		argsStr := string(p.Function.Arguments)
+		var unquoted string
+		if json.Unmarshal(p.Function.Arguments, &unquoted) == nil {
+			argsStr = unquoted // was a JSON-encoded string (OpenAI shape)
+		}
+		callID := p.ID
+		if callID == "" {
+			callID = fmt.Sprintf("%s_%d", p.Function.Name, i)
+		}
+		calls = append(calls, ToolCallEventData{
+			Name:      p.Function.Name,
+			Arguments: argsStr,
+			CallID:    callID,
+		})
+	}
+	if len(calls) == 0 {
+		return nil, false
+	}
+	return calls, true
+}
+
+// dispatchToolCall runs one tool call — a registered server-side handler
+// (15s timeout) or, if none is registered, waits for a client to submit a
+// result via SubmitToolResult (10s timeout) — and returns the result string.
+// Shared by the streaming tool-call path (invoked per-call as they arrive)
+// and the non-streaming path (invoked for a batch parsed from a
+// [TOOL_CALLS] marker), so both dispatch and time out identically.
+func (ms *ManagedStream) dispatchToolCall(ctx context.Context, tcData ToolCallEventData) string {
+	if handler, ok := ms.orch.toolHandlers[tcData.Name]; ok {
+		hrCh := make(chan toolHandlerResult, 1)
+		go func() {
+			r, err := handler(tcData.Arguments)
+			hrCh <- toolHandlerResult{res: r, err: err}
+		}()
+		select {
+		case hr := <-hrCh:
+			if hr.err == nil {
+				return hr.res
+			}
+			return fmt.Sprintf(`{"error": %s}`, jsonQuote(hr.err.Error()))
+		case <-time.After(15 * time.Second):
+			return `{"error": "tool handler timed out after 15 seconds"}`
+		case <-ms.ctx.Done():
+			return `{"error": "cancelled"}`
+		}
+	}
+
+	// Client-side tool: create a channel and wait for the client to respond.
+	ch := make(chan string, 1)
+	ms.clientToolResultsMu.Lock()
+	ms.clientToolResults[tcData.CallID] = ch
+	ms.clientToolResultsMu.Unlock()
+	defer func() {
+		ms.clientToolResultsMu.Lock()
+		delete(ms.clientToolResults, tcData.CallID)
+		ms.clientToolResultsMu.Unlock()
+	}()
+
+	resultCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	select {
+	case res := <-ch:
+		return res
+	case <-resultCtx.Done():
+		return `{"error": "client tool request timed out after 10 seconds"}`
+	case <-ms.ctx.Done():
+		return `{"error": "cancelled"}`
+	}
+}
+
+// handleNonStreamingToolCalls executes a batch of tool calls parsed from a
+// [TOOL_CALLS] marker (the non-streaming Anthropic/OpenAI path) and speaks
+// the model's follow-up answer. Mirrors runStreamingLLM's tool-dispatch
+// pattern — parallel goroutines via dispatchToolCall, a filler phrase while
+// tools run, per-call loop guard — so behavior is consistent regardless of
+// which LLM provider is configured. Does not recurse into a further round of
+// tool calls if the follow-up answer is itself another marker; that matches
+// the existing limitation of the streaming path's own round-2 fallback, and
+// parseToolCallMarker guards against speaking that raw JSON either way.
+func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen int, userTranscript string, calls []ToolCallEventData) {
+	fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
+	if fillerPhrase != "" {
+		go func(t string) {
+			sCtx, sCancel := context.WithCancel(ctx)
+			defer sCancel()
+			ms.speakText(sCtx, t, gen)
+		}(fillerPhrase)
+	}
+
+	type toolRes struct {
+		TC     ToolCallEventData
+		Result string
+	}
+	var results []toolRes
+	var resMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for _, tc := range calls {
+		ms.emit(ToolCall, tc)
+		if !ms.session.RecordToolCall(tc.Name) {
+			ms.emit(ErrorEvent, fmt.Sprintf("Tool loop detected: %s called too many times. Aborting to prevent infinite retry.", tc.Name))
+			ms.mu.Lock()
+			if ms.state != StateInterrupted {
+				ms.state = StateIdle
+			}
+			ms.mu.Unlock()
+			return
+		}
+		wg.Add(1)
+		go func(tcData ToolCallEventData) {
+			defer wg.Done()
+			result := ms.dispatchToolCall(ctx, tcData)
+			resMu.Lock()
+			results = append(results, toolRes{TC: tcData, Result: result})
+			resMu.Unlock()
+		}(tc)
+	}
+	wg.Wait()
+
+	var tcData []interface{}
+	for _, r := range results {
+		tcData = append(tcData, map[string]interface{}{
+			"id":   r.TC.CallID,
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      r.TC.Name,
+				"arguments": r.TC.Arguments,
+			},
+		})
+		ms.emit(ToolResult, map[string]interface{}{"tool_call": r.TC, "result": r.Result})
+	}
+	ms.session.AddMessageRaw(Message{
+		Role:      "assistant",
+		ToolCalls: tcData,
+	})
+	for _, r := range results {
+		resultContent := strings.TrimSpace(r.Result)
+		if resultContent == "" {
+			resultContent = `{"result": "no result"}`
+		} else if !strings.HasPrefix(resultContent, "{") && !strings.HasPrefix(resultContent, "[") {
+			resultContent = fmt.Sprintf(`{"result": %s}`, jsonQuote(resultContent))
+		}
+		ms.session.AddMessageRaw(Message{
+			Role:       "tool",
+			Content:    resultContent,
+			ToolCallID: r.TC.CallID,
+			Name:       r.TC.Name,
+		})
+	}
+
+	final, err := ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), ms.session.GetTools())
+	ms.mu.Lock()
+	if ms.state != StateInterrupted {
+		ms.state = StateIdle
+	}
+	ms.mu.Unlock()
+	if err != nil {
+		if ctx.Err() == nil {
+			ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
+		}
+		return
+	}
+	if _, isMarker := parseToolCallMarker(final); isMarker {
+		return
+	}
+	text := strings.TrimSpace(final)
+	if text == "" {
+		text = "Got it."
+	}
+	ms.session.AddMessage("assistant", text)
+	ms.emit(BotResponse, text)
+	ms.cacheResponse(userTranscript, text, nil)
+	ms.speakText(ctx, text, gen)
+}
+
 func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider StreamingLLMProvider, gen int, userTranscript string) {
 	var fullText strings.Builder
 	var hasToolCalls bool
@@ -184,57 +393,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			toolWg.Add(1)
 			go func(tcData ToolCallEventData) {
 				defer toolWg.Done()
-
-				handler, ok := ms.orch.toolHandlers[tcData.Name]
-				var result string
-				if ok {
-					// Run server-side handler with a timeout so a slow handler
-					// doesn't freeze the turn (Vapi/industry pattern).
-					hrCh := make(chan toolHandlerResult, 1)
-					go func() {
-						r, err := handler(tcData.Arguments)
-						hrCh <- toolHandlerResult{res: r, err: err}
-					}()
-					select {
-					case hr := <-hrCh:
-						if hr.err == nil {
-							result = hr.res
-						} else {
-							result = fmt.Sprintf(`{"error": %s}`, jsonQuote(hr.err.Error()))
-						}
-					case <-time.After(15 * time.Second):
-						result = `{"error": "tool handler timed out after 15 seconds"}`
-					case <-ms.ctx.Done():
-						result = `{"error": "cancelled"}`
-					}
-				} else {
-					// Client-side tool: create a channel and wait for the client to respond
-					ch := make(chan string, 1)
-					ms.clientToolResultsMu.Lock()
-					ms.clientToolResults[tcData.CallID] = ch
-					ms.clientToolResultsMu.Unlock()
-
-					// Clean up channel from map when done
-					defer func() {
-						ms.clientToolResultsMu.Lock()
-						delete(ms.clientToolResults, tcData.CallID)
-						ms.clientToolResultsMu.Unlock()
-					}()
-
-					// Wait for client response with 10-second timeout
-					resultCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-					defer cancel()
-
-					select {
-					case res := <-ch:
-						result = res
-					case <-resultCtx.Done():
-						result = `{"error": "client tool request timed out after 10 seconds"}`
-					case <-ms.ctx.Done():
-						result = `{"error": "cancelled"}`
-					}
-				}
-
+				result := ms.dispatchToolCall(ctx, tcData)
 				toolMu.Lock()
 				toolResults = append(toolResults, toolRes{TC: tcData, Result: result})
 				toolMu.Unlock()
@@ -334,28 +493,18 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				responseText, err = sProv.StreamComplete(rCtx, ms.session.GetContextCopy(), tools,
 					func(chunk string) error { return nil }, // text handled below
 					func(tc ToolCallEventData) error {
-						// Multi-step tool chain: execute and append result to context
+						// Multi-step tool chain: execute and append result to context.
+						// Uses the same dispatchToolCall as round one (server handler
+						// with a 15s timeout, or a client-side wait with a 10s
+						// timeout) — previously this block had no client-tool branch
+						// at all and returned "unknown tool" for any tool without a
+						// registered server handler, silently breaking client-side
+						// tools specifically on chained (round 2+) calls.
 						ms.emit(ToolCall, tc)
 						if !ms.session.RecordToolCall(tc.Name) {
 							return fmt.Errorf("tool loop detected: %s", tc.Name)
 						}
-						var res string
-						if handler, ok := ms.orch.toolHandlers[tc.Name]; ok {
-							hrCh := make(chan toolHandlerResult, 1)
-							go func() { r, e := handler(tc.Arguments); hrCh <- toolHandlerResult{res: r, err: e} }()
-							select {
-							case hr := <-hrCh:
-								if hr.err == nil {
-									res = hr.res
-								} else {
-									res = fmt.Sprintf(`{"error": %s}`, jsonQuote(hr.err.Error()))
-								}
-							case <-time.After(15 * time.Second):
-								res = `{"error": "tool handler timed out"}`
-							}
-						} else {
-							res = `{"error": "unknown tool"}`
-						}
+						res := ms.dispatchToolCall(rCtx, tc)
 						ms.session.AddMessageRaw(Message{
 							Role:       "tool",
 							Content:    res,

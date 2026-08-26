@@ -299,6 +299,7 @@ func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 
 	reader := bufio.NewReader(resp.Body)
 	var fullContent strings.Builder
+	toolCallIndex := 0
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -352,10 +353,20 @@ func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 			if part.FunctionCall.Name != "" {
 				if onToolCall != nil {
 					argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+					// Gemini doesn't provide call IDs. Using the bare name
+					// collided when the model called the same tool twice in
+					// one turn (e.g. two search_knowledge_base calls with
+					// different queries): both got the same CallID, results
+					// are correlated by CallID, so the second silently
+					// clobbered the first's pending result and one call
+					// always timed out. Suffix with a per-response index to
+					// keep concurrent calls to the same tool distinct.
+					callID := fmt.Sprintf("%s_%d", part.FunctionCall.Name, toolCallIndex)
+					toolCallIndex++
 					err := onToolCall(orchestrator.ToolCallEventData{
 						Name:      part.FunctionCall.Name,
 						Arguments: string(argsJSON),
-						CallID:    part.FunctionCall.Name, // Gemini doesn't provide call IDs; use name
+						CallID:    callID,
 					})
 					if err != nil {
 						return "", err

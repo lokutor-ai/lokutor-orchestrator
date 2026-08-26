@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -74,9 +75,16 @@ func TestManagedStream_ToolCalling(t *testing.T) {
 
 	orch := NewWithAllLayers(stt, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
 
-	weatherCalled := false
+	// Tool handlers run in their own goroutine (see dispatchToolCall) — a
+	// plain bool written there and read from the test goroutine below raced
+	// under -race even though BotResponse happens to be emitted afterward,
+	// since a channel receive only establishes happens-before for the
+	// sender's own goroutine, not for a separate handler goroutine joined via
+	// a WaitGroup the test never observes. atomic.Bool makes the flag itself
+	// safe to read from either goroutine regardless of ordering.
+	var weatherCalled atomic.Bool
 	orch.RegisterTool("get_weather", func(args string) (string, error) {
-		weatherCalled = true
+		weatherCalled.Store(true)
 		var params struct{ Location string }
 		json.Unmarshal([]byte(args), &params)
 		return fmt.Sprintf("It is currently sunny in %s", params.Location), nil
@@ -106,7 +114,7 @@ loop:
 		}
 	}
 
-	if !weatherCalled {
+	if !weatherCalled.Load() {
 		t.Error("get_weather tool was never called")
 	}
 
