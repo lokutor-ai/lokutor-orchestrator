@@ -1248,18 +1248,28 @@ func (ms *ManagedStream) emitFrames(data []byte, frameSize, gen int) {
 }
 
 func (ms *ManagedStream) handleInterrupt() {
+	// Capture state BEFORE cancelling anything: cancelPipeline()'s cancel()
+	// calls wake the in-flight TTS/pipeline goroutine, whose own cleanup
+	// path (reacting to ctx.Done()) can win the race to grab ms.mu and reset
+	// ms.state to something other than Speaking/Processing before this
+	// function gets to read it below. That race meant "was this actually
+	// interrupting something" sometimes read the POST-cancellation state
+	// instead of the state at the moment the interrupt was requested — the
+	// Interrupted event would silently never fire, which is what a real
+	// barge-in on a call looks like getting dropped (bot doesn't stop, or
+	// the next turn starts from stale state).
+	ms.mu.Lock()
+	oldState := ms.state
+	ms.state = StateInterrupted
+	ms.interruptedAt = time.Now()
+	ms.mu.Unlock()
+
 	ms.cancelPipeline()
 
 	// Spoken-truth context: if the bot was interrupted mid-response, truncate
 	// the last assistant message to only the text that was actually spoken.
 	// This prevents the model from "remembering" things it never said.
 	ms.truncateSpokenContext()
-
-	ms.mu.Lock()
-	oldState := ms.state
-	ms.state = StateInterrupted
-	ms.interruptedAt = time.Now()
-	ms.mu.Unlock()
 
 	if oldState == StateSpeaking || oldState == StateProcessing {
 		ms.drainAudioChunks()
@@ -1478,9 +1488,17 @@ func isLikelyEcho(transcript, currentlySpeaking string) bool {
 	if strings.Contains(s, t) {
 		return true
 	}
-	// STT on a bleed-through echo is often imperfect (clipped audio, mixed
-	// with room noise), so also accept near-total word overlap rather than
-	// requiring an exact substring match.
+	// STT on a bleed-through echo is often imperfect — phone-network
+	// compression plus speaker-to-mic bleed plus a second STT pass produces
+	// real insertions/deletions/substitutions, not just noise. On telephony
+	// (no client-side AEC at all — see the caller's comment) this is the
+	// only thing standing between the bot's own echo and a self-triggered
+	// interrupt, so it needs real tolerance for garbled transcripts rather
+	// than a near-exact match. 0.6 (was 0.8) accepts more of that noise;
+	// worth erring toward "it's an echo" here since the failure mode of
+	// wrongly resuming instead of interrupting is `wait`/`stop` occasionally
+	// not landing, while the failure mode of missing a real echo is the
+	// bot audibly restarting/repeating itself.
 	tWords := strings.Fields(t)
 	if len(tWords) == 0 {
 		return false
@@ -1495,7 +1513,7 @@ func isLikelyEcho(transcript, currentlySpeaking string) bool {
 			matched++
 		}
 	}
-	return float64(matched)/float64(len(tWords)) >= 0.8
+	return float64(matched)/float64(len(tWords)) >= 0.6
 }
 
 func normalizeForEchoCompare(s string) string {

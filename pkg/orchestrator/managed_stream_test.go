@@ -169,8 +169,14 @@ func TestManagedStream_InterruptDuringPendingResponse(t *testing.T) {
 
 	go stream.runLLMAndTTS(context.Background(), "user says something")
 
-	// Wait for BotSpeaking (TTS started)
-	deadline := time.After(2 * time.Second)
+	// Wait for BotSpeaking (TTS started). 10s, not 2s: under `go test -race`
+	// (which CI always runs with) goroutine scheduling slows down enough
+	// that 2s flaked here on a genuinely correct run roughly 1 in 7-10
+	// times — confirmed by running this same test at HEAD~1, before
+	// tonight's confirmation-gate change, which flaked identically. Not a
+	// real race (no race detector report ever fired), just a deadline too
+	// tight for -race's overhead.
+	deadline := time.After(10 * time.Second)
 	for {
 		select {
 		case ev := <-stream.Events():
@@ -185,7 +191,7 @@ pipelineStarted:
 
 	stream.Interrupt()
 
-	timeout := time.After(2 * time.Second)
+	timeout := time.After(10 * time.Second)
 	for {
 		select {
 		case ev := <-stream.Events():
