@@ -327,10 +327,16 @@ func (ms *ManagedStream) audioProcessor() {
 	}
 }
 
-func (ms *ManagedStream) handleAudio(chunk []byte) {
-	// Signal the confirmation gate: new audio arrived during the post-speech-end
-	// window. This tells onVADEnd that the user resumed speaking and the pending
-	// response should be cancelled.
+// closeConfirmationGateIfOpen signals the confirmation gate: the caller has
+// just been confirmed as actually SPEAKING (not merely "some audio chunk
+// arrived" — silence-period packets flow continuously over the media stream
+// too) during the post-speech-end window. This tells onVADEnd the user
+// resumed and the pending response should be cancelled. Must only be called
+// once a chunk has been VAD/Vela-confirmed as speech, never unconditionally
+// on every incoming chunk — doing so made the gate close on essentially the
+// very next packet regardless of silence, defeating the whole point of the
+// confirmation window (see the commit that introduced this gate).
+func (ms *ManagedStream) closeConfirmationGateIfOpen() {
 	ms.mu.Lock()
 	if ms.confirmationGate != nil {
 		select {
@@ -339,6 +345,11 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 			close(ms.confirmationGate)
 		}
 	}
+	ms.mu.Unlock()
+}
+
+func (ms *ManagedStream) handleAudio(chunk []byte) {
+	ms.mu.Lock()
 	state := ms.state
 	clientVAD := ms.clientVAD
 	// Update pre-speech buffer BEFORE VAD processing so it never includes
@@ -358,6 +369,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	if clientVAD {
 		isSpeaking := ms.vadSpeaking
 		if isSpeaking {
+			ms.closeConfirmationGateIfOpen()
 			ms.userAudio = append(ms.userAudio, chunk...)
 			ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
 		}
@@ -402,6 +414,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	}
 
 	if isSpeaking {
+		ms.closeConfirmationGateIfOpen()
 		ms.userAudio = append(ms.userAudio, chunk...)
 		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
 
@@ -469,6 +482,7 @@ func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
 	}
 
 	if isSpeaking {
+		ms.closeConfirmationGateIfOpen()
 		ms.userAudio = append(ms.userAudio, chunk...)
 		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
 
