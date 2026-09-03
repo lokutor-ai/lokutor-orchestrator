@@ -215,6 +215,11 @@ type Config struct {
 	// barge-in, not just edge cases.
 	PostInterruptBackoff time.Duration
 
+	// SilenceConfirmationMs: after VAD detects speech end, wait this many ms
+	// for the user to resume speaking before triggering the LLM pipeline.
+	// Prevents phantom interruptions from brief pauses between sentences.
+	SilenceConfirmationMs int
+
 	// Client-side VAD: server accepts vad_speech_start/end control frames
 	ClientVAD bool
 
@@ -288,6 +293,12 @@ func DefaultConfig() Config {
 		// reply — halved here since it stacks on top of whatever STT+LLM
 		// processing time has already elapsed since the interrupt.
 		PostInterruptBackoff: 500 * time.Millisecond,
+
+		// SilenceConfirmationMs: after VAD detects speech end, wait this long
+		// for the user to resume speaking before triggering the LLM pipeline.
+		// Prevents "phantom interrupts" where a brief pause (exceeding the
+		// VAD silence limit) triggers the bot while the user continues speaking.
+		SilenceConfirmationMs: 800,
 
 		ClientVAD:             false,
 		TokenLevelTTS:         true,

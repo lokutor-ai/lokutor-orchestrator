@@ -69,6 +69,13 @@ type ManagedStream struct {
 	interruptChan chan struct{}
 	state         StreamState
 
+	// confirmationGate: when VAD fires speech end, onVADEnd sets this field
+	// to a channel. If new audio arrives in handleAudio before the channel is
+	// closed (by the confirmation timer), the user resumed speaking and the
+	// pending response is cancelled. Channel is nil when no gate is active.
+	confirmationGate     chan struct{}
+	confirmationGateOnce sync.Once
+
 	// pendingBargeIn tracks a tentative barge-in: raw VAD fired while the bot
 	// was speaking/processing, so audio delivery is already suppressed (state
 	// left StateSpeaking), but the underlying TTS/LLM pipeline is deliberately
@@ -321,7 +328,17 @@ func (ms *ManagedStream) audioProcessor() {
 }
 
 func (ms *ManagedStream) handleAudio(chunk []byte) {
+	// Signal the confirmation gate: new audio arrived during the post-speech-end
+	// window. This tells onVADEnd that the user resumed speaking and the pending
+	// response should be cancelled.
 	ms.mu.Lock()
+	if ms.confirmationGate != nil {
+		select {
+		case <-ms.confirmationGate:
+		default:
+			close(ms.confirmationGate)
+		}
+	}
 	state := ms.state
 	clientVAD := ms.clientVAD
 	// Update pre-speech buffer BEFORE VAD processing so it never includes
@@ -792,6 +809,46 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 		// barge-in, resume the bot rather than leaving it silent.
 		ms.resolvePendingBargeIn()
 		return
+	}
+
+	// Confirmation gate: after VAD fires speech end, wait a short window
+	// for the user to resume speaking. If they do, cancel the pending
+	// response and continue listening. This prevents "phantom interrupts"
+	// where a brief pause between sentences triggers the bot.
+	confirmMs := ms.orch.config.SilenceConfirmationMs
+	if confirmMs > 0 {
+		gate := make(chan struct{})
+		ms.mu.Lock()
+		ms.confirmationGate = gate
+		ms.mu.Unlock()
+
+		timer := time.NewTimer(time.Duration(confirmMs) * time.Millisecond)
+		defer timer.Stop()
+
+		// Block until either: (a) gate closed (new audio = user resumed),
+		// (b) timer expires (user truly done), or (c) context cancelled.
+		select {
+		case <-gate:
+			// New audio arrived during confirmation window — user resumed.
+			ms.logger.Info("Confirmation gate: user resumed after speech end",
+				"confirmMs", confirmMs)
+			ms.mu.Lock()
+			ms.confirmationGate = nil
+			ms.mu.Unlock()
+			ms.resolvePendingBargeIn()
+			return
+		case <-timer.C:
+			// Timer expired — user is done, proceed with processing.
+		case <-ms.ctx.Done():
+			ms.mu.Lock()
+			ms.confirmationGate = nil
+			ms.mu.Unlock()
+			return
+		}
+
+		ms.mu.Lock()
+		ms.confirmationGate = nil
+		ms.mu.Unlock()
 	}
 
 	ms.mu.Lock()
