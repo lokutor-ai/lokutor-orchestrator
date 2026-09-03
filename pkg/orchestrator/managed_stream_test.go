@@ -239,5 +239,98 @@ func TestManagedStream_NoSelfInterruptDuringTTS(t *testing.T) {
 }
 
 func TestManagedStream_EchoSuppression(t *testing.T) {
-	t.Skip("Echo suppression requires full integration test with audio pipeline")
+	stt := &MockSTTProvider{transcribeResult: "let me check that for you"}
+	llm := &MockLLMProvider{completeResult: "ok"}
+	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
+	vad := NewRMSVAD(0.05, 50*time.Millisecond)
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithVAD(stt, llm, tts, vad, cfg)
+	session := NewConversationSession("echo-test")
+
+	stream := orch.NewManagedStream(context.Background(), session)
+	defer stream.Close()
+
+	// Simulate a tentative barge-in fired while the bot is mid-sentence, and
+	// the mic picking up the bot's own audio (no AEC on the telephony path).
+	stream.mu.Lock()
+	stream.state = StateSpeaking
+	stream.lastResponseText = "let me check that for you"
+	stream.pendingBargeIn = true
+	stream.pendingBargeGen = stream.payloadGen
+	stream.mu.Unlock()
+
+	stream.processUtterance([]byte{0, 0, 0, 0}, 1*time.Second, 0)
+
+	select {
+	case ev := <-stream.Events():
+		if ev.Type == Interrupted {
+			t.Fatal("an echo of the bot's own speech should not confirm a real interrupt")
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	stream.mu.Lock()
+	pending := stream.pendingBargeIn
+	stream.mu.Unlock()
+	if pending {
+		t.Fatal("expected the pending barge-in to resolve (resume) rather than stay dangling")
+	}
+}
+
+func TestManagedStream_RealBargeInStillInterruptsDespitePendingGate(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "actually stop wait no"}
+	llm := &MockLLMProvider{completeResult: "ok"}
+	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
+	vad := NewRMSVAD(0.05, 50*time.Millisecond)
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithVAD(stt, llm, tts, vad, cfg)
+	session := NewConversationSession("real-interrupt-test")
+
+	stream := orch.NewManagedStream(context.Background(), session)
+	defer stream.Close()
+
+	stream.mu.Lock()
+	stream.state = StateSpeaking
+	stream.lastResponseText = "let me check that for you"
+	stream.pendingBargeIn = true
+	stream.pendingBargeGen = stream.payloadGen
+	stream.mu.Unlock()
+
+	stream.processUtterance([]byte{0, 0, 0, 0}, 1*time.Second, 0)
+
+	select {
+	case ev := <-stream.Events():
+		if ev.Type != Interrupted {
+			t.Fatalf("expected Interrupted event for genuine barge-in, got %v", ev.Type)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for Interrupted event")
+	}
+}
+
+func TestIsLikelyEcho(t *testing.T) {
+	tests := []struct {
+		name              string
+		transcript        string
+		currentlySpeaking string
+		want              bool
+	}{
+		{"exact echo", "let me check that for you", "let me check that for you", true},
+		{"partial echo substring", "check that for you", "let me check that for you", true},
+		{"echo with punctuation/case noise", "Let Me Check That, For You!", "let me check that for you", true},
+		{"echo with a couple STT slips", "let me check that four you", "let me check that for you", true},
+		{"unrelated real interruption", "actually stop wait no", "let me check that for you", false},
+		{"empty currently speaking", "hello there", "", false},
+		{"empty transcript", "", "let me check that for you", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isLikelyEcho(tc.transcript, tc.currentlySpeaking)
+			if got != tc.want {
+				t.Errorf("isLikelyEcho(%q, %q) = %v, want %v", tc.transcript, tc.currentlySpeaking, got, tc.want)
+			}
+		})
+	}
 }

@@ -13,24 +13,32 @@ import (
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
 
-type GroqLLM struct {
+// CerebrasLLM talks to Cerebras Inference's OpenAI-compatible chat completions
+// API (https://inference-docs.cerebras.ai). Cerebras runs on wafer-scale
+// hardware specifically built for fast token generation — usually the
+// fastest of the "fast inference" providers (Groq/Cerebras/SambaNova) — and
+// its paid tier is plain usage-based billing with no manual tier-upgrade
+// approval step, unlike Groq's Developer tier which gates on demand.
+type CerebrasLLM struct {
 	apiKey string
 	url    string
 	model  string
 }
 
-func NewGroqLLM(apiKey string, model string) *GroqLLM {
+func NewCerebrasLLM(apiKey string, model string) *CerebrasLLM {
 	if model == "" {
-		model = "meta-llama/llama-4-scout-17b-16e-instruct"
+		model = "gpt-oss-120b"
 	}
-	return &GroqLLM{
+	return &CerebrasLLM{
 		apiKey: apiKey,
-		url:    "https://api.groq.com/openai/v1/chat/completions",
+		url:    "https://api.cerebras.ai/v1/chat/completions",
 		model:  model,
 	}
 }
 
-func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
+func (l *CerebrasLLM) Name() string { return "cerebras-llm" }
+
+func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
 		"messages": messages,
@@ -49,7 +57,6 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 	if err != nil {
 		return "", err
 	}
-
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
@@ -62,7 +69,7 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 	if resp.StatusCode != http.StatusOK {
 		var errResp interface{}
 		json.NewDecoder(resp.Body).Decode(&errResp)
-		return "", fmt.Errorf("groq api error (status %d): %v", resp.StatusCode, errResp)
+		return "", fmt.Errorf("cerebras api error (status %d): %v", resp.StatusCode, errResp)
 	}
 
 	var result struct {
@@ -75,15 +82,13 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
-
 	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("no response from groq")
+		return "", fmt.Errorf("no response from cerebras")
 	}
-
 	return result.Choices[0].Message.Content, nil
 }
 
-func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
+func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
 		"messages": messages,
@@ -103,7 +108,6 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 	if err != nil {
 		return "", err
 	}
-
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
@@ -116,7 +120,7 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 	if resp.StatusCode != http.StatusOK {
 		var errResp interface{}
 		json.NewDecoder(resp.Body).Decode(&errResp)
-		return "", fmt.Errorf("groq api error (status %d): %v", resp.StatusCode, errResp)
+		return "", fmt.Errorf("cerebras api error (status %d): %v", resp.StatusCode, errResp)
 	}
 
 	reader := bufio.NewReader(resp.Body)
@@ -167,7 +171,6 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
-
 		if len(chunk.Choices) == 0 {
 			continue
 		}
@@ -200,31 +203,24 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 		}
 	}
 
-	// Emit tool calls if any - iterating safely over max observed index
 	maxIdx := -1
 	for idx := range toolCalls {
 		if idx > maxIdx {
 			maxIdx = idx
 		}
 	}
-
 	for i := 0; i <= maxIdx; i++ {
 		state, ok := toolCalls[i]
 		if ok && state != nil && onToolCall != nil {
-			err := onToolCall(orchestrator.ToolCallEventData{
+			if err := onToolCall(orchestrator.ToolCallEventData{
 				Name:      state.name,
 				Arguments: state.arguments.String(),
 				CallID:    state.id,
-			})
-			if err != nil {
+			}); err != nil {
 				return "", err
 			}
 		}
 	}
 
 	return fullContent.String(), nil
-}
-
-func (l *GroqLLM) Name() string {
-	return "groq-llm"
 }

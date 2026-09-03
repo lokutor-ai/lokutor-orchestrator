@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/vela"
@@ -903,6 +904,24 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			ms.resolvePendingBargeIn()
 			return
 		}
+		// Echo check: there's no acoustic echo cancellation between what the
+		// bot is currently speaking and what the mic picks up beyond
+		// whatever the client provides — real on browser (WebRTC AEC), but
+		// nonexistent for telephony (Telnyx/Twilio), where there's no
+		// client-side AEC at all. Without this, the bot's own voice bleeding
+		// into the mic gets transcribed, treated as a real barge-in, cuts
+		// itself off mid-sentence, and the next turn can trigger the same
+		// thing again — a self-interruption loop that looks like the bot
+		// restarting/repeating itself over and over.
+		ms.mu.Lock()
+		currentlySpeaking := ms.lastResponseText
+		ms.mu.Unlock()
+		if isLikelyEcho(transcript, currentlySpeaking) {
+			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
+				"transcript", transcript)
+			ms.resolvePendingBargeIn()
+			return
+		}
 	}
 	// Real, sufficient speech — commit to the interrupt now (cancels the old
 	// pipeline, truncates spoken-truth context, emits Interrupted). No-op if
@@ -1026,15 +1045,19 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// (adds filler words, inserts "...", changes pacing) which causes the TTS
 	// model to skip or repeat words. Raw LLM text goes directly to TTS.
 
-	// Post-interrupt backoff: if the user just barged in, wait ~1s before
+	// Post-interrupt backoff: if the user just barged in, wait a bit before
 	// speaking so we don't talk over them (Vapi backoffSeconds pattern).
+	// Measured from the interrupt itself, not from now — the STT+LLM work
+	// already done to get here usually covers most or all of this window,
+	// so this rarely adds its configured value in full on top.
+	backoff := ms.orch.config.PostInterruptBackoff
 	ms.mu.Lock()
 	sinceInterrupt := time.Since(ms.interruptedAt)
 	ms.mu.Unlock()
-	if sinceInterrupt > 0 && sinceInterrupt < 1*time.Second {
+	if backoff > 0 && sinceInterrupt > 0 && sinceInterrupt < backoff {
 		ms.logger.Info("Post-interrupt backoff: delaying speech",
-			"since_interrupt_ms", sinceInterrupt.Milliseconds())
-		time.Sleep(1*time.Second - sinceInterrupt)
+			"since_interrupt_ms", sinceInterrupt.Milliseconds(), "backoff_ms", backoff.Milliseconds())
+		time.Sleep(backoff - sinceInterrupt)
 	}
 
 	if ms.userProfile.HasBaseline() {
@@ -1050,6 +1073,12 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	ms.botSpeakStart = time.Now()
 	ms.ttsStartTime = ms.botSpeakStart
 	ms.state = StateSpeaking
+	// Tracks whatever's actively coming out of the speaker right now — used
+	// to detect a barge-in that's actually an echo of the bot's own voice
+	// (see isLikelyEcho in processUtterance). In the streaming path this is
+	// the current sentence, not the full multi-sentence response, since
+	// that's what's actually audible at any given moment.
+	ms.lastResponseText = text
 	ms.mu.Unlock()
 
 	ms.emitWithGen(BotSpeaking, nil, gen)
@@ -1359,6 +1388,54 @@ func countWords(s string) int {
 		return 0
 	}
 	return len(strings.Fields(s))
+}
+
+// isLikelyEcho reports whether transcript looks like the mic picked up the
+// bot's own currently-speaking text rather than the caller actually talking
+// over it. There's no acoustic echo cancellation on telephony calls (Telnyx/
+// Twilio), and the browser path only gets whatever the client's WebRTC AEC
+// manages, so the bot's voice bleeding back into the mic is a real and
+// common source of false barge-ins — confirming one cuts the bot off
+// mid-sentence, which is what shows up in production as the bot restarting
+// or re-saying the same sentence over and over.
+func isLikelyEcho(transcript, currentlySpeaking string) bool {
+	t := normalizeForEchoCompare(transcript)
+	s := normalizeForEchoCompare(currentlySpeaking)
+	if t == "" || s == "" {
+		return false
+	}
+	if strings.Contains(s, t) {
+		return true
+	}
+	// STT on a bleed-through echo is often imperfect (clipped audio, mixed
+	// with room noise), so also accept near-total word overlap rather than
+	// requiring an exact substring match.
+	tWords := strings.Fields(t)
+	if len(tWords) == 0 {
+		return false
+	}
+	sWords := make(map[string]bool, len(tWords))
+	for _, w := range strings.Fields(s) {
+		sWords[w] = true
+	}
+	matched := 0
+	for _, w := range tWords {
+		if sWords[w] {
+			matched++
+		}
+	}
+	return float64(matched)/float64(len(tWords)) >= 0.8
+}
+
+func normalizeForEchoCompare(s string) string {
+	s = strings.ToLower(s)
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsSpace(r) {
+			b.WriteRune(r)
+		}
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
 }
 
 type rmsProvider interface {

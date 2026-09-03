@@ -121,6 +121,16 @@ func (o *Orchestrator) SetRAGProvider(rag RAGProvider) {
 	o.rag = rag
 }
 
+// SetLLMProvider overrides the LLM provider used for this orchestrator's
+// turns — used for per-agent bring-your-own-key configurations, where a
+// specific agent's calls should use a customer-supplied LLM account instead
+// of the platform's default provider chain.
+func (o *Orchestrator) SetLLMProvider(llm LLMProvider) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.llm = llm
+}
+
 // GetToolHandlers returns a snapshot of the registered server-side tool handlers.
 func (o *Orchestrator) GetToolHandlers() map[string]ToolHandler {
 	o.mu.Lock()

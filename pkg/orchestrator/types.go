@@ -205,6 +205,16 @@ type Config struct {
 	FirstSpeaker             FirstSpeaker
 	SilenceTimeout           time.Duration
 
+	// PostInterruptBackoff: after a confirmed barge-in, wait this long from
+	// the interrupt (not from when the response is ready) before the bot's
+	// next reply starts speaking — avoids immediately talking back over a
+	// user who paused mid-thought (Vapi backoffSeconds pattern). By the time
+	// a reply is ready to speak, STT+LLM processing has usually already
+	// eaten a few hundred ms of this window, so it rarely adds its full
+	// value on top — but keep it short: it's dead air on every single
+	// barge-in, not just edge cases.
+	PostInterruptBackoff time.Duration
+
 	// Client-side VAD: server accepts vad_speech_start/end control frames
 	ClientVAD bool
 
@@ -274,6 +284,10 @@ func DefaultConfig() Config {
 		// user again instead of leaving the call silent indefinitely. Previously
 		// left at 0 (disabled) except where Telnyx explicitly overrode it.
 		SilenceTimeout: 10 * time.Second,
+		// Was a hardcoded, unconditional 1s sleep before every post-interrupt
+		// reply — halved here since it stacks on top of whatever STT+LLM
+		// processing time has already elapsed since the interrupt.
+		PostInterruptBackoff: 500 * time.Millisecond,
 
 		ClientVAD:             false,
 		TokenLevelTTS:         true,
