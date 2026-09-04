@@ -93,7 +93,8 @@ type ManagedStream struct {
 	userSpeechEnd     time.Time
 	lastUserText      string
 
-	vadSpeaking bool
+	vadSpeaking   bool
+	vadDiagChunks int
 
 	pipelineCancel context.CancelFunc
 	ttsCancel      context.CancelFunc
@@ -401,7 +402,21 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 	event, err := ms.vad.Process(chunk)
 	if err != nil {
+		ms.logger.Warn("VAD process error", "error", err)
 		return
+	}
+
+	// Diagnostic: log the raw probability periodically even when no event
+	// fires, so a call with zero VADSpeechStart events is distinguishable
+	// between "genuinely near-zero probability the whole call" (garbled/
+	// wrong-codec audio) and "probability crossed threshold briefly but
+	// never sustained minSpeechFrames" — the silent VADProvider interface
+	// otherwise gives no visibility into that difference.
+	ms.vadDiagChunks++
+	if ms.vadDiagChunks%50 == 0 {
+		if p, ok := ms.vad.(interface{ LastProbability() float64 }); ok {
+			ms.logger.Info("VAD diag", "lastProbability", p.LastProbability(), "chunks", ms.vadDiagChunks)
+		}
 	}
 
 	isSpeaking := ms.vad.IsSpeaking()
