@@ -1072,6 +1072,13 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 
 	ms.emitWithGen(BotThinking, nil, gen)
 	ms.llmStartTime = time.Now()
+	// runStreamingLLM below only sets llmEndTime the first time it's zero
+	// (capturing first-token arrival, not stream completion) — but that
+	// guard never gets reset between turns, so from the second turn of a
+	// call onward it kept the very first turn's value forever, making
+	// every later llmEndTime - llmStartTime go strongly negative. Reset it
+	// here so each turn's "first token" gets captured fresh.
+	ms.llmEndTime = time.Time{}
 
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
 		ms.runStreamingLLM(rCtx, sProvider, gen, transcript)
