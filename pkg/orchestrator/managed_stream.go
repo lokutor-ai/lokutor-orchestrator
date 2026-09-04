@@ -854,46 +854,19 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 		return
 	}
 
-	// Confirmation gate: after VAD fires speech end, wait a short window
-	// for the user to resume speaking. If they do, cancel the pending
-	// response and continue listening. This prevents "phantom interrupts"
-	// where a brief pause between sentences triggers the bot.
-	confirmMs := ms.orch.config.SilenceConfirmationMs
-	if confirmMs > 0 {
-		gate := make(chan struct{})
-		ms.mu.Lock()
-		ms.confirmationGate = gate
-		ms.mu.Unlock()
-
-		timer := time.NewTimer(time.Duration(confirmMs) * time.Millisecond)
-		defer timer.Stop()
-
-		// Block until either: (a) gate closed (new audio = user resumed),
-		// (b) timer expires (user truly done), or (c) context cancelled.
-		select {
-		case <-gate:
-			// New audio arrived during confirmation window — user resumed.
-			ms.logger.Info("Confirmation gate: user resumed after speech end",
-				"confirmMs", confirmMs)
-			ms.mu.Lock()
-			ms.confirmationGate = nil
-			ms.mu.Unlock()
-			ms.resolvePendingBargeIn()
-			return
-		case <-timer.C:
-			// Timer expired — user is done, proceed with processing.
-		case <-ms.ctx.Done():
-			ms.mu.Lock()
-			ms.confirmationGate = nil
-			ms.mu.Unlock()
-			return
-		}
-
-		ms.mu.Lock()
-		ms.confirmationGate = nil
-		ms.mu.Unlock()
-	}
-
+	// STT+LLM+TTS generation starts immediately — no blocking wait here.
+	// "Did the user actually finish talking" is rechecked once, late, right
+	// before speakText plays anything (see the vadSpeaking check there):
+	// generation itself already takes hundreds of ms to a couple seconds in
+	// practice, which is what a fixed pre-generation wait was mostly there
+	// to cover, so by the time audio is ready to play we usually already
+	// know whether the user resumed. A phantom interrupt (brief pause
+	// between sentences) now costs a wasted STT+LLM call instead of wasted
+	// wall-clock time on every single turn — worth it for how much this
+	// used to add to every response's latency (see SILENCE_CONFIRMATION_MS
+	// change tonight). ms.confirmationGate/closeConfirmationGateIfOpen are
+	// now unused (nothing sets the gate non-nil anymore) — left in place
+	// rather than ripped out mid-incident.
 	ms.mu.Lock()
 	ms.utteranceSeq++
 	seq := ms.utteranceSeq
@@ -1142,6 +1115,24 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
+	// Late recheck: STT+LLM+TTS generation for this response ran without
+	// waiting on anything (see onVADEnd) — this is the one point where we
+	// actually confirm the user is done talking, right before committing to
+	// speak. Catches both a phantom interrupt (brief pause mid-sentence,
+	// generation finished fast) and the multi-sentence streaming case
+	// (skips queuing the next sentence once the user starts talking again),
+	// since every speakText call — including each streamed sentence — goes
+	// through here.
+	if ms.IsVADSpeaking() {
+		ms.logger.Info("speakText: user resumed talking before this response was ready, skipping", "gen", gen)
+		ms.mu.Lock()
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
+		ms.mu.Unlock()
+		return
+	}
+
 	// Prosody processor: disabled — it modifies text in unpredictable ways
 	// (adds filler words, inserts "...", changes pacing) which causes the TTS
 	// model to skip or repeat words. Raw LLM text goes directly to TTS.
