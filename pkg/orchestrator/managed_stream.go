@@ -763,9 +763,21 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.userSpeechEnd = time.Now()
 	ms.emit(UserStopped, nil)
 
-	// Finalize streaming STT session
-	if ms.sttStarted && ms.sttResultChan != nil {
-		close(ms.sttResultChan)
+	// Finalize streaming STT session. Closing sttAudioChan is what lets
+	// StreamTranscribe's goroutine leave its `case data, ok := <-audioChan`
+	// loop via the `!ok` branch and free its whisper stream (kv-cache +
+	// compute buffers) — previously only sttResultChan was closed here, so
+	// every single utterance leaked its streaming STT goroutine and whisper
+	// state until the whole call ended (ctx.Done()), compounding CPU/memory
+	// use across a call's utterances with no matching real workload.
+	if ms.sttStarted {
+		if ms.sttResultChan != nil {
+			close(ms.sttResultChan)
+		}
+		if ms.sttAudioChan != nil {
+			close(ms.sttAudioChan)
+			ms.sttAudioChan = nil
+		}
 		ms.sttStarted = false
 	}
 
@@ -836,6 +848,8 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	if duration < minDur || len(audioData) < minLen {
 		// Too brief to even bother with STT — if this cut off a tentative
 		// barge-in, resume the bot rather than leaving it silent.
+		ms.logger.Info("onVADEnd: utterance too brief, skipping processUtterance",
+			"duration_ms", duration.Milliseconds(), "audioBytes", len(audioData), "minDur_ms", minDur.Milliseconds(), "minLen", minLen)
 		ms.resolvePendingBargeIn()
 		return
 	}
@@ -890,6 +904,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 }
 
 func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Duration, seq int) {
+	ms.logger.Info("processUtterance: entered", "seq", seq, "duration_ms", duration.Milliseconds(), "audioBytes", len(audioData))
 	defer func() {
 		if r := recover(); r != nil {
 			ms.logger.Error("processUtterance: recovered panic", "panic", r)
