@@ -1115,24 +1115,6 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
-	// Late recheck: STT+LLM+TTS generation for this response ran without
-	// waiting on anything (see onVADEnd) — this is the one point where we
-	// actually confirm the user is done talking, right before committing to
-	// speak. Catches both a phantom interrupt (brief pause mid-sentence,
-	// generation finished fast) and the multi-sentence streaming case
-	// (skips queuing the next sentence once the user starts talking again),
-	// since every speakText call — including each streamed sentence — goes
-	// through here.
-	if ms.IsVADSpeaking() {
-		ms.logger.Info("speakText: user resumed talking before this response was ready, skipping", "gen", gen)
-		ms.mu.Lock()
-		if ms.state != StateInterrupted {
-			ms.state = StateIdle
-		}
-		ms.mu.Unlock()
-		return
-	}
-
 	// Prosody processor: disabled — it modifies text in unpredictable ways
 	// (adds filler words, inserts "...", changes pacing) which causes the TTS
 	// model to skip or repeat words. Raw LLM text goes directly to TTS.
