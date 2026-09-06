@@ -281,9 +281,9 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
 		go func() {
 			time.Sleep(600 * time.Millisecond)
-			greeting := "Hello!"
+			greeting := "Hello! Thank you for answering. This is an automated assistant — how can I help you today?"
 			if o.config.Language == LanguageEs {
-				greeting = "¡Hola!"
+				greeting = "¡Hola! Gracias por atender. Soy un asistente automatizado, ¿en qué puedo ayudarte hoy?"
 			}
 			ms.session.AddMessage("assistant", greeting)
 			ms.runLLMAndTTS(ms.ctx, greeting)

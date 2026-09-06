@@ -290,9 +290,9 @@ func DefaultConfig() Config {
 		// left at 0 (disabled) except where Telnyx explicitly overrode it.
 		SilenceTimeout: 10 * time.Second,
 		// Was a hardcoded, unconditional 1s sleep before every post-interrupt
-		// reply — halved here since it stacks on top of whatever STT+LLM
-		// processing time has already elapsed since the interrupt.
-		PostInterruptBackoff: 500 * time.Millisecond,
+		// reply — reduced to 100ms since echo suppressor now handles false
+		// interrupts at the Telnyx inbound layer.
+		PostInterruptBackoff: 100 * time.Millisecond,
 
 		// SilenceConfirmationMs: after VAD detects speech end, wait this long
 		// for the user to resume speaking before triggering the LLM pipeline.

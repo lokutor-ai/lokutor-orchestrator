@@ -60,7 +60,7 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -111,7 +111,7 @@ func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrato
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}
