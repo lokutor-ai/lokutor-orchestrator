@@ -205,6 +205,13 @@ type Config struct {
 	FirstSpeaker             FirstSpeaker
 	SilenceTimeout           time.Duration
 
+	// SkipBotGreeting: when true and FirstSpeaker is Bot, skip the
+	// hardcoded "Hello!"/"¡Hola!" greeting. The bot still speaks first
+	// but the LLM generates a natural greeting from the system prompt
+	// instead of using a canned message. Used for outbound calls where
+	// the agent should introduce itself naturally.
+	SkipBotGreeting bool
+
 	// PostInterruptBackoff: after a confirmed barge-in, wait this long from
 	// the interrupt (not from when the response is ready) before the bot's
 	// next reply starts speaking — avoids immediately talking back over a

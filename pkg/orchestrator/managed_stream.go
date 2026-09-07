@@ -279,15 +279,25 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 	}
 
 	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
-		go func() {
-			time.Sleep(600 * time.Millisecond)
-			greeting := "Hello! Thank you for answering. This is an automated assistant — how can I help you today?"
-			if o.config.Language == LanguageEs {
-				greeting = "¡Hola! Gracias por atender. Soy un asistente automatizado, ¿en qué puedo ayudarte hoy?"
-			}
-			ms.session.AddMessage("assistant", greeting)
-			ms.runLLMAndTTS(ms.ctx, greeting)
-		}()
+		if o.config.SkipBotGreeting {
+			// Outbound call: let the LLM generate a natural greeting from
+			// the system prompt instead of using a canned "Hello!".
+			go func() {
+				time.Sleep(400 * time.Millisecond)
+				ms.session.AddMessage("user", "The call has been answered. Introduce yourself and greet the person.")
+				ms.runLLMAndTTS(ms.ctx, "")
+			}()
+		} else {
+			go func() {
+				time.Sleep(600 * time.Millisecond)
+				greeting := "Hello!"
+				if o.config.Language == LanguageEs {
+					greeting = "¡Hola!"
+				}
+				ms.session.AddMessage("assistant", greeting)
+				ms.runLLMAndTTS(ms.ctx, greeting)
+			}()
+		}
 	}
 
 	return ms
