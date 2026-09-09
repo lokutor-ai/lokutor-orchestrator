@@ -262,13 +262,27 @@ type Config struct {
 	LLMRegion string
 	TTSRegion string
 
-	// Vela turn detection: ONNX model path for neural turn detection
-	VelaModelPath string
+	// GateTurn: ONNX model path for the dual-channel (near+far) barge-in
+	// classifier. Runs alongside VAD — it does not replace turn-state
+	// detection (its own benchmark shows that head loses to a naive
+	// baseline), only the barge-in discrimination during a tentative
+	// barge-in. On by default (see DefaultConfig); set to "" to disable.
+	GateTurnModelPath string
 
-	// Vela thresholds for turn detection decisions
-	VelaFloorYieldThreshold   float32 // floor_yield threshold to consider user done (default 0.5)
-	VelaContinuationThreshold float32 // continuation threshold below which user is likely done (default 0.4)
-	VelaInterruptThreshold    float32 // interruption_safety threshold to allow barge-in (default 0.6)
+	// GateTurnBargeinConfirmThreshold: once a tentative barge-in is open
+	// (raw VAD already suppressed bot audio), a GateTurn bargein score
+	// at or above this commits to the interrupt immediately instead of
+	// waiting for STT confirmation — the model's validated duplex
+	// differential gate makes that call from audio alone in the same 20ms
+	// frame (see turn-taking/README.md's bargein head benchmark: precision
+	// 0.976 at this kind of threshold).
+	GateTurnBargeinConfirmThreshold float32
+
+	// GateTurnBargeinResolveThreshold: symmetric to Confirm — a bargein
+	// score at or below this, sustained for a few frames, resolves the
+	// tentative barge-in as a backchannel ("mhm") and resumes bot playback
+	// without waiting for STT to (correctly, but slowly) conclude the same.
+	GateTurnBargeinResolveThreshold float32
 
 	// VoiceUXInstructions are appended to the system prompt to instruct the LLM
 	// how to format speech for a real-time voice interface. Override for custom behavior.
@@ -321,11 +335,12 @@ func DefaultConfig() Config {
 		LLMRegion:             "",
 		TTSRegion:             "",
 
-		VelaModelPath:             "assets/onnx/vela/model.onnx",
-		VelaFloorYieldThreshold:   0.5,
-		VelaContinuationThreshold: 0.4,
-		VelaInterruptThreshold:    0.6,
-		VoiceUXInstructions:       "",
+		// On by default — see GateTurnModelPath's doc comment. Set to "" to
+		// disable (e.g. if the model asset genuinely isn't present).
+		GateTurnModelPath:               "assets/onnx/gateturn/model.onnx",
+		GateTurnBargeinConfirmThreshold: 0.85,
+		GateTurnBargeinResolveThreshold: 0.15,
+		VoiceUXInstructions:             "",
 	}
 }
 

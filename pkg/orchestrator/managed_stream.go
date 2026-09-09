@@ -12,8 +12,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/lokutor-ai/lokutor-orchestrator/pkg/gateturn"
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
-	"github.com/lokutor-ai/lokutor-orchestrator/pkg/vela"
 )
 
 // byteBufPool recycles byte slices to reduce GC pressure in the audio hot path.
@@ -60,10 +60,19 @@ type ManagedStream struct {
 	events  chan OrchestratorEvent
 	vad     VADProvider
 
-	// Vela turn detection model (replaces VAD-based turn detection)
-	vela               *vela.Detector
-	velaSilenceStart   time.Time // Tracks silence start after speech end
-	velaPeakFloorYield float32   // Peak floor_yield during current speech period
+	// GateTurn dual-channel barge-in classifier: additive, not a replacement
+	// for VAD above. Only acts while a tentative barge-in is open
+	// (ms.pendingBargeIn), using near (user mic) + far (bot TTS loopback)
+	// audio to confirm or dismiss it faster than waiting for STT. nil when
+	// GateTurnModelPath isn't configured.
+	gateturn            *gateturn.Runtime
+	gtBargeinConfirmThr float32
+	gtBargeinResolveThr float32
+	gtNearAccum         []byte // <320-sample leftover near-channel bytes, 16kHz PCM16
+	gtConfirmRun        int    // consecutive frames at/above the confirm threshold
+	gtResolveRun        int    // consecutive frames at/below the resolve threshold
+	farEndBuf           []byte // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
+	farEndMu            sync.Mutex
 
 	cmdChan       chan []byte
 	interruptChan chan struct{}
@@ -240,18 +249,23 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		clientToolResults:  make(map[string]chan string),
 	}
 
-	// Initialize Vela turn detection model if path is configured
-	if cfg.VelaModelPath != "" {
-		if _, err := os.Stat(cfg.VelaModelPath); err == nil {
-			v, err := vela.NewDetector(cfg.VelaModelPath)
+	// Initialize GateTurn's duplex barge-in classifier if configured. This
+	// is additive: it only ever fast-tracks a decision VAD's own logic and
+	// the STT-confirmation path would otherwise have reached anyway, so a
+	// load failure just leaves that fast path disabled (logged, not fatal).
+	if cfg.GateTurnModelPath != "" {
+		if _, err := os.Stat(cfg.GateTurnModelPath); err == nil {
+			g, err := gateturn.NewRuntime(cfg.GateTurnModelPath)
 			if err != nil {
-				logger.Warn("failed to load Vela model, falling back to VAD", "error", err)
+				logger.Warn("failed to load GateTurn model, barge-in fast-path disabled", "error", err)
 			} else {
-				ms.vela = v
-				logger.Info("Vela turn detection loaded", "model", cfg.VelaModelPath)
+				ms.gateturn = g
+				ms.gtBargeinConfirmThr = cfg.GateTurnBargeinConfirmThreshold
+				ms.gtBargeinResolveThr = cfg.GateTurnBargeinResolveThreshold
+				logger.Info("GateTurn barge-in classifier loaded", "model", cfg.GateTurnModelPath)
 			}
 		} else {
-			logger.Warn("Vela model file not found, falling back to VAD", "path", cfg.VelaModelPath)
+			logger.Warn("GateTurn model file not found, barge-in fast-path disabled", "path", cfg.GateTurnModelPath)
 		}
 	}
 
@@ -343,7 +357,7 @@ func (ms *ManagedStream) audioProcessor() {
 // arrived" — silence-period packets flow continuously over the media stream
 // too) during the post-speech-end window. This tells onVADEnd the user
 // resumed and the pending response should be cancelled. Must only be called
-// once a chunk has been VAD/Vela-confirmed as speech, never unconditionally
+// once a chunk has been VAD-confirmed as speech, never unconditionally
 // on every incoming chunk — doing so made the gate close on essentially the
 // very next packet regardless of silence, defeating the whole point of the
 // confirmation window (see the commit that introduced this gate).
@@ -399,13 +413,6 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		return
 	}
 
-	// Vela turn detection mode: use neural model instead of VAD
-	if ms.vela != nil {
-		ms.handleAudioVela(chunk, state)
-		return
-	}
-
-	// Legacy VAD mode
 	if ms.vad == nil {
 		return
 	}
@@ -431,6 +438,14 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 	isSpeaking := ms.vad.IsSpeaking()
 	ms.vadSpeaking = isSpeaking
+
+	if ms.gateturn != nil {
+		audioChunk16k := chunk
+		if ms.inputSampleRate != 16000 {
+			audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
+		}
+		ms.feedGateTurnBargein(audioChunk16k)
+	}
 
 	if event != nil && (event.Type == VADSpeechStart || event.Type == VADSpeechEnd || event.Type == VADSpeechPotential) {
 		ms.logger.Info("VAD event",
@@ -467,119 +482,6 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		ms.onVADStart(state)
 	case event != nil && event.Type == VADSpeechEnd:
 		ms.onVADEnd(state)
-	}
-
-	if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
-		samples := make([]int16, len(chunk)/2)
-		for i := range samples {
-			samples[i] = int16(chunk[i*2]) | int16(chunk[i*2+1])<<8
-		}
-		ms.backch.ProcessAudio(samples, time.Now())
-	}
-
-	if isSpeaking {
-		ms.updateActivity()
-	}
-}
-
-// handleAudioVela processes audio using the Vela neural turn detection model.
-func (ms *ManagedStream) handleAudioVela(chunk []byte, prevState StreamState) {
-	audioChunk := chunk
-	if ms.inputSampleRate != 16000 {
-		audioChunk = resampleTo16k(chunk, ms.inputSampleRate)
-	}
-
-	event, err := ms.vela.Process(audioChunk)
-	if err != nil {
-		ms.logger.Warn("Vela processing error", "error", err)
-		return
-	}
-
-	wasSpeaking := ms.vadSpeaking
-	isSpeaking := ms.vela.IsSpeaking()
-	ms.vadSpeaking = isSpeaking
-
-	cfg := ms.orch.GetConfig()
-
-	// Track peak floor_yield during speech period
-	if isSpeaking && event.FloorYield > ms.velaPeakFloorYield {
-		ms.velaPeakFloorYield = event.FloorYield
-	}
-
-	if isSpeaking {
-		ms.closeConfirmationGateIfOpen()
-		ms.userAudio = append(ms.userAudio, chunk...)
-		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
-
-		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
-			speechDuration := time.Since(ms.userSpeakingSince)
-			if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
-				ms.lastSpecAt = time.Now()
-				audioCopy := make([]byte, len(ms.speechAudioBuf))
-				copy(audioCopy, ms.speechAudioBuf)
-				ms.speculator.Start(ms.ctx, ms.orch, audioCopy, ms.session.GetCurrentLanguage())
-			}
-		}
-	}
-
-	// Speech start detection
-	if isSpeaking && !wasSpeaking {
-		ms.velaPeakFloorYield = 0
-		if prevState != StateListening && prevState != StateProcessing {
-			ms.onVADStart(prevState)
-		}
-	}
-
-	// Neural turn end: when VAD drops to silence, check if model detected yield intent
-	if wasSpeaking && !isSpeaking && ms.velaPeakFloorYield > 0.5 {
-		ms.logger.Info("Vela: neural turn completion", "peak_floor_yield", ms.velaPeakFloorYield)
-		ms.onVADEnd(prevState)
-		ms.velaPeakFloorYield = 0
-		ms.velaSilenceStart = time.Time{}
-		return
-	}
-
-	// Fallback: silence timer only if model didn't produce a yield signal
-	if wasSpeaking && !isSpeaking {
-		ms.velaSilenceStart = time.Now()
-	}
-
-	if ms.velaSilenceStart != (time.Time{}) && !isSpeaking {
-		// Fallback silence threshold: 75ms when Vela neural model didn't detect yield.
-		// This is a fast fallback for cases where floor_yield < 0.5. Can be tuned via env var.
-		fallbackThreshold := 75 * time.Millisecond
-		if envThreshold := os.Getenv("VELA_FALLBACK_SILENCE_MS"); envThreshold != "" {
-			if ms, err := strconv.Atoi(envThreshold); err == nil && ms > 0 {
-				fallbackThreshold = time.Duration(ms) * time.Millisecond
-			}
-		}
-		if time.Since(ms.velaSilenceStart) >= fallbackThreshold {
-			if prevState == StateListening || prevState == StateProcessing {
-				ms.onVADEnd(prevState)
-				ms.velaSilenceStart = time.Time{}
-				return
-			}
-		}
-	}
-
-	if isSpeaking {
-		ms.velaSilenceStart = time.Time{}
-	}
-
-	if event.InterruptionSafety > cfg.VelaInterruptThreshold && isSpeaking {
-		if prevState == StateSpeaking || prevState == StateProcessing {
-			// Same tentative-mute pattern as onVADStart: suppress audio via
-			// state immediately, defer the destructive cancel to onVADEnd's
-			// confirmation so a false-positive neural trigger can resume
-			// instead of leaving the caller with dead air.
-			ms.mu.Lock()
-			ms.state = StateListening
-			ms.pendingBargeIn = true
-			ms.pendingBargeGen = ms.payloadGen
-			ms.mu.Unlock()
-			ms.emit(UserSpeaking, nil)
-			return
-		}
 	}
 
 	if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
@@ -1256,6 +1158,13 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 }
 
 func (ms *ManagedStream) emitFrames(data []byte, frameSize, gen int) {
+	if ms.gateturn != nil {
+		farChunk16k := data
+		if ms.playbackRate != 16000 {
+			farChunk16k = resampleTo16k(data, ms.playbackRate)
+		}
+		ms.noteFarEndAudio(farChunk16k)
+	}
 	for i := 0; i < len(data); i += frameSize {
 		end := i + frameSize
 		if end > len(data) {
@@ -1654,9 +1563,9 @@ func (ms *ManagedStream) Close() {
 		// session with this user can start with context (Retell/ElevenLabs pattern).
 		ms.extractUserMemory()
 
-		// Clean up Vela model
-		if ms.vela != nil {
-			ms.vela.Destroy()
+		// Clean up GateTurn model
+		if ms.gateturn != nil {
+			ms.gateturn.Destroy()
 		}
 
 		time.Sleep(10 * time.Millisecond)
