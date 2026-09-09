@@ -19,9 +19,12 @@ package orchestrator
 import "encoding/binary"
 
 // gtConsecutiveFramesRequired is how many consecutive frames must agree
-// before acting — a single 20ms frame's score is noisy; three in a row
-// (60ms) is a cheap, effective debounce against acting on a blip.
-const gtConsecutiveFramesRequired = 3
+// before acting — a single 20ms frame's score is noisy, so require at
+// least a blip-sized debounce. 2 (40ms) rather than 3 (60ms): the entire
+// point of this fast path is shaving time off an STT round trip that's
+// several hundred ms, so the debounce itself shouldn't be a meaningful
+// fraction of that budget.
+const gtConsecutiveFramesRequired = 2
 
 // gtFarEndBufCap caps the far-end ring buffer at 2s of 16kHz PCM16 — plenty
 // of slack for the near/far alignment to be approximate (this is a coarse
@@ -120,6 +123,15 @@ func (ms *ManagedStream) feedGateTurnBargein(nearChunk16k []byte) {
 			ms.logger.Warn("GateTurn inference error", "error", err)
 			return
 		}
+		// Score visibility while tuning against real traffic: the confirm/
+		// resolve log lines below only fire once a run of frames commits,
+		// which said nothing at all in the first hour of production calls
+		// (see the commit that lowered the thresholds) — logging every
+		// frame's raw score during an actual pending window is what makes
+		// that observable instead of a guess. Volume is bounded: this only
+		// runs while a tentative barge-in is open, typically well under a
+		// couple seconds of audio.
+		ms.logger.Info("GateTurn frame", "bargein", decision.Bargein, "vad", decision.VAD)
 
 		// Re-check pending/gen each frame: the loop that confirms via STT
 		// can win the race at any point, and a stale generation must not

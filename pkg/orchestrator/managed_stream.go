@@ -142,6 +142,15 @@ type ManagedStream struct {
 	lastNoSpeechProb  float64
 	lastActivityAt    time.Time
 
+	// silenceNudgeSent gates monitorInactivity's silence-timeout reprompt to
+	// at most once per idle stretch — it used to have no such gate and would
+	// refire every ~10s indefinitely while the user stayed silent, each time
+	// asking the LLM for a fresh paraphrase of "are you there", producing an
+	// unbounded loop of slightly-reworded nudges instead of one prompt
+	// followed by real silence. Cleared the moment real speech starts again
+	// (onVADStart), so a later genuine silence still gets its own one nudge.
+	silenceNudgeSent bool
+
 	// Spoken-truth context tracking: the last assistant response and how much
 	// of it was actually synthesized/played before an interruption. On interrupt,
 	// the context is truncated to only what the user heard (Pipecat/OpenAI pattern).
@@ -538,6 +547,10 @@ func resampleTo16k(audio []byte, inputSampleRate int) []byte {
 }
 
 func (ms *ManagedStream) onVADStart(prevState StreamState) {
+	ms.mu.Lock()
+	ms.silenceNudgeSent = false
+	ms.mu.Unlock()
+
 	// Cooldown: ignore VAD start if a speech end happened <200ms ago AND the
 	// bot hasn't started speaking yet. If the bot is already processing/speaking,
 	// allow immediate barge-in — the user didn't actually finish speaking.
@@ -1966,10 +1979,19 @@ func (ms *ManagedStream) monitorInactivity() {
 						// interrupt should never leave the caller in permanent
 						// silence — this is the last-resort net for that case.
 						recoverable := ms.state == StateIdle || ms.state == StateInterrupted
-						if !recoverable || ms.vadSpeaking {
+						// At most one nudge per idle stretch — cleared by
+						// onVADStart the next time the user actually speaks.
+						// Without this, every subsequent 2s tick still finds
+						// lastActivity stale (nothing here ever refreshes it
+						// once the user has gone silent) and fires again,
+						// producing an unbounded loop of freshly-reworded
+						// "are you there" nudges instead of one prompt
+						// followed by real silence.
+						if !recoverable || ms.vadSpeaking || ms.silenceNudgeSent {
 							ms.mu.Unlock()
 							return
 						}
+						ms.silenceNudgeSent = true
 						ms.mu.Unlock()
 						ms.runLLMAndTTS(ms.ctx, "[USER_SILENCE_TIMEOUT]")
 					}()

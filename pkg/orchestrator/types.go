@@ -276,6 +276,14 @@ type Config struct {
 	// differential gate makes that call from audio alone in the same 20ms
 	// frame (see turn-taking/README.md's bargein head benchmark: precision
 	// 0.976 at this kind of threshold).
+	//
+	// 0.85/0.15 (this field's original values) never fired once across an
+	// hour of real production calls — the model's own benchmark numbers
+	// are from OpenYAP/oto, not this telephony pipeline's actual codec/
+	// echo/noise profile, so real scores apparently don't reach that
+	// extreme. Loosened to 0.6/0.4 so the gate has real headroom to act;
+	// re-check GateTurn confirmed/resolved log lines against call
+	// recordings and retune from there rather than trusting this number.
 	GateTurnBargeinConfirmThreshold float32
 
 	// GateTurnBargeinResolveThreshold: symmetric to Confirm — a bargein
@@ -338,8 +346,8 @@ func DefaultConfig() Config {
 		// On by default — see GateTurnModelPath's doc comment. Set to "" to
 		// disable (e.g. if the model asset genuinely isn't present).
 		GateTurnModelPath:               "assets/onnx/gateturn/model.onnx",
-		GateTurnBargeinConfirmThreshold: 0.85,
-		GateTurnBargeinResolveThreshold: 0.15,
+		GateTurnBargeinConfirmThreshold: 0.6,
+		GateTurnBargeinResolveThreshold: 0.4,
 		VoiceUXInstructions:             "",
 	}
 }
