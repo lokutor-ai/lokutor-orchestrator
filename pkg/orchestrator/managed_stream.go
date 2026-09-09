@@ -172,6 +172,20 @@ type ManagedStream struct {
 	lastSpecAt     time.Time
 	speechAudioBuf []byte
 
+	// Fast pause-trigger for speculation: independent of, and much quicker
+	// than, the main VAD's hangover (which deliberately holds "still
+	// speaking" through brief gaps). lastRawEnergyAt is stamped on every
+	// chunk whose raw PCM RMS crosses pauseEnergyThreshold, regardless of
+	// what the hangover-smoothed VAD currently reports; once ~100ms passes
+	// with no such chunk, mid-utterance, that's this stream's guess that
+	// the user might be done — worth a speculative shot even though the
+	// real VAD won't confirm anything for a few hundred more ms.
+	// specTriggeredForRun avoids re-firing every chunk through the same
+	// quiet stretch; cleared the moment energy resumes, so a later pause
+	// in the same utterance gets its own attempt.
+	lastRawEnergyAt     time.Time
+	specTriggeredForRun bool
+
 	// preSpeechBuf stores the last ~300ms of audio unconditionally, updated BEFORE VAD.
 	// Used in onVADStart to prepend speech onset that VAD's confirmation window missed.
 	preSpeechBuf *bytes.Buffer
@@ -478,13 +492,17 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
 			speechDuration := time.Since(ms.userSpeakingSince)
 			if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
-				ms.lastSpecAt = time.Now()
-				audioCopy := make([]byte, len(ms.speechAudioBuf))
-				copy(audioCopy, ms.speechAudioBuf)
-				ms.speculator.Start(ms.ctx, ms.orch, audioCopy, ms.session.GetCurrentLanguage())
+				ms.startSpeculation()
 			}
 		}
 	}
+
+	// Fast pause-trigger, independent of isSpeaking above: raw energy is
+	// checked on every chunk regardless of what the hangover-smoothed VAD
+	// currently reports, specifically so a brief in-utterance gap can
+	// trigger speculation well before the real VAD's ~448ms hangover would
+	// ever say the user stopped talking.
+	ms.updatePauseSpeculationTrigger(chunk)
 
 	switch {
 	case event != nil && event.Type == VADSpeechStart:
@@ -550,6 +568,8 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	ms.mu.Lock()
 	ms.silenceNudgeSent = false
 	ms.mu.Unlock()
+	ms.specTriggeredForRun = false
+	ms.lastRawEnergyAt = time.Time{}
 
 	// Cooldown: ignore VAD start if a speech end happened <200ms ago AND the
 	// bot hasn't started speaking yet. If the bot is already processing/speaking,
@@ -966,7 +986,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// (LiveKit pattern — avoids extra tool round-trips).
 	ms.injectRagContext(transcript)
 
-	ms.runLLMAndTTS(ctx, transcript)
+	if !ms.trySpeculativeResponse(ctx, transcript) {
+		ms.runLLMAndTTS(ctx, transcript)
+	}
 
 	// Log latency breakdown for observability
 	bd := ms.GetLatencyBreakdown()
@@ -974,6 +996,14 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		"stt_ms", bd.STT,
 		"llm_ms", bd.LLM,
 		"tts_first_ms", bd.LLMToTTSFirstByte,
+		// ttfa_ms: true time-to-first-audio since the user actually
+		// stopped speaking (userSpeechEnd -> first TTS byte) — this was
+		// computed (UserToTTSFirstByte) but never logged; everything else
+		// here is a narrower sub-interval of it (llm_ms is LLM-only,
+		// tts_first_ms is LLM-end-to-TTS-first-byte, neither includes the
+		// VAD hangover + STT time that comes first). This is the number
+		// that answers "how fast does it respond after I stop talking".
+		"ttfa_ms", bd.UserToTTSFirstByte,
 		"tts_total_ms", bd.TTSTotal,
 		"e2e_ms", bd.UserToPlay,
 		"bot_start_ms", bd.BotStartLatency,

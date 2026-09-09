@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"sync"
@@ -49,4 +50,27 @@ func getSharedLLMClient() *http.Client {
 		}
 	})
 	return sharedLLMClient
+}
+
+// WarmupHost opens (and pools, via keep-alive) a TCP+TLS connection to host
+// through the shared LLM client, without making a real API call. The very
+// first genuine LLM request of a freshly-started process otherwise pays
+// that handshake — typically ~100-150ms on a cross-region link — inline
+// with a real caller's latency, since getSharedLLMClient's pool starts
+// empty. A bare GET to the provider's base URL gets rejected (404/401/etc)
+// almost immediately, but that's fine: completing the handshake and
+// leaving the connection idle in the pool is the only thing this is for,
+// so the response (and any error past the handshake itself) is ignored.
+// Meant to be called once, in the background, as early as possible at
+// process startup — not per-call.
+func WarmupHost(ctx context.Context, host string) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, host, nil)
+	if err != nil {
+		return
+	}
+	resp, err := getSharedLLMClient().Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
