@@ -281,9 +281,14 @@ type Config struct {
 	// hour of real production calls — the model's own benchmark numbers
 	// are from OpenYAP/oto, not this telephony pipeline's actual codec/
 	// echo/noise profile, so real scores apparently don't reach that
-	// extreme. Loosened to 0.6/0.4 so the gate has real headroom to act;
-	// re-check GateTurn confirmed/resolved log lines against call
-	// recordings and retune from there rather than trusting this number.
+	// extreme. Loosened to 0.6/0.4 on the first pass; 0.6 then confirmed
+	// a real "mhh" backchannel as a genuine interrupt on the very next
+	// test call (log: bargein 0.65, crossed in 2 frames/40ms) — a false
+	// confirm is the visibly bad outcome (cuts the bot off for real), so
+	// raised again to 0.8: this only costs the STT-confirmation fallback
+	// path's usual few hundred ms on a genuinely ambiguous case, whereas
+	// too low costs a wrongly-real interrupt outright. Re-tune from real
+	// GateTurn confirmed/resolved log lines, not by guessing again.
 	GateTurnBargeinConfirmThreshold float32
 
 	// GateTurnBargeinResolveThreshold: symmetric to Confirm — a bargein
@@ -346,7 +351,7 @@ func DefaultConfig() Config {
 		// On by default — see GateTurnModelPath's doc comment. Set to "" to
 		// disable (e.g. if the model asset genuinely isn't present).
 		GateTurnModelPath:               "assets/onnx/gateturn/model.onnx",
-		GateTurnBargeinConfirmThreshold: 0.6,
+		GateTurnBargeinConfirmThreshold: 0.8,
 		GateTurnBargeinResolveThreshold: 0.4,
 		VoiceUXInstructions:             "",
 	}
