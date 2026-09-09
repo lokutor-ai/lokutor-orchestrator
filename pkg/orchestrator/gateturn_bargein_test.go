@@ -3,19 +3,29 @@ package orchestrator
 import (
 	"context"
 	"math"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/lokutor-ai/lokutor-orchestrator/pkg/gateturn"
 )
 
 // gateTurnTestModelPath must match where the integration copied
 // turn-taking/checkpoints/gateturn.onnx for production use.
 const gateTurnTestModelPath = "../../assets/onnx/gateturn/model.onnx"
 
+// requireGateTurnModel skips (not fails) unless a GateTurn runtime can
+// actually be constructed here — covers both the model file being absent
+// and, just as importantly, the ONNX runtime shared library itself not
+// being installed in this environment (e.g. a CI runner with no
+// libonnxruntime.so — a real environment gap hit in CI, not a code
+// regression). An os.Stat-only check missed that second case entirely.
 func requireGateTurnModel(t *testing.T) {
-	if _, err := os.Stat(gateTurnTestModelPath); err != nil {
-		t.Skipf("gateturn model not present at %s: %v", gateTurnTestModelPath, err)
+	t.Helper()
+	rt, err := gateturn.NewRuntime(gateTurnTestModelPath)
+	if err != nil {
+		t.Skipf("GateTurn runtime unavailable: %v", err)
 	}
+	rt.Destroy()
 }
 
 // loudFrame16k returns synthetic 16kHz PCM16 audio loud enough to register
