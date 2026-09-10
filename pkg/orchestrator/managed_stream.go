@@ -196,6 +196,14 @@ type ManagedStream struct {
 	sttStarted    bool
 	sttAudioChan  chan<- []byte
 
+	// transportReady is closed by the embedding transport (web WS handler,
+	// Telnyx/Twilio media handler) the moment it can deliver bot audio —
+	// e.g. once the stream ID is known. The FirstSpeakerBot greeting waits
+	// on this gate instead of a fixed sleep: no dead air when the
+	// transport is already up, no dropped greeting audio when it isn't.
+	transportReadyMu sync.Once
+	transportReady   chan struct{}
+
 	// Response cache
 	responseCache *ResponseCache
 
@@ -250,6 +258,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		events:          make(chan OrchestratorEvent, 1024),
 		cmdChan:         make(chan []byte, 512),
 		interruptChan:   make(chan struct{}, 1),
+		transportReady:  make(chan struct{}),
 		vad:             streamVAD,
 		playbackRate:    44100,
 		inputSampleRate: cfg.SampleRate,
@@ -319,17 +328,20 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			// Outbound call: let the LLM generate a natural greeting from
 			// the system prompt instead of using a canned "Hello!".
 			go func() {
-				time.Sleep(150 * time.Millisecond)
+				if ms.waitTransportReady(3*time.Second) != nil || ms.ctx.Err() != nil {
+					return
+				}
 				ms.session.AddMessage("user", "The call has been answered. Introduce yourself and greet the person.")
 				ms.runLLMAndTTS(ms.ctx, "")
 			}()
 		} else {
-			// 150ms (was 600ms): the user sees the avatar instantly and
-			// expects the greeting immediately; 600ms of dead air reads as
-			// "broken". The stagger NBC only exists so the WS media pipeline
-			// is ready to accept audio.
+			// Signal-driven wait (was a fixed sleep): fires as soon as the
+			// transport says it can deliver audio — instant when it's
+			// already up, and no dropped greeting audio when it isn't.
 			go func() {
-				time.Sleep(150 * time.Millisecond)
+				if ms.waitTransportReady(3*time.Second) != nil || ms.ctx.Err() != nil {
+					return
+				}
 				greeting := "Hello!"
 				if o.config.Language == LanguageEs {
 					greeting = "¡Hola!"
@@ -347,6 +359,31 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 // Must be called before audio processing begins (before audioProcessor goroutine).
 func (ms *ManagedStream) SetPlaybackRate(rate int) {
 	ms.playbackRate = rate
+}
+
+// NotifyTransportReady signals that the embedding transport can now deliver
+// bot audio (stream ID known). Closes the gate exactly once; safe to call
+// multiple times. Transports that are ready immediately (e.g. web
+// WebSocket speakers) should call this as soon as the session is wired.
+func (ms *ManagedStream) NotifyTransportReady() {
+	ms.transportReadyMu.Do(func() {
+		close(ms.transportReady)
+	})
+}
+
+// waitTransportReady blocks until the transport signals readiness. The
+// fallback timeout prevents an indefinite hang if the transport never
+// signals; the greeting then proceeds and risks dropping its first chunks
+// (same behavior as the old fixed-sleep path, but only in the failure case).
+func (ms *ManagedStream) waitTransportReady(timeout time.Duration) error {
+	select {
+	case <-ms.transportReady:
+		return nil
+	case <-time.After(timeout):
+		return fmt.Errorf("transport not ready after %v", timeout)
+	case <-ms.ctx.Done():
+		return ms.ctx.Err()
+	}
 }
 
 func (ms *ManagedStream) audioProcessor() {
