@@ -1033,6 +1033,16 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	// every later llmEndTime - llmStartTime go strongly negative. Reset it
 	// here so each turn's "first token" gets captured fresh.
 	ms.llmEndTime = time.Time{}
+	// Same reset, same reason, for ttsFirstChunkTime: it must capture only
+	// the FIRST audio byte of this turn's response. speakText is called
+	// once per sentence for multi-sentence responses, so without this
+	// reset (and the matching fix removing speakText's own unconditional
+	// overwrite — see there), a later sentence's start time silently
+	// replaced the real first-byte timestamp, making ttfa_ms/tts_first_ms
+	// measure "time to the LAST sentence" instead of the first — inflating
+	// reported TTS latency by however long the earlier sentences took to
+	// finish playing, on every multi-sentence reply.
+	ms.ttsFirstChunkTime = time.Time{}
 
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
 		ms.runStreamingLLM(rCtx, sProvider, gen, transcript)
@@ -1137,7 +1147,15 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	var jitterBuf []byte
 	var started bool
 
-	ms.ttsFirstChunkTime = time.Now()
+	// Deliberately NOT setting ms.ttsFirstChunkTime here unconditionally —
+	// speakText runs once per sentence for multi-sentence responses, and an
+	// unconditional set here stomped whatever the first sentence's real
+	// first-byte time was every time a later sentence started, silently
+	// turning "time to first audio" into "time to the LAST sentence's
+	// first audio". The IsZero()-guarded set inside the chunk callback
+	// below is the only place this should be written; runLLMAndTTS resets
+	// it to zero once per turn so that guard fires exactly once, on this
+	// turn's true first byte.
 
 	// Serialize TTS operations to prevent concurrent WS frame corruption.
 	// Only one StreamSynthesize call per session at a time.

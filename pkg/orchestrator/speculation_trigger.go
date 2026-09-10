@@ -145,6 +145,10 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.emitWithGen(BotThinking, nil, gen)
 	ms.llmStartTime = time.Now()
 	ms.llmEndTime = time.Now() // already generated ahead of time — no LLM wait on this turn
+	// Same per-turn reset as runLLMAndTTS — see the comment there. Without
+	// it, this turn's ttfa_ms/tts_first_ms would be measured against
+	// whatever sentence last set ttsFirstChunkTime on a PRIOR turn.
+	ms.ttsFirstChunkTime = time.Time{}
 
 	ms.mu.Lock()
 	ms.lastResponseText = response
