@@ -635,6 +635,8 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 			ms.sttAudioChan = audioChan
 			ms.sttStarted = true
 			ms.logger.Info("Streaming STT session started")
+		} else if err != nil {
+			ms.logger.Info("Streaming STT unavailable; using final STT provider", "error", err)
 		}
 	}
 
