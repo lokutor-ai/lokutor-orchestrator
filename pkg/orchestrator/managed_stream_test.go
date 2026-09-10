@@ -340,3 +340,12 @@ func TestIsLikelyEcho(t *testing.T) {
 		})
 	}
 }
+
+func TestAcceptsSustainedSingleWordBargeIn(t *testing.T) {
+	if !acceptsSustainedSingleWordBargeIn("stop", 700*time.Millisecond) {
+		t.Fatal("expected a sustained single-word command to interrupt")
+	}
+	if acceptsSustainedSingleWordBargeIn("uh", 250*time.Millisecond) {
+		t.Fatal("did not expect a short backchannel/noise edge to interrupt")
+	}
+}

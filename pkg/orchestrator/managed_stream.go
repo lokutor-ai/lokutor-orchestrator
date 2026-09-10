@@ -946,8 +946,15 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.mu.Unlock()
 	if pendingBarge {
 		if minWords := ms.orch.config.MinWordsToInterrupt; minWords > 0 && countWords(transcript) < minWords {
-			ms.resolvePendingBargeIn()
-			return
+			// Keep the two-word guard for short noise/backchannels, but do
+			// not make a sustained one-word command impossible to use. With
+			// the current VAD hangover, a real "yes", "no", or "stop" turn
+			// remains active long enough to qualify here; brief noise still
+			// resolves as a false barge-in.
+			if !acceptsSustainedSingleWordBargeIn(transcript, duration) {
+				ms.resolvePendingBargeIn()
+				return
+			}
 		}
 		// Echo check: there's no acoustic echo cancellation between what the
 		// bot is currently speaking and what the mic picks up beyond
@@ -1491,6 +1498,15 @@ func countWords(s string) int {
 		return 0
 	}
 	return len(strings.Fields(s))
+}
+
+func acceptsSustainedSingleWordBargeIn(transcript string, duration time.Duration) bool {
+	words := strings.Fields(transcript)
+	if len(words) != 1 || duration < 600*time.Millisecond {
+		return false
+	}
+	word := strings.TrimFunc(words[0], unicode.IsPunct)
+	return len([]rune(word)) >= 2
 }
 
 // isLikelyEcho reports whether transcript looks like the mic picked up the
