@@ -319,13 +319,17 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			// Outbound call: let the LLM generate a natural greeting from
 			// the system prompt instead of using a canned "Hello!".
 			go func() {
-				time.Sleep(400 * time.Millisecond)
+				time.Sleep(150 * time.Millisecond)
 				ms.session.AddMessage("user", "The call has been answered. Introduce yourself and greet the person.")
 				ms.runLLMAndTTS(ms.ctx, "")
 			}()
 		} else {
+			// 150ms (was 600ms): the user sees the avatar instantly and
+			// expects the greeting immediately; 600ms of dead air reads as
+			// "broken". The stagger NBC only exists so the WS media pipeline
+			// is ready to accept audio.
 			go func() {
-				time.Sleep(600 * time.Millisecond)
+				time.Sleep(150 * time.Millisecond)
 				greeting := "Hello!"
 				if o.config.Language == LanguageEs {
 					greeting = "¡Hola!"
