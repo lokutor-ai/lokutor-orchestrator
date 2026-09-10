@@ -60,7 +60,6 @@ func TestGateTurnBargein_ConfirmsRealInterruption(t *testing.T) {
 	cfg.SilenceTimeout = 0
 	cfg.GateTurnModelPath = gateTurnTestModelPath
 	cfg.GateTurnBargeinConfirmThreshold = 0.5
-	cfg.GateTurnBargeinResolveThreshold = 0.05
 
 	orch := NewWithVAD(stt, llm, tts, vad, cfg)
 	session := NewConversationSession("test")
@@ -92,10 +91,10 @@ func TestGateTurnBargein_ConfirmsRealInterruption(t *testing.T) {
 		pending := stream.pendingBargeIn
 		stream.mu.Unlock()
 		if !pending {
-			return // fast path acted (confirmed or resolved) — wiring works end to end
+			return // fast path confirmed — wiring works end to end
 		}
 	}
-	t.Fatal("GateTurn barge-in fast path never resolved pendingBargeIn on sustained loud near+far audio")
+	t.Fatal("GateTurn barge-in fast path never confirmed pendingBargeIn on sustained loud near+far audio")
 }
 
 // TestGateTurnBargein_Disabled verifies the feature is a true no-op when

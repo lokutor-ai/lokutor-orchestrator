@@ -63,14 +63,14 @@ type ManagedStream struct {
 	// GateTurn dual-channel barge-in classifier: additive, not a replacement
 	// for VAD above. Only acts while a tentative barge-in is open
 	// (ms.pendingBargeIn), using near (user mic) + far (bot TTS loopback)
-	// audio to confirm or dismiss it faster than waiting for STT. nil when
-	// GateTurnModelPath isn't configured.
+	// audio to confirm a real interruption faster than waiting for STT.
+	// Confirm-only (see gateturn_bargein.go) — it never resolves/dismisses a
+	// barge-in on its own; that decision stays with the existing STT-based
+	// checks. nil when GateTurnModelPath isn't configured.
 	gateturn            *gateturn.Runtime
 	gtBargeinConfirmThr float32
-	gtBargeinResolveThr float32
 	gtNearAccum         []byte // <320-sample leftover near-channel bytes, 16kHz PCM16
 	gtConfirmRun        int    // consecutive frames at/above the confirm threshold
-	gtResolveRun        int    // consecutive frames at/below the resolve threshold
 	farEndBuf           []byte // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
 	farEndMu            sync.Mutex
 
@@ -284,7 +284,6 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			} else {
 				ms.gateturn = g
 				ms.gtBargeinConfirmThr = cfg.GateTurnBargeinConfirmThreshold
-				ms.gtBargeinResolveThr = cfg.GateTurnBargeinResolveThreshold
 				logger.Info("GateTurn barge-in classifier loaded", "model", cfg.GateTurnModelPath)
 			}
 		} else {

@@ -284,18 +284,21 @@ type Config struct {
 	// extreme. Loosened to 0.6/0.4 on the first pass; 0.6 then confirmed
 	// a real "mhh" backchannel as a genuine interrupt on the very next
 	// test call (log: bargein 0.65, crossed in 2 frames/40ms) — a false
-	// confirm is the visibly bad outcome (cuts the bot off for real), so
-	// raised again to 0.8: this only costs the STT-confirmation fallback
-	// path's usual few hundred ms on a genuinely ambiguous case, whereas
-	// too low costs a wrongly-real interrupt outright. Re-tune from real
-	// GateTurn confirmed/resolved log lines, not by guessing again.
+	// confirm is a visibly bad outcome (cuts the bot off for real), so
+	// raised again to 0.8.
+	//
+	// GateTurn originally also had a symmetric ResolveThreshold: a low
+	// score would resolvePendingBargeIn() (declare "just a backchannel,
+	// keep talking"). Removed entirely after production showed genuine
+	// interruption attempts commonly scoring in the same ~0.37-0.5 band as
+	// backchannels on this pipeline's real audio — the resolve path was
+	// actively vetoing real barge-ins, making the bot impossible to
+	// interrupt, which is strictly worse than a wrong confirm (that just
+	// costs a redundant interrupt STT would have made anyway). GateTurn is
+	// confirm-only now; the decision to stand down stays with the existing
+	// STT-based checks (MinWordsToInterrupt/isLikelyNoise/isLikelyEcho),
+	// which worked correctly on their own before GateTurn existed.
 	GateTurnBargeinConfirmThreshold float32
-
-	// GateTurnBargeinResolveThreshold: symmetric to Confirm — a bargein
-	// score at or below this, sustained for a few frames, resolves the
-	// tentative barge-in as a backchannel ("mhm") and resumes bot playback
-	// without waiting for STT to (correctly, but slowly) conclude the same.
-	GateTurnBargeinResolveThreshold float32
 
 	// VoiceUXInstructions are appended to the system prompt to instruct the LLM
 	// how to format speech for a real-time voice interface. Override for custom behavior.
@@ -352,7 +355,6 @@ func DefaultConfig() Config {
 		// disable (e.g. if the model asset genuinely isn't present).
 		GateTurnModelPath:               "assets/onnx/gateturn/model.onnx",
 		GateTurnBargeinConfirmThreshold: 0.8,
-		GateTurnBargeinResolveThreshold: 0.4,
 		VoiceUXInstructions:             "",
 	}
 }

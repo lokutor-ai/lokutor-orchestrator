@@ -103,7 +103,6 @@ func (ms *ManagedStream) feedGateTurnBargein(nearChunk16k []byte) {
 			ms.gtNearAccum = ms.gtNearAccum[:0]
 		}
 		ms.gtConfirmRun = 0
-		ms.gtResolveRun = 0
 		return
 	}
 
@@ -141,32 +140,34 @@ func (ms *ManagedStream) feedGateTurnBargein(nearChunk16k []byte) {
 		ms.mu.Unlock()
 		if !stillPending {
 			ms.gtConfirmRun = 0
-			ms.gtResolveRun = 0
 			return
 		}
 
-		switch {
-		case decision.Bargein >= ms.gtBargeinConfirmThr:
+		// Confirm-only, deliberately: GateTurn used to also be able to
+		// resolvePendingBargeIn() (declare "this is just a backchannel,
+		// keep talking") on a low score. In production that backfired
+		// hard — real interruption attempts commonly score in the same
+		// 0.37-0.5 band as backchannels on this pipeline's actual audio
+		// (not the OpenYAP/oto data the model was benchmarked on), so the
+		// resolve path was actively vetoing genuine barge-ins and the bot
+		// became impossible to interrupt. A wrong CONFIRM only costs a
+		// redundant interrupt (STT would have confirmed it anyway, just
+		// slower); a wrong RESOLVE costs the user being unable to cut the
+		// bot off at all — a strictly worse failure mode. So this path
+		// only ever fast-tracks a confirm; the decision to stand down
+		// stays with the existing STT-based checks (MinWordsToInterrupt /
+		// isLikelyNoise / isLikelyEcho in processUtterance), which were
+		// already working correctly on their own before GateTurn existed.
+		if decision.Bargein >= ms.gtBargeinConfirmThr {
 			ms.gtConfirmRun++
-			ms.gtResolveRun = 0
-		case decision.Bargein <= ms.gtBargeinResolveThr:
-			ms.gtResolveRun++
+		} else {
 			ms.gtConfirmRun = 0
-		default:
-			ms.gtConfirmRun = 0
-			ms.gtResolveRun = 0
 		}
 
 		if ms.gtConfirmRun >= gtConsecutiveFramesRequired {
 			ms.logger.Info("GateTurn confirmed barge-in", "bargein", decision.Bargein)
 			ms.gtConfirmRun = 0
 			ms.confirmBargeInIfPending()
-			return
-		}
-		if ms.gtResolveRun >= gtConsecutiveFramesRequired {
-			ms.logger.Info("GateTurn resolved barge-in as backchannel", "bargein", decision.Bargein)
-			ms.gtResolveRun = 0
-			ms.resolvePendingBargeIn()
 			return
 		}
 	}
