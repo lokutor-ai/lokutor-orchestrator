@@ -970,7 +970,13 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 
 	if ms.isLikelyNoise(result, duration) {
 		// False alarm — if this cut off a tentative barge-in, resume the bot
-		// instead of leaving the caller with dead air.
+		// instead of leaving the caller with dead air. Logged with the raw
+		// (possibly gibberish) transcript and the scores that drove the
+		// call — otherwise a real, quiet utterance getting discarded here
+		// is indistinguishable after the fact from actual silence/noise.
+		ms.logger.Info("Utterance discarded as noise, resuming bot",
+			"transcript", result.Text, "no_speech_prob", result.NoSpeechProb,
+			"audio_duration_ms", duration.Milliseconds())
 		ms.resolvePendingBargeIn()
 		ms.emit(BotResumed, nil)
 		return
@@ -978,6 +984,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 
 	transcript := strings.TrimSpace(result.Text)
 	if transcript == "" {
+		ms.logger.Info("Utterance discarded: empty transcript, resuming bot",
+			"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
 		ms.resolvePendingBargeIn()
 		return
 	}
@@ -998,6 +1006,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// remains active long enough to qualify here; brief noise still
 			// resolves as a false barge-in.
 			if !acceptsSustainedSingleWordBargeIn(transcript, duration) {
+				ms.logger.Info("Barge-in below MinWordsToInterrupt, resuming bot",
+					"transcript", transcript, "word_count", countWords(transcript),
+					"audio_duration_ms", duration.Milliseconds())
 				ms.resolvePendingBargeIn()
 				return
 			}
@@ -1016,7 +1027,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.mu.Unlock()
 		if isLikelyEcho(transcript, currentlySpeaking) {
 			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
-				"transcript", transcript)
+				"transcript", transcript, "bot_was_saying", currentlySpeaking)
 			ms.resolvePendingBargeIn()
 			return
 		}
