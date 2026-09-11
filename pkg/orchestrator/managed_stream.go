@@ -106,7 +106,18 @@ type ManagedStream struct {
 	vadDiagChunks int
 
 	pipelineCancel context.CancelFunc
-	ttsCancel      context.CancelFunc
+	// pipelineCtx is the context pipelineCancel cancels. A multi-sentence
+	// response is synthesized one speakText() call per sentence, and each
+	// call resets ms.state to StateIdle on its own completion — so between
+	// sentences, ms.state genuinely reads Idle even though the turn as a
+	// whole is still in flight. pipelineCtx stays un-Done for the entire
+	// turn (every entry point that sets pipelineCancel also defers its
+	// cancel, firing only on real interruption or the turn's true, final
+	// completion), so checking pipelineCtx.Err() is the reliable "is a turn
+	// actually still active" signal — unlike ms.state, it isn't blind to the
+	// gaps between sentences. See handleInterrupt.
+	pipelineCtx context.Context
+	ttsCancel   context.CancelFunc
 
 	payloadGen int
 
@@ -616,6 +627,26 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	// Start streaming STT session — process audio incrementally
 	// This saves ~400ms by not waiting for VAD speech end
 	if streamingSTT, ok := ms.orch.stt.(StreamingSTTProvider); ok {
+		// Guard against a duplicate/back-to-back VAD start (e.g. a jittery
+		// client sending two vad_speech_start control frames with no
+		// intervening end, or a raw-VAD retrigger) leaking the PREVIOUS
+		// streaming STT session: without this, ms.sttAudioChan/sttResultChan
+		// below would simply be overwritten, orphaning the old session's
+		// channels — nothing would ever close them, so the underlying
+		// provider goroutine (and its STT connection/state) would run for
+		// the rest of the call with no matching real workload, exactly the
+		// leak onVADEnd's cleanup below was written to prevent for the
+		// normal one-session-per-utterance case. Close it the same way
+		// onVADEnd does before replacing it.
+		if ms.sttStarted {
+			if ms.sttResultChan != nil {
+				close(ms.sttResultChan)
+			}
+			if ms.sttAudioChan != nil {
+				close(ms.sttAudioChan)
+			}
+			ms.sttStarted = false
+		}
 		ms.sttResultChan = make(chan string, 10) // Buffer for partials
 		audioChan, err := streamingSTT.StreamTranscribe(ms.ctx, ms.session.GetCurrentLanguage(), func(transcript string, isFinal bool) error {
 			// Store partials in channel — processUtterance will read the latest
@@ -694,10 +725,25 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 func (ms *ManagedStream) resolvePendingBargeIn() {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if !ms.pendingBargeIn || ms.pendingBargeGen != ms.payloadGen {
+	if !ms.pendingBargeIn {
+		// Nothing was tentatively muted (e.g. a short/noisy utterance that
+		// never opened a barge-in at all) — safe to normalize back to idle.
 		if ms.state != StateInterrupted {
 			ms.state = StateIdle
 		}
+		return
+	}
+	if ms.pendingBargeGen != ms.payloadGen {
+		// A pending barge-in exists, but not for the CURRENT generation: this
+		// call is a stale resolve racing in from an already-superseded
+		// utterance (e.g. its async processUtterance goroutine finally
+		// reaches isLikelyNoise/resolvePendingBargeIn well after a newer
+		// turn already started). A newer turn's pipeline may be legitimately
+		// StateProcessing/StateSpeaking right now — forcing ms.state to Idle
+		// here would clobber that active turn's state out from under it,
+		// which makes emitWithGen's AudioChunk gate (state == StateSpeaking)
+		// silently drop that turn's real audio. Per the doc comment above,
+		// a stale call must be a true no-op: don't touch ms.state at all.
 		return
 	}
 	ms.pendingBargeIn = false
@@ -1052,6 +1098,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 		ms.pipelineCancel()
 	}
 	ms.pipelineCancel = rCancel
+	ms.pipelineCtx = rCtx
 	ms.payloadGen++
 	gen := ms.payloadGen
 	ms.mu.Unlock()
@@ -1111,6 +1158,18 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.lastResponseText = response
 	ms.spokenTextPrefix = ""
 	ms.spokenTextLocked = false
+	// responseChunksSent is truncateSpokenContext's signal for "did this
+	// response actually play any audio before being interrupted" (see the
+	// chunksSent==0 branch there). It was never reset per-turn anywhere in
+	// this file — only ever incremented in speakText's chunk callback — so
+	// once any earlier turn in the session had delivered at least one audio
+	// chunk, the counter stayed >=1 for the rest of the call. A LATER turn
+	// interrupted before its own TTS produced a single byte was then wrongly
+	// treated as "something was spoken", and its never-spoken assistant
+	// message was left in context instead of being removed. Reset here,
+	// alongside the neighboring per-turn resets above, so the counter
+	// reflects only the response about to be spoken.
+	ms.responseChunksSent = 0
 	ms.session.AddMessage("assistant", response)
 	ms.emit(BotResponse, response)
 	ms.cacheResponse(transcript, response, nil)
@@ -1120,6 +1179,19 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
+	// A multi-sentence response is queued and spoken one sentence per
+	// speakText call. If the turn's pipeline was already cancelled (e.g. the
+	// user interrupted during the gap between two sentences — see
+	// handleInterrupt's pipelineCtx check) by the time a later sentence's
+	// turn comes up, don't speak it: without this, an interrupt landing
+	// between sentences stopped emitting further audio for the CURRENT
+	// sentence but still went on to speak every queued sentence after it,
+	// since nothing here checked whether the pipeline had already been torn
+	// down before starting a new one.
+	if ctx.Err() != nil {
+		return
+	}
+
 	// Prosody processor: disabled — it modifies text in unpredictable ways
 	// (adds filler words, inserts "...", changes pacing) which causes the TTS
 	// model to skip or repeat words. Raw LLM text goes directly to TTS.
@@ -1289,6 +1361,16 @@ func (ms *ManagedStream) handleInterrupt() {
 	// the next turn starts from stale state).
 	ms.mu.Lock()
 	oldState := ms.state
+	// A multi-sentence response is synthesized one speakText() call per
+	// sentence, and each call resets ms.state to StateIdle the moment its
+	// own sentence finishes — so oldState can genuinely read Idle while the
+	// turn as a whole is still very much in flight, waiting on the next
+	// sentence. Checking pipelineCtx (un-Done for the turn's full duration,
+	// not just one sentence of it) alongside oldState catches an interrupt
+	// landing in exactly that gap, which oldState alone would silently miss
+	// — the bot would keep talking through the rest of the response with no
+	// Interrupted event ever firing.
+	hadActiveTurn := ms.pipelineCtx != nil && ms.pipelineCtx.Err() == nil
 	ms.state = StateInterrupted
 	ms.interruptedAt = time.Now()
 	ms.mu.Unlock()
@@ -1300,7 +1382,7 @@ func (ms *ManagedStream) handleInterrupt() {
 	// This prevents the model from "remembering" things it never said.
 	ms.truncateSpokenContext()
 
-	if oldState == StateSpeaking || oldState == StateProcessing {
+	if oldState == StateSpeaking || oldState == StateProcessing || hadActiveTurn {
 		ms.drainAudioChunks()
 		ms.mu.Lock()
 		gen := ms.payloadGen
@@ -1407,6 +1489,7 @@ func (ms *ManagedStream) cancelPipeline() {
 	pCancel := ms.pipelineCancel
 	tCancel := ms.ttsCancel
 	ms.pipelineCancel = nil
+	ms.pipelineCtx = nil
 	ms.ttsCancel = nil
 	ms.mu.Unlock()
 

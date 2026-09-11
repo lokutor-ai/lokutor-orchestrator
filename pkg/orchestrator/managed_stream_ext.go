@@ -292,6 +292,20 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 }
 
 func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider StreamingLLMProvider, gen int, userTranscript string) {
+	// Per-turn reset, mirroring runLLMAndTTS's non-streaming path: these three
+	// fields drive truncateSpokenContext's "was anything actually spoken"
+	// decision on interrupt and must not carry a stale value across turns
+	// (see the reset in runLLMAndTTS for the bug this previously caused —
+	// this path never reset them at all, so spokenTextLocked in particular
+	// latched true on turn one's first audio chunk and then stayed true for
+	// the rest of the session, freezing spokenTextPrefix to that first turn's
+	// text).
+	ms.mu.Lock()
+	ms.spokenTextPrefix = ""
+	ms.spokenTextLocked = false
+	ms.responseChunksSent = 0
+	ms.mu.Unlock()
+
 	var fullText strings.Builder
 	var hasToolCalls bool
 	messages := ms.session.GetContextCopy()
@@ -441,10 +455,35 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	response := strings.TrimSpace(fullText.String())
 
-	if response != "" && !hasToolCalls {
-		ms.session.AddMessage("assistant", response)
-		ms.emit(BotResponse, response)
-		ms.cacheResponse(userTranscript, response, nil)
+	if !hasToolCalls {
+		if ctx.Err() != nil {
+			// The turn was interrupted before StreamComplete unblocked (e.g.
+			// the interrupt landed in the gap between two sentences of a
+			// multi-sentence reply — see speakText's own ctx check, which is
+			// what actually stops any not-yet-spoken sentence from playing).
+			// fullText can still contain text streamed in after the
+			// interrupt, since the provider callback isn't itself
+			// ctx-aware, so don't record the full response as if it were
+			// delivered. handleInterrupt's truncateSpokenContext runs
+			// synchronously with the interrupt and can race ahead of this
+			// point — landing before this turn has added anything to
+			// context yet — so record only what speakText actually
+			// confirmed spoken (the same source of truth
+			// truncateSpokenContext itself reads) instead.
+			ms.mu.Lock()
+			spoken := ms.spokenTextPrefix
+			locked := ms.spokenTextLocked
+			ms.mu.Unlock()
+			if locked {
+				if trimmed := strings.TrimSpace(spoken); trimmed != "" {
+					ms.session.AddMessage("assistant", trimmed)
+				}
+			}
+		} else if response != "" {
+			ms.session.AddMessage("assistant", response)
+			ms.emit(BotResponse, response)
+			ms.cacheResponse(userTranscript, response, nil)
+		}
 	}
 
 	if hasToolCalls {
@@ -497,6 +536,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				ms.pipelineCancel()
 			}
 			ms.pipelineCancel = rCancel
+			ms.pipelineCtx = rCtx
 			ms.payloadGen++
 			gen := ms.payloadGen
 			ms.mu.Unlock()

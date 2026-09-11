@@ -137,6 +137,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 		ms.pipelineCancel()
 	}
 	ms.pipelineCancel = rCancel
+	ms.pipelineCtx = rCtx
 	ms.payloadGen++
 	gen := ms.payloadGen
 	ms.mu.Unlock()
