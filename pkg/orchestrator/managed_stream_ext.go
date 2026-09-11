@@ -173,10 +173,19 @@ func (ms *ManagedStream) dispatchToolCall(ctx context.Context, tcData ToolCallEv
 // the model's follow-up answer. Mirrors runStreamingLLM's tool-dispatch
 // pattern — parallel goroutines via dispatchToolCall, a filler phrase while
 // tools run, per-call loop guard — so behavior is consistent regardless of
-// which LLM provider is configured. Does not recurse into a further round of
-// tool calls if the follow-up answer is itself another marker; that matches
-// the existing limitation of the streaming path's own round-2 fallback, and
-// parseToolCallMarker guards against speaking that raw JSON either way.
+// which LLM provider is configured. Loops (bounded by maxNonStreamingToolRounds)
+// when the follow-up answer is itself another marker, so multi-step tool
+// chains (e.g. look up availability, then book it) work the same way on
+// Anthropic/OpenAI as they already do on the streaming providers — a single
+// round used to be a hard ceiling here: the second round's marker was
+// silently discarded and the caller got no response at all for that turn.
+// maxNonStreamingToolRounds bounds how many back-to-back [TOOL_CALLS] rounds
+// handleNonStreamingToolCalls will chain before giving up. The per-tool-name
+// cap in ConversationSession.RecordToolCall (3 calls/tool/session) already
+// blocks the common infinite-loop case; this is a coarser backstop against a
+// pathological chain across many distinct tool names.
+const maxNonStreamingToolRounds = 8
+
 func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen int, userTranscript string, calls []ToolCallEventData) {
 	fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
 	if fillerPhrase != "" {
@@ -187,90 +196,99 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 		}(fillerPhrase)
 	}
 
-	type toolRes struct {
-		TC     ToolCallEventData
-		Result string
-	}
-	var results []toolRes
-	var resMu sync.Mutex
-	var wg sync.WaitGroup
-
-	for _, tc := range calls {
-		ms.emit(ToolCall, tc)
-		if !ms.session.RecordToolCall(tc.Name) {
-			ms.emit(ErrorEvent, fmt.Sprintf("Tool loop detected: %s called too many times. Aborting to prevent infinite retry.", tc.Name))
-			ms.mu.Lock()
-			if ms.state != StateInterrupted {
-				ms.state = StateIdle
-			}
-			ms.mu.Unlock()
-			return
+	setIdle := func() {
+		ms.mu.Lock()
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
 		}
-		wg.Add(1)
-		go func(tcData ToolCallEventData) {
-			defer wg.Done()
-			result := ms.dispatchToolCall(ctx, tcData)
-			resMu.Lock()
-			results = append(results, toolRes{TC: tcData, Result: result})
-			resMu.Unlock()
-		}(tc)
+		ms.mu.Unlock()
 	}
-	wg.Wait()
 
-	var tcData []interface{}
-	for _, r := range results {
-		tcData = append(tcData, map[string]interface{}{
-			"id":   r.TC.CallID,
-			"type": "function",
-			"function": map[string]interface{}{
-				"name":      r.TC.Name,
-				"arguments": r.TC.Arguments,
-			},
-		})
-		ms.emit(ToolResult, map[string]interface{}{"tool_call": r.TC, "result": r.Result})
-	}
-	ms.session.AddMessageRaw(Message{
-		Role:      "assistant",
-		ToolCalls: tcData,
-	})
-	for _, r := range results {
-		resultContent := strings.TrimSpace(r.Result)
-		if resultContent == "" {
-			resultContent = `{"result": "no result"}`
-		} else if !strings.HasPrefix(resultContent, "{") && !strings.HasPrefix(resultContent, "[") {
-			resultContent = fmt.Sprintf(`{"result": %s}`, jsonQuote(resultContent))
+	for round := 0; round < maxNonStreamingToolRounds; round++ {
+		type toolRes struct {
+			TC     ToolCallEventData
+			Result string
+		}
+		var results []toolRes
+		var resMu sync.Mutex
+		var wg sync.WaitGroup
+
+		for _, tc := range calls {
+			ms.emit(ToolCall, tc)
+			if !ms.session.RecordToolCall(tc.Name) {
+				ms.emit(ErrorEvent, fmt.Sprintf("Tool loop detected: %s called too many times. Aborting to prevent infinite retry.", tc.Name))
+				setIdle()
+				return
+			}
+			wg.Add(1)
+			go func(tcData ToolCallEventData) {
+				defer wg.Done()
+				result := ms.dispatchToolCall(ctx, tcData)
+				resMu.Lock()
+				results = append(results, toolRes{TC: tcData, Result: result})
+				resMu.Unlock()
+			}(tc)
+		}
+		wg.Wait()
+
+		var tcData []interface{}
+		for _, r := range results {
+			tcData = append(tcData, map[string]interface{}{
+				"id":   r.TC.CallID,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      r.TC.Name,
+					"arguments": r.TC.Arguments,
+				},
+			})
+			ms.emit(ToolResult, map[string]interface{}{"tool_call": r.TC, "result": r.Result})
 		}
 		ms.session.AddMessageRaw(Message{
-			Role:       "tool",
-			Content:    resultContent,
-			ToolCallID: r.TC.CallID,
-			Name:       r.TC.Name,
+			Role:      "assistant",
+			ToolCalls: tcData,
 		})
+		for _, r := range results {
+			resultContent := strings.TrimSpace(r.Result)
+			if resultContent == "" {
+				resultContent = `{"result": "no result"}`
+			} else if !strings.HasPrefix(resultContent, "{") && !strings.HasPrefix(resultContent, "[") {
+				resultContent = fmt.Sprintf(`{"result": %s}`, jsonQuote(resultContent))
+			}
+			ms.session.AddMessageRaw(Message{
+				Role:       "tool",
+				Content:    resultContent,
+				ToolCallID: r.TC.CallID,
+				Name:       r.TC.Name,
+			})
+		}
+
+		final, err := ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), ms.session.GetTools())
+		if err != nil {
+			setIdle()
+			if ctx.Err() == nil {
+				ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
+			}
+			return
+		}
+		if nextCalls, isMarker := parseToolCallMarker(final); isMarker {
+			calls = nextCalls
+			continue
+		}
+
+		setIdle()
+		text := strings.TrimSpace(final)
+		if text == "" {
+			text = "Got it."
+		}
+		ms.session.AddMessage("assistant", text)
+		ms.emit(BotResponse, text)
+		ms.cacheResponse(userTranscript, text, nil)
+		ms.speakText(ctx, text, gen)
+		return
 	}
 
-	final, err := ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), ms.session.GetTools())
-	ms.mu.Lock()
-	if ms.state != StateInterrupted {
-		ms.state = StateIdle
-	}
-	ms.mu.Unlock()
-	if err != nil {
-		if ctx.Err() == nil {
-			ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
-		}
-		return
-	}
-	if _, isMarker := parseToolCallMarker(final); isMarker {
-		return
-	}
-	text := strings.TrimSpace(final)
-	if text == "" {
-		text = "Got it."
-	}
-	ms.session.AddMessage("assistant", text)
-	ms.emit(BotResponse, text)
-	ms.cacheResponse(userTranscript, text, nil)
-	ms.speakText(ctx, text, gen)
+	ms.emit(ErrorEvent, "Tool call chain exceeded max rounds without a final answer")
+	setIdle()
 }
 
 func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider StreamingLLMProvider, gen int, userTranscript string) {
