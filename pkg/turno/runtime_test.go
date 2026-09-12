@@ -1,11 +1,11 @@
-package gateturn
+package turno
 
 import (
 	"math"
 	"testing"
 )
 
-const testModelPath = "../../assets/onnx/gateturn/model.onnx"
+const testModelPath = "../../assets/onnx/turno/model.onnx"
 
 // newTestRuntime skips (not fails) when the ONNX runtime shared library
 // itself isn't installed in this environment — that's a CI/host gap (no
@@ -18,7 +18,7 @@ func newTestRuntime(t *testing.T) *Runtime {
 	t.Helper()
 	rt, err := NewRuntime(testModelPath)
 	if err != nil {
-		t.Skipf("GateTurn runtime unavailable (likely no libonnxruntime.so in this environment): %v", err)
+		t.Skipf("Turno runtime unavailable (likely no libonnxruntime.so in this environment): %v", err)
 	}
 	return rt
 }

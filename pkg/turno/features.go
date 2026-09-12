@@ -1,4 +1,4 @@
-// Package gateturn wraps GateTurn, a ~17.5K-param dual-channel turn-taking
+// Package turno wraps Turno, a ~17.5K-param dual-channel turn-taking
 // model (github.com/danivarela/turn-taking), for production use in the
 // orchestrator: a validated VAD replacement plus a duplex near/far barge-in
 // classifier that can confirm or dismiss a tentative barge-in from raw audio
@@ -10,7 +10,7 @@
 // pitch-confidence estimate, same stage-0 DSP skip. Verified against a
 // golden fixture generated from the Python implementation
 // (features_test.go).
-package gateturn
+package turno
 
 import (
 	"math"

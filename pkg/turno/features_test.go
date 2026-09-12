@@ -1,4 +1,4 @@
-package gateturn
+package turno
 
 import (
 	"encoding/json"
@@ -10,7 +10,7 @@ import (
 // fixture mirrors the golden fixture generated from the Python reference
 // implementation (turn-taking/src/features.py) via:
 //
-//	python3 -c "..." > /tmp/gateturn_fixture.json
+//	python3 -c "..." > /tmp/turno_fixture.json
 //
 // See the command in the PR/commit description. This test exists to catch
 // any numerical drift between this Go port and the Python original, since a
@@ -22,7 +22,7 @@ type fixture struct {
 }
 
 func TestPushFrameMatchesPythonReference(t *testing.T) {
-	data, err := os.ReadFile("/tmp/gateturn_fixture.json")
+	data, err := os.ReadFile("/tmp/turno_fixture.json")
 	if err != nil {
 		t.Skipf("golden fixture not present (%v) — regenerate with the Python reference before trusting this port", err)
 	}

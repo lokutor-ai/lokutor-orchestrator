@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/lokutor-ai/lokutor-orchestrator/pkg/gateturn"
+	"github.com/lokutor-ai/lokutor-orchestrator/pkg/turno"
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
 )
 
@@ -60,19 +60,25 @@ type ManagedStream struct {
 	events  chan OrchestratorEvent
 	vad     VADProvider
 
-	// GateTurn dual-channel barge-in classifier: additive, not a replacement
-	// for VAD above. Only acts while a tentative barge-in is open
-	// (ms.pendingBargeIn), using near (user mic) + far (bot TTS loopback)
-	// audio to confirm a real interruption faster than waiting for STT.
-	// Confirm-only (see gateturn_bargein.go) — it never resolves/dismisses a
-	// barge-in on its own; that decision stays with the existing STT-based
-	// checks. nil when GateTurnModelPath isn't configured.
-	gateturn            *gateturn.Runtime
-	gtBargeinConfirmThr float32
-	gtNearAccum         []byte // <320-sample leftover near-channel bytes, 16kHz PCM16
-	gtConfirmRun        int    // consecutive frames at/above the confirm threshold
-	farEndBuf           []byte // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
-	farEndMu            sync.Mutex
+	// Turno dual-channel model: additive, not a replacement for VAD above.
+	// Runs continuously (see turno_bargein.go: feedTurno) for two
+	// purposes: (1) a VAD shadow comparison against ms.vad, logged only,
+	// zero behavioral effect; (2) while a tentative barge-in is open
+	// (ms.pendingBargeIn), tracks the peak bargein score for this window so
+	// processUtterance can relax (never bypass) the STT MinWordsToInterrupt
+	// gate when Turno corroborates a real interruption. It never
+	// resolves/dismisses a barge-in on its own, and — since the AEC-Challenge
+	// retrain (see types.go: TurnoBargeinAssistThreshold) — it no longer
+	// confirms one unilaterally either; that decision stays with the
+	// existing STT-based checks. nil when TurnoModelPath isn't configured.
+	turno             *turno.Runtime
+	turnoBargeinAssistThr   float32
+	turnoBargeinWordsRelief int
+	turnoBargeinPeakScore   float32 // max bargein score seen during the current pendingBargeGen window
+	turnoNearAccum          []byte  // <320-sample leftover near-channel bytes, 16kHz PCM16
+	turnoVadDiagFrames      int     // frame counter gating the periodic VAD-shadow log line
+	farEndBuf            []byte  // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
+	farEndMu             sync.Mutex
 
 	cmdChan       chan []byte
 	interruptChan chan struct{}
@@ -292,22 +298,23 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		clientToolResults:  make(map[string]chan string),
 	}
 
-	// Initialize GateTurn's duplex barge-in classifier if configured. This
-	// is additive: it only ever fast-tracks a decision VAD's own logic and
-	// the STT-confirmation path would otherwise have reached anyway, so a
-	// load failure just leaves that fast path disabled (logged, not fatal).
-	if cfg.GateTurnModelPath != "" {
-		if _, err := os.Stat(cfg.GateTurnModelPath); err == nil {
-			g, err := gateturn.NewRuntime(cfg.GateTurnModelPath)
+	// Initialize Turno if configured. This is additive: VAD shadow
+	// logging never affects behavior, and the barge-in assist only ever
+	// relaxes a gate the STT-confirmation path would reach anyway — so a
+	// load failure just leaves both disabled (logged, not fatal).
+	if cfg.TurnoModelPath != "" {
+		if _, err := os.Stat(cfg.TurnoModelPath); err == nil {
+			g, err := turno.NewRuntime(cfg.TurnoModelPath)
 			if err != nil {
-				logger.Warn("failed to load GateTurn model, barge-in fast-path disabled", "error", err)
+				logger.Warn("failed to load Turno model, disabled", "error", err)
 			} else {
-				ms.gateturn = g
-				ms.gtBargeinConfirmThr = cfg.GateTurnBargeinConfirmThreshold
-				logger.Info("GateTurn barge-in classifier loaded", "model", cfg.GateTurnModelPath)
+				ms.turno = g
+				ms.turnoBargeinAssistThr = cfg.TurnoBargeinAssistThreshold
+				ms.turnoBargeinWordsRelief = cfg.TurnoBargeinAssistWordsRelief
+				logger.Info("Turno loaded (VAD shadow + barge-in assist)", "model", cfg.TurnoModelPath)
 			}
 		} else {
-			logger.Warn("GateTurn model file not found, barge-in fast-path disabled", "path", cfg.GateTurnModelPath)
+			logger.Warn("Turno model file not found, disabled", "path", cfg.TurnoModelPath)
 		}
 	}
 
@@ -497,12 +504,12 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	isSpeaking := ms.vad.IsSpeaking()
 	ms.vadSpeaking = isSpeaking
 
-	if ms.gateturn != nil {
+	if ms.turno != nil {
 		audioChunk16k := chunk
 		if ms.inputSampleRate != 16000 {
 			audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
 		}
-		ms.feedGateTurnBargein(audioChunk16k)
+		ms.feedTurno(audioChunk16k)
 	}
 
 	if event != nil && (event.Type == VADSpeechStart || event.Type == VADSpeechEnd || event.Type == VADSpeechPotential) {
@@ -708,6 +715,7 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 		ms.mu.Lock()
 		ms.pendingBargeIn = true
 		ms.pendingBargeGen = ms.payloadGen
+		ms.turnoBargeinPeakScore = 0
 		ms.mu.Unlock()
 		ms.emit(UserSpeaking, nil)
 		return
@@ -990,16 +998,84 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		return
 	}
 
+	// Mid-thought pause guard: VAD's silence-based end-of-turn has no way to
+	// know a brief pause (e.g. after a comma, mid-clause) isn't the user
+	// actually finishing -- it just measures silence duration. A transcript
+	// ending on a trailing comma/conjunction ("...and then,") is a cheap,
+	// already-built-and-tested signal that this is exactly that case (see
+	// turn_completion.go / TestIsLikelyComplete's "trailing comma = mid-
+	// thought" case) -- but nothing in the pipeline actually consulted it
+	// before this. Give a short, bounded window for a continuation before
+	// committing the LLM to answering a half-sentence and the bot to
+	// speaking right as the user keeps talking. Applied narrowly (only when
+	// the text itself looks incomplete), not as a blanket wait on every
+	// turn -- see the SILENCE_CONFIRMATION_MS removal above for why an
+	// unconditional version of this was deliberately cut for latency.
+	if ms.turnComp != nil && !ms.turnComp.IsLikelyComplete(transcript) {
+		waitMs := ms.orch.config.SilenceConfirmationMs
+		if waitMs <= 0 {
+			waitMs = 800
+		}
+		ms.mu.Lock()
+		gate := make(chan struct{})
+		ms.confirmationGate = gate
+		ms.mu.Unlock()
+
+		select {
+		case <-gate:
+			// User resumed speaking before the window elapsed: a mid-thought
+			// pause, not a real turn end. Abandon this response -- the
+			// continuation is already being captured as its own utterance by
+			// onVADStart/handleAudio and will reach processUtterance on its
+			// own once it, in turn, looks complete (or times out here too).
+			ms.logger.Info("Utterance looked incomplete and user resumed speaking, abandoning response",
+				"transcript", transcript, "wait_ms", waitMs)
+			ms.mu.Lock()
+			if ms.confirmationGate == gate {
+				ms.confirmationGate = nil
+			}
+			ms.mu.Unlock()
+			ms.resolvePendingBargeIn()
+			return
+		case <-time.After(time.Duration(waitMs) * time.Millisecond):
+			ms.mu.Lock()
+			if ms.confirmationGate == gate {
+				ms.confirmationGate = nil
+			}
+			ms.mu.Unlock()
+			ms.logger.Info("Utterance looked incomplete but no continuation arrived, proceeding",
+				"transcript", transcript, "wait_ms", waitMs)
+		case <-ctx.Done():
+			return
+		}
+	}
+
 	// Barge-in confirmation gate: if this utterance tentatively interrupted a
 	// still-speaking/processing bot, require at least MinWordsToInterrupt
 	// words before committing to the interrupt — short interjections ("uh",
 	// "yeah") that don't trip isLikelyNoise still shouldn't cut the bot off.
 	// Below the threshold, resume instead of committing.
+	//
+	// Turno assist: if the bargein score peaked at/above
+	// turnoBargeinAssistThr during this pending window, relax the word-count
+	// requirement by turnoBargeinWordsRelief. This corroborates rather than
+	// replaces the STT check — it can only ever lower the bar, never skip
+	// it, and isLikelyEcho below still runs unmodified regardless.
 	ms.mu.Lock()
 	pendingBarge := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
+	turnoPeak := ms.turnoBargeinPeakScore
 	ms.mu.Unlock()
 	if pendingBarge {
-		if minWords := ms.orch.config.MinWordsToInterrupt; minWords > 0 && countWords(transcript) < minWords {
+		minWords := ms.orch.config.MinWordsToInterrupt
+		effectiveMinWords := minWords
+		turnoAssisted := ms.turno != nil && turnoPeak >= ms.turnoBargeinAssistThr
+		if turnoAssisted {
+			effectiveMinWords -= ms.turnoBargeinWordsRelief
+			if effectiveMinWords < 0 {
+				effectiveMinWords = 0
+			}
+		}
+		if effectiveMinWords > 0 && countWords(transcript) < effectiveMinWords {
 			// Keep the two-word guard for short noise/backchannels, but do
 			// not make a sustained one-word command impossible to use. With
 			// the current VAD hangover, a real "yes", "no", or "stop" turn
@@ -1012,6 +1088,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				ms.resolvePendingBargeIn()
 				return
 			}
+		} else if turnoAssisted && countWords(transcript) < minWords {
+			ms.logger.Info("Turno assist relaxed MinWordsToInterrupt",
+				"transcript", transcript, "word_count", countWords(transcript),
+				"turno_bargein_peak", turnoPeak)
 		}
 		// Echo check: there's no acoustic echo cancellation between what the
 		// bot is currently speaking and what the mic picks up beyond
@@ -1341,7 +1421,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 }
 
 func (ms *ManagedStream) emitFrames(data []byte, frameSize, gen int) {
-	if ms.gateturn != nil {
+	if ms.turno != nil {
 		farChunk16k := data
 		if ms.playbackRate != 16000 {
 			farChunk16k = resampleTo16k(data, ms.playbackRate)
@@ -1766,9 +1846,9 @@ func (ms *ManagedStream) Close() {
 		// session with this user can start with context (Retell/ElevenLabs pattern).
 		ms.extractUserMemory()
 
-		// Clean up GateTurn model
-		if ms.gateturn != nil {
-			ms.gateturn.Destroy()
+		// Clean up Turno model
+		if ms.turno != nil {
+			ms.turno.Destroy()
 		}
 
 		time.Sleep(10 * time.Millisecond)

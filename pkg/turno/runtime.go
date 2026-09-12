@@ -1,4 +1,4 @@
-package gateturn
+package turno
 
 import (
 	"fmt"
@@ -56,7 +56,7 @@ func (d Decision) ShouldYieldFloor(threshold float32) bool {
 	return d.Bargein >= threshold
 }
 
-// Runtime is the real-time, frame-by-frame GateTurn inference wrapper —
+// Runtime is the real-time, frame-by-frame Turno inference wrapper —
 // a Go port of turn-taking/src/runtime.py's GateTurnRuntime, using
 // onnxruntime_go instead of onnxruntime's Python bindings.
 //
@@ -101,7 +101,7 @@ type Runtime struct {
 	}
 }
 
-// NewRuntime loads the GateTurn ONNX model at modelPath.
+// NewRuntime loads the Turno ONNX model at modelPath.
 func NewRuntime(modelPath string) (*Runtime, error) {
 	if !ort.IsInitialized() {
 		libPath := os.Getenv("ONNXRUNTIME_LIB_PATH")
@@ -270,7 +270,7 @@ func (r *Runtime) Step(nearFrame, farFrame []float32) (Decision, error) {
 	r.energyDelta.GetData()[0] = energyDelta
 
 	if err := r.session.Run(); err != nil {
-		return Decision{}, fmt.Errorf("gateturn inference: %w", err)
+		return Decision{}, fmt.Errorf("turno inference: %w", err)
 	}
 
 	g := r.gateOut.GetData()[0]

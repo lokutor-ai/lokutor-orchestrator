@@ -259,43 +259,61 @@ type Config struct {
 	LLMRegion string
 	TTSRegion string
 
-	// GateTurn: ONNX model path for the dual-channel (near+far) barge-in
-	// classifier. Runs alongside VAD — it does not replace turn-state
-	// detection (its own benchmark shows that head loses to a naive
-	// baseline), only the barge-in discrimination during a tentative
-	// barge-in. On by default (see DefaultConfig); set to "" to disable.
-	GateTurnModelPath string
+	// Turno: ONNX model path for the dual-channel (near+far) model. Runs
+	// alongside VAD, continuously, for two purposes (see
+	// turno_bargein.go): a log-only VAD shadow comparison against ms.vad,
+	// and a barge-in assist that relaxes (never bypasses)
+	// MinWordsToInterrupt. It does not replace turn-state detection (its own
+	// benchmark shows that head loses to a naive baseline). On by default
+	// (see DefaultConfig); set to "" to disable.
+	TurnoModelPath string
 
-	// GateTurnBargeinConfirmThreshold: once a tentative barge-in is open
-	// (raw VAD already suppressed bot audio), a GateTurn bargein score
-	// at or above this commits to the interrupt immediately instead of
-	// waiting for STT confirmation — the model's validated duplex
-	// differential gate makes that call from audio alone in the same 20ms
-	// frame (see turn-taking/README.md's bargein head benchmark: precision
-	// 0.976 at this kind of threshold).
+	// TurnoBargeinAssistThreshold: while a tentative barge-in is open, if
+	// Turno's bargein score peaks at or above this value, processUtterance
+	// relaxes MinWordsToInterrupt by TurnoBargeinAssistWordsRelief for
+	// that utterance instead of requiring the full word count. This
+	// corroborates the STT gate; it cannot skip it.
 	//
-	// 0.85/0.15 (this field's original values) never fired once across an
-	// hour of real production calls — the model's own benchmark numbers
-	// are from OpenYAP/oto, not this telephony pipeline's actual codec/
-	// echo/noise profile, so real scores apparently don't reach that
-	// extreme. Loosened to 0.6/0.4 on the first pass; 0.6 then confirmed
-	// a real "mhh" backchannel as a genuine interrupt on the very next
-	// test call (log: bargein 0.65, crossed in 2 frames/40ms) — a false
-	// confirm is a visibly bad outcome (cuts the bot off for real), so
-	// raised again to 0.8.
+	// History: this field used to be a fast-confirm bypass threshold (a
+	// score at/above it committed the interrupt immediately, no STT
+	// involved) — tuned against real production traffic from 0.85 -> 0.6 ->
+	// 0.8 after the original model (trained only on OpenYAP/oto, with no
+	// acoustic echo path between channels) proved to have little real
+	// signal on this pipeline's actual audio: 0.6 confirmed a real "mhh"
+	// backchannel as a genuine interrupt on a real test call. The bypass was
+	// retired entirely (not just re-tuned) after root-causing that failure
+	// to a real gap — zero training exposure to device echo — and retraining
+	// against Microsoft's AEC Challenge real-device recordings
+	// (turn-taking/checkpoints_v3_aec). That retrain cut the false-confirm
+	// rate on held-out real echo from 93.0% to 11.4%, but true-confirm speed
+	// on real interruptions also dropped (median 140ms -> 3.46s, recall
+	// 100% -> 84.8%) and a threshold/debounce sweep confirmed there's no
+	// operating point that recovers both — a hard tradeoff in the model's
+	// score distribution, not a tuning gap. A "fast" path slower than just
+	// waiting for STT isn't a bypass worth having, so Turno's bargein
+	// score is now only ever an assist on top of STT, which doesn't need to
+	// be fast. 0.8 carries over as a starting point from the old bypass
+	// tuning — re-tune against the "Turno frame" bargein logs from real
+	// calls with the new model, the same way the old threshold was tuned.
 	//
-	// GateTurn originally also had a symmetric ResolveThreshold: a low
+	// Turno originally also had a symmetric ResolveThreshold: a low
 	// score would resolvePendingBargeIn() (declare "just a backchannel,
 	// keep talking"). Removed entirely after production showed genuine
 	// interruption attempts commonly scoring in the same ~0.37-0.5 band as
 	// backchannels on this pipeline's real audio — the resolve path was
 	// actively vetoing real barge-ins, making the bot impossible to
-	// interrupt, which is strictly worse than a wrong confirm (that just
-	// costs a redundant interrupt STT would have made anyway). GateTurn is
-	// confirm-only now; the decision to stand down stays with the existing
-	// STT-based checks (MinWordsToInterrupt/isLikelyNoise/isLikelyEcho),
-	// which worked correctly on their own before GateTurn existed.
-	GateTurnBargeinConfirmThreshold float32
+	// interrupt, which is strictly worse than a wrong assist (that just
+	// costs one utterance needing one fewer word than usual). The decision
+	// to stand down stays entirely with the existing STT-based checks
+	// (MinWordsToInterrupt/isLikelyNoise/isLikelyEcho), which worked
+	// correctly on their own before Turno existed.
+	TurnoBargeinAssistThreshold float32
+
+	// TurnoBargeinAssistWordsRelief: how many fewer words
+	// MinWordsToInterrupt requires for an utterance where
+	// TurnoBargeinAssistThreshold was met. Floored at 0 words (never
+	// fewer) — this narrows the gate, it does not remove it.
+	TurnoBargeinAssistWordsRelief int
 
 	// VoiceUXInstructions are appended to the system prompt to instruct the LLM
 	// how to format speech for a real-time voice interface. Override for custom behavior.
@@ -348,11 +366,12 @@ func DefaultConfig() Config {
 		LLMRegion:             "",
 		TTSRegion:             "",
 
-		// On by default — see GateTurnModelPath's doc comment. Set to "" to
+		// On by default — see TurnoModelPath's doc comment. Set to "" to
 		// disable (e.g. if the model asset genuinely isn't present).
-		GateTurnModelPath:               "assets/onnx/gateturn/model.onnx",
-		GateTurnBargeinConfirmThreshold: 0.8,
-		VoiceUXInstructions:             "",
+		TurnoModelPath:                "assets/onnx/turno/model.onnx",
+		TurnoBargeinAssistThreshold:   0.8,
+		TurnoBargeinAssistWordsRelief: 1,
+		VoiceUXInstructions:              "",
 	}
 }
 
