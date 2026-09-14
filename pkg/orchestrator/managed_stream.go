@@ -77,6 +77,18 @@ type ManagedStream struct {
 	turnoBargeinPeakScore   float32 // max bargein score seen during the current pendingBargeGen window
 	turnoNearAccum          []byte  // <320-sample leftover near-channel bytes, 16kHz PCM16
 	turnoVadDiagFrames      int     // frame counter gating the periodic VAD-shadow log line
+
+	// Latest turn-completion heads, captured per frame by feedTurno and read
+	// once per utterance by processUtterance's mid-thought guard. These are
+	// the two heads the model computes on every frame but nothing consumed:
+	// TurnState is the prosodic analogue of turnComp.IsLikelyComplete's
+	// regex, and Horizon predicts end-of-turn 200/500/800ms ahead. Recorded
+	// in shadow so the lexical gate can be scored against them on real
+	// traffic before either is trusted to gate anything.
+	turnoLastTurnState   [4]float32
+	turnoLastHorizon     [3]float32
+	turnoLastTurnLabel   string
+	turnoTurnStateFrames int // frames captured since the last utterance, 0 = no Turno audio seen
 	farEndBuf            []byte  // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
 	farEndMu             sync.Mutex
 
@@ -1011,7 +1023,32 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// the text itself looks incomplete), not as a blanket wait on every
 	// turn -- see the SILENCE_CONFIRMATION_MS removal above for why an
 	// unconditional version of this was deliberately cut for latency.
-	if ms.turnComp != nil && !ms.turnComp.IsLikelyComplete(transcript) {
+	// Shadow-score Turno's turn-completion heads against the lexical gate.
+	// This is the comparison that would justify promoting them: the lexical
+	// verdict comes from a regex over the transcript after STT returns, the
+	// Turno verdict from prosody during the speech itself. Neither gates
+	// anything here -- but which branch we take below is a free ground-truth
+	// label (user resumed = the turn really was incomplete), so every
+	// incomplete-looking turn in production scores both predictors at once.
+	lexicalComplete := ms.turnComp == nil || ms.turnComp.IsLikelyComplete(transcript)
+	ms.mu.Lock()
+	turnoLabel, turnoFrames := ms.turnoLastTurnLabel, ms.turnoTurnStateFrames
+	turnoState, turnoHorizon := ms.turnoLastTurnState, ms.turnoLastHorizon
+	ms.turnoTurnStateFrames = 0
+	ms.mu.Unlock()
+	if ms.turno != nil && turnoFrames > 0 {
+		ms.logger.Info("Turno turn-completion shadow",
+			"lexical_complete", lexicalComplete,
+			"turno_label", turnoLabel,
+			"p_complete", turnoState[0], "p_incomplete", turnoState[1],
+			"p_backchannel", turnoState[2], "p_wait", turnoState[3],
+			"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
+			"p_end_800ms", turnoHorizon[2],
+			"speech_frames", turnoFrames,
+			"transcript", transcript)
+	}
+
+	if ms.turnComp != nil && !lexicalComplete {
 		waitMs := ms.orch.config.SilenceConfirmationMs
 		if waitMs <= 0 {
 			waitMs = 800
@@ -1028,8 +1065,12 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// continuation is already being captured as its own utterance by
 			// onVADStart/handleAudio and will reach processUtterance on its
 			// own once it, in turn, looks complete (or times out here too).
+			// truly_incomplete=true is ground truth: the user did resume, so
+			// the lexical gate was right to wait. turno_label on the same
+			// line says whether Turno would have agreed.
 			ms.logger.Info("Utterance looked incomplete and user resumed speaking, abandoning response",
-				"transcript", transcript, "wait_ms", waitMs)
+				"transcript", transcript, "wait_ms", waitMs,
+				"truly_incomplete", true, "turno_label", turnoLabel)
 			ms.mu.Lock()
 			if ms.confirmationGate == gate {
 				ms.confirmationGate = nil
@@ -1043,8 +1084,12 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				ms.confirmationGate = nil
 			}
 			ms.mu.Unlock()
+			// truly_incomplete=false: the lexical gate made us wait waitMs for
+			// a continuation that never came. If Turno said "complete" here,
+			// that wait was latency the horizon head could have saved.
 			ms.logger.Info("Utterance looked incomplete but no continuation arrived, proceeding",
-				"transcript", transcript, "wait_ms", waitMs)
+				"transcript", transcript, "wait_ms", waitMs,
+				"truly_incomplete", false, "turno_label", turnoLabel)
 		case <-ctx.Done():
 			return
 		}

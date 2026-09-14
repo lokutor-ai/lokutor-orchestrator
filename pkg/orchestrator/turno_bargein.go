@@ -51,6 +51,13 @@ const turnoFarEndBufCap = 2 * turnoSampleRate * 2 // bytes
 // is naturally bounded to pending-barge-in windows only.
 const turnoShadowLogEveryNFrames = 50
 
+// turnoTurnStateVADFloor is the speech probability below which a frame's
+// turn-completion verdict is ignored. The heads are trained to describe the
+// turn being spoken; sampling them from the trailing silence after the user
+// stops would record a verdict about silence and compare it against a
+// transcript, which is not the comparison we want to draw conclusions from.
+const turnoTurnStateVADFloor = 0.5
+
 // noteFarEndAudio appends the bot's own outgoing audio (already resampled
 // to 16kHz PCM16 by the caller) to the far-end ring buffer that feedTurno
 // reads from. No-op if Turno isn't loaded — no reason to hold onto audio
@@ -125,6 +132,20 @@ func (ms *ManagedStream) feedTurno(nearChunk16k []byte) {
 		if err != nil {
 			ms.logger.Warn("Turno inference error", "error", err)
 			return
+		}
+
+		// Turn-completion heads: keep the most recent frame's verdict so
+		// processUtterance can score it against the lexical gate. Only
+		// frames with actual speech are worth keeping -- a verdict sampled
+		// from trailing silence describes the silence, not the turn that
+		// preceded it.
+		if decision.VAD >= turnoTurnStateVADFloor {
+			ms.mu.Lock()
+			ms.turnoLastTurnState = decision.TurnState
+			ms.turnoLastHorizon = decision.Horizon
+			ms.turnoLastTurnLabel = decision.TurnStateLabel()
+			ms.turnoTurnStateFrames++
+			ms.mu.Unlock()
 		}
 
 		// VAD shadow comparison: purely observability, zero effect on
