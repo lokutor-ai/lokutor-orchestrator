@@ -1112,6 +1112,40 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		if waitMs <= 0 {
 			waitMs = 800
 		}
+
+		// Turno horizon assist: when the head predicts the speaker was
+		// finishing, shorten this wait instead of running it in full.
+		//
+		// Safe to drive from a low-precision signal specifically because of
+		// where it sits. VAD has already reported end-of-turn by the time we
+		// reach here, so a false positive cannot talk over anyone — the worst
+		// it does is answer a half-finished sentence a little sooner, which is
+		// the same risk the lexical gate beside it is already taking. The gate
+		// still runs, and a user who resumes inside the shortened window still
+		// reclaims the turn.
+		horizonAssisted := false
+		if thr := ms.orch.config.TurnoHorizonAssistThreshold; thr > 0 &&
+			ms.turnoTurn != nil && turnoFrames > 0 && turnoHorizon[0] >= thr {
+			factor := ms.orch.config.TurnoHorizonAssistFactor
+			if factor <= 0 || factor >= 1 {
+				factor = 0.25
+			}
+			floor := ms.orch.config.TurnoHorizonAssistMinMs
+			if floor <= 0 {
+				floor = 120
+			}
+			shortened := int(float64(waitMs) * factor)
+			if shortened < floor {
+				shortened = floor
+			}
+			if shortened < waitMs {
+				ms.logger.Info("Turno horizon assist: shortening confirmation wait",
+					"p_end_200ms", turnoHorizon[0], "threshold", thr,
+					"wait_ms_before", waitMs, "wait_ms_after", shortened)
+				waitMs = shortened
+				horizonAssisted = true
+			}
+		}
 		ms.mu.Lock()
 		gate := make(chan struct{})
 		ms.confirmationGate = gate
@@ -1132,14 +1166,15 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// Self-contained lines make the analysis a single pass.
 			ms.logger.Info("Utterance looked incomplete and user resumed speaking, abandoning response",
 				"transcript", transcript, "wait_ms", waitMs,
-				"truly_incomplete", true,
+				"truly_incomplete", true, "horizon_assisted", horizonAssisted,
 				"turno_model", "v6", "turno_label", turnoLabel,
 				"p_complete", turnoState[0], "p_incomplete", turnoState[1],
 				"p_backchannel", turnoState[2], "p_wait", turnoState[3],
 				"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
 				"p_end_800ms", turnoHorizon[2], "speech_frames", turnoFrames)
 			ms.recordExperiment(turnoTurnCompletionExperiment, "v6", ms.openingUnitID(seq), nil,
-				map[string]interface{}{"truly_incomplete": true, "wait_ms": waitMs})
+				map[string]interface{}{"truly_incomplete": true, "wait_ms": waitMs,
+					"horizon_assisted": horizonAssisted})
 			ms.mu.Lock()
 			if ms.confirmationGate == gate {
 				ms.confirmationGate = nil
@@ -1161,14 +1196,15 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// here too, so it is a slightly optimistic negative.
 			ms.logger.Info("Utterance looked incomplete but no continuation arrived, proceeding",
 				"transcript", transcript, "wait_ms", waitMs,
-				"truly_incomplete", false,
+				"truly_incomplete", false, "horizon_assisted", horizonAssisted,
 				"turno_model", "v6", "turno_label", turnoLabel,
 				"p_complete", turnoState[0], "p_incomplete", turnoState[1],
 				"p_backchannel", turnoState[2], "p_wait", turnoState[3],
 				"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
 				"p_end_800ms", turnoHorizon[2], "speech_frames", turnoFrames)
 			ms.recordExperiment(turnoTurnCompletionExperiment, "v6", ms.openingUnitID(seq), nil,
-				map[string]interface{}{"truly_incomplete": false, "wait_ms": waitMs})
+				map[string]interface{}{"truly_incomplete": false, "wait_ms": waitMs,
+					"horizon_assisted": horizonAssisted})
 		case <-ctx.Done():
 			return
 		}

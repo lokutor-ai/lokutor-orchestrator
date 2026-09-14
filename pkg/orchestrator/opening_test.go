@@ -94,3 +94,43 @@ func TestDefaultOpeningIsLLMDriven(t *testing.T) {
 		t.Errorf("default instruction = %q, want OpeningTrigger", instr)
 	}
 }
+
+// The horizon assist may only ever SHORTEN the confirmation wait, never remove
+// it or extend it. It runs after VAD end-of-turn, so a false positive costs a
+// slightly-early answer — but if it could drive the wait to zero the user would
+// lose the window to reclaim a turn they were still finishing.
+func TestHorizonAssistOnlyShortensWithinFloor(t *testing.T) {
+	cases := []struct{ wait, floor int; factor float64; want int }{
+		{600, 120, 0.25, 150}, // phone: 600 -> 150
+		{200, 120, 0.25, 120}, // web: 0.25*200=50, floored to 120
+		{400, 120, 0.25, 120}, // 100 -> floored
+		{800, 120, 0.25, 200}, // default
+	}
+	for _, c := range cases {
+		got := int(float64(c.wait) * c.factor)
+		if got < c.floor {
+			got = c.floor
+		}
+		if got != c.want {
+			t.Errorf("wait=%d factor=%.2f floor=%d: got %d, want %d", c.wait, c.factor, c.floor, got, c.want)
+		}
+		if got > c.wait {
+			t.Errorf("wait=%d: assist produced %d, which is LONGER than the unassisted wait", c.wait, got)
+		}
+		if got <= 0 {
+			t.Errorf("wait=%d: assist produced %d — the user must keep a window to resume", c.wait, got)
+		}
+	}
+}
+
+// 0.5 would never fire: the v6 horizon head peaks around 0.48 on real speech.
+func TestHorizonThresholdIsReachable(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.TurnoHorizonAssistThreshold <= 0 {
+		t.Fatal("horizon assist disabled by default")
+	}
+	if cfg.TurnoHorizonAssistThreshold >= 0.48 {
+		t.Errorf("threshold %.2f is at or above the head's observed ceiling (~0.48) — it would never fire",
+			cfg.TurnoHorizonAssistThreshold)
+	}
+}

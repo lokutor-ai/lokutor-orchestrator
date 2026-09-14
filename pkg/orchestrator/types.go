@@ -247,6 +247,32 @@ type Config struct {
 	// Takes precedence over OpeningInstruction.
 	OpeningMessage string
 
+	// TurnoHorizonAssistThreshold: when Turno's horizon head predicts the
+	// speaker is finishing (p_end_within_200ms at or above this value), the
+	// mid-thought confirmation wait is shortened by
+	// TurnoHorizonAssistFactor rather than run in full.
+	//
+	// This is deliberately placed AFTER VAD end-of-turn, which is what makes
+	// a low-precision signal safe to use here: by this point the user has
+	// already stopped speaking, so a false positive cannot cut anyone off —
+	// it can only make the agent answer a half-finished sentence slightly
+	// sooner, which is the exact risk the lexical gate beside it already
+	// manages. Used to shorten, never to skip: the gate still runs and the
+	// user can still reclaim the turn.
+	//
+	// Default 0.35, not 0.5: the v6 horizon head's scores peak around 0.48 on
+	// real speech, so a conventional cutoff would never fire at all.
+	// Zero disables the assist.
+	TurnoHorizonAssistThreshold float32
+
+	// TurnoHorizonAssistFactor scales the confirmation wait when the horizon
+	// head corroborates. Floored by TurnoHorizonAssistMinMs so the gate keeps
+	// a real window for the user to resume.
+	TurnoHorizonAssistFactor float64
+
+	// TurnoHorizonAssistMinMs is the floor on a shortened wait.
+	TurnoHorizonAssistMinMs int
+
 	// RecordExperiment, when set, receives champion/challenger observations
 	// (see the turn-completion shadow in turno_bargein.go). A hook rather than
 	// a direct dependency: this module has no business knowing where
@@ -443,6 +469,9 @@ func DefaultConfig() Config {
 		// disable (e.g. if the model asset genuinely isn't present).
 		TurnoModelPath:                "assets/onnx/turno/model.onnx",
 		TurnoTurnModelPath:            "assets/onnx/turno/turn_v6.onnx",
+		TurnoHorizonAssistThreshold:   0.35,
+		TurnoHorizonAssistFactor:      0.25,
+		TurnoHorizonAssistMinMs:       120,
 		TurnoBargeinAssistThreshold:   0.8,
 		TurnoBargeinAssistWordsRelief: 1,
 		VoiceUXInstructions:              "",
