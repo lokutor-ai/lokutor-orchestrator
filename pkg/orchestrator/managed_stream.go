@@ -72,6 +72,11 @@ type ManagedStream struct {
 	// confirms one unilaterally either; that decision stays with the
 	// existing STT-based checks. nil when TurnoModelPath isn't configured.
 	turno             *turno.Runtime
+	// turnoTurn is a second, independent Turno instance used ONLY to record
+	// the TurnState/Horizon heads. It gates nothing; its VAD and bargein
+	// outputs are discarded. See TurnoTurnModelPath for why the gating model
+	// can't supply these (dead horizon head).
+	turnoTurn *turno.Runtime
 	turnoBargeinAssistThr   float32
 	turnoBargeinWordsRelief int
 	turnoBargeinPeakScore   float32 // max bargein score seen during the current pendingBargeGen window
@@ -327,6 +332,26 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			}
 		} else {
 			logger.Warn("Turno model file not found, disabled", "path", cfg.TurnoModelPath)
+		}
+	}
+
+	// Second Turno instance for the turn-completion shadow only. Loaded
+	// independently of the gating instance above and never consulted by any
+	// gate — if this fails, ms.turnoTurn stays nil and the only consequence
+	// is that the shadow log line is absent.
+	if cfg.TurnoTurnModelPath != "" && ms.turno != nil {
+		if _, err := os.Stat(cfg.TurnoTurnModelPath); err == nil {
+			g, err := turno.NewRuntime(cfg.TurnoTurnModelPath)
+			if err != nil {
+				logger.Warn("failed to load Turno turn-completion model, shadow disabled", "error", err)
+			} else {
+				ms.turnoTurn = g
+				logger.Info("Turno turn-completion shadow loaded (TurnState/Horizon only)",
+					"model", cfg.TurnoTurnModelPath)
+			}
+		} else {
+			logger.Warn("Turno turn-completion model not found, shadow disabled",
+				"path", cfg.TurnoTurnModelPath)
 		}
 	}
 
@@ -1036,8 +1061,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	turnoState, turnoHorizon := ms.turnoLastTurnState, ms.turnoLastHorizon
 	ms.turnoTurnStateFrames = 0
 	ms.mu.Unlock()
-	if ms.turno != nil && turnoFrames > 0 {
+	if ms.turnoTurn != nil && turnoFrames > 0 {
 		ms.logger.Info("Turno turn-completion shadow",
+			"turno_model", "v6",
 			"lexical_complete", lexicalComplete,
 			"turno_label", turnoLabel,
 			"p_complete", turnoState[0], "p_incomplete", turnoState[1],
@@ -1891,9 +1917,12 @@ func (ms *ManagedStream) Close() {
 		// session with this user can start with context (Retell/ElevenLabs pattern).
 		ms.extractUserMemory()
 
-		// Clean up Turno model
+		// Clean up Turno models (gating instance + turn-completion shadow)
 		if ms.turno != nil {
 			ms.turno.Destroy()
+		}
+		if ms.turnoTurn != nil {
+			ms.turnoTurn.Destroy()
 		}
 
 		time.Sleep(10 * time.Millisecond)

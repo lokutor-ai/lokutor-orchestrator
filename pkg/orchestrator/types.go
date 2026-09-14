@@ -268,6 +268,23 @@ type Config struct {
 	// (see DefaultConfig); set to "" to disable.
 	TurnoModelPath string
 
+	// TurnoTurnModelPath: a SECOND Turno instance, loaded only to record the
+	// TurnState and Horizon heads for the turn-completion shadow (see
+	// managed_stream.go's mid-thought guard). Its VAD and bargein outputs are
+	// discarded — TurnoModelPath above remains the only model that gates
+	// anything.
+	//
+	// This exists because the gating model (v3_aec) has a dead horizon head:
+	// 0.000/0.000/0.060 recall at 200/500/800ms, and measured on real speech
+	// its p_end_200ms never exceeds 0.062, so it cannot cross any usable
+	// threshold. Shadow-logging horizon off it would yield a confident-looking
+	// dataset that means nothing. checkpoints_v6 has the fix and is
+	// signature-identical, so it loads into the same runtime unchanged.
+	//
+	// Set to "" to disable the turn-completion shadow. Failure to load is
+	// non-fatal and leaves every gating path untouched.
+	TurnoTurnModelPath string
+
 	// TurnoBargeinAssistThreshold: while a tentative barge-in is open, if
 	// Turno's bargein score peaks at or above this value, processUtterance
 	// relaxes MinWordsToInterrupt by TurnoBargeinAssistWordsRelief for
@@ -369,6 +386,7 @@ func DefaultConfig() Config {
 		// On by default — see TurnoModelPath's doc comment. Set to "" to
 		// disable (e.g. if the model asset genuinely isn't present).
 		TurnoModelPath:                "assets/onnx/turno/model.onnx",
+		TurnoTurnModelPath:            "assets/onnx/turno/turn_v6.onnx",
 		TurnoBargeinAssistThreshold:   0.8,
 		TurnoBargeinAssistWordsRelief: 1,
 		VoiceUXInstructions:              "",

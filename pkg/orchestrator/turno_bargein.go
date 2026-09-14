@@ -134,18 +134,28 @@ func (ms *ManagedStream) feedTurno(nearChunk16k []byte) {
 			return
 		}
 
-		// Turn-completion heads: keep the most recent frame's verdict so
-		// processUtterance can score it against the lexical gate. Only
-		// frames with actual speech are worth keeping -- a verdict sampled
-		// from trailing silence describes the silence, not the turn that
-		// preceded it.
-		if decision.VAD >= turnoTurnStateVADFloor {
-			ms.mu.Lock()
-			ms.turnoLastTurnState = decision.TurnState
-			ms.turnoLastHorizon = decision.Horizon
-			ms.turnoLastTurnLabel = decision.TurnStateLabel()
-			ms.turnoTurnStateFrames++
-			ms.mu.Unlock()
+		// Turn-completion heads come from the SEPARATE v6 instance, not from
+		// `decision` above. The gating model's horizon head is dead (max
+		// p_end_200ms 0.062 on real speech — it cannot cross any threshold),
+		// so reading these off it would produce a dataset that looks fine and
+		// means nothing. v6 is signature-identical, so the same frame feeds
+		// both; only its TurnState/Horizon are kept and its VAD/bargein are
+		// discarded. Gating still reads `decision` (v3) exclusively.
+		if ms.turnoTurn != nil {
+			turnDec, terr := ms.turnoTurn.Step(nearF, farF)
+			if terr != nil {
+				ms.logger.Warn("Turno turn-completion inference error", "error", terr)
+			} else if turnDec.VAD >= turnoTurnStateVADFloor {
+				// Gate on the shadow model's own VAD: it is the model whose
+				// heads we are recording, so its notion of "mid-speech" is the
+				// one that makes the verdict meaningful.
+				ms.mu.Lock()
+				ms.turnoLastTurnState = turnDec.TurnState
+				ms.turnoLastHorizon = turnDec.Horizon
+				ms.turnoLastTurnLabel = turnDec.TurnStateLabel()
+				ms.turnoTurnStateFrames++
+				ms.mu.Unlock()
+			}
 		}
 
 		// VAD shadow comparison: purely observability, zero effect on
