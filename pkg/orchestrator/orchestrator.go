@@ -237,6 +237,14 @@ func (o *Orchestrator) SetTTSRate(rate float64) {
 	}
 }
 
+// SetOpeningMessage sets a verbatim first line for bot-first conversations.
+// Callers that build their Config before loading the agent record (the browser
+// path does) can apply it here instead. Must be called before the stream is
+// created — the opening fires as soon as the transport is ready.
+func (o *Orchestrator) SetOpeningMessage(msg string) {
+	o.config.OpeningMessage = msg
+}
+
 func (o *Orchestrator) GenerateSilent(ctx context.Context, text string, voice Voice, lang Language) ([]byte, error) {
 	// Try Synthesize (REST) first — avoids WS conflicts with streaming TTS
 	audio, err := o.tts.Synthesize(ctx, text, voice, lang)

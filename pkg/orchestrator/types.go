@@ -182,15 +182,19 @@ type Tool struct {
 	Function interface{} `json:"function"`
 }
 
-// DefaultOpeningInstruction is the inbound-receptionist opening: greet, then
-// hand the floor to the caller. Correct when the caller dialled in wanting
-// something; wrong for any agent that placed the call itself.
-const DefaultOpeningInstruction = "The conversation has just started. Give a brief, natural greeting in the configured language and ask how you can help."
-
-// OutboundOpeningInstruction defers to the agent's own system prompt instead
-// of prescribing what to say. An outbound agent already knows why it called —
-// the orchestrator prescribing "ask how you can help" actively overrode that.
-const OutboundOpeningInstruction = "The conversation has just started and you placed this call. Open it yourself, in the configured language, exactly as your instructions describe. Do not ask the other person how you can help them."
+// OpeningTrigger is the minimal nudge that makes the model take the first
+// turn. It deliberately prescribes NO content.
+//
+// The orchestrator has no business deciding what an agent opens with. It used
+// to inject "give a brief greeting and ask how you can help", which — because
+// it goes in as a USER-role message, outranking the agent's system prompt for
+// that turn — made every agent behave like an inbound receptionist. An
+// outbound sales agent configured to pitch opened by asking the person it had
+// just cold-called how it could help them.
+//
+// Anything about WHAT to say belongs in the agent's own prompt (or in
+// OpeningMessage). This constant only says "your turn".
+const OpeningTrigger = "The conversation has just started and you are speaking first. Open it now, in the configured language, following your own instructions."
 
 // resolveOpening decides how the bot's first turn is produced. Exactly one of
 // the two results is non-empty: a verbatim message to speak (no LLM call), or
@@ -205,7 +209,7 @@ func resolveOpening(cfg Config) (verbatim string, instruction string) {
 	}
 	instr := strings.TrimSpace(cfg.OpeningInstruction)
 	if instr == "" {
-		instr = DefaultOpeningInstruction
+		instr = OpeningTrigger
 	}
 	return "", instr
 }
@@ -234,31 +238,23 @@ type Config struct {
 	FirstSpeaker             FirstSpeaker
 	SilenceTimeout           time.Duration
 
-	// SkipBotGreeting is DEAD — declared, set by the telephony outbound path,
-	// and read by nothing. Use OpeningInstruction/OpeningMessage instead.
-	// Kept only so existing callers still compile; delete once they're moved.
-	//
-	// Deprecated: has never had any effect.
-	SkipBotGreeting bool
-
-	// OpeningInstruction steers the bot's first turn when FirstSpeaker is bot.
-	// It is injected as a USER-role message, which means it outranks the
-	// agent's own system prompt for that turn: the default below tells the
-	// model to ask how it can help, so an outbound sales agent configured to
-	// open with a pitch will instead open by asking how it can help, no
-	// matter what its prompt says. That was a real customer-visible bug.
-	// Callers that want the agent's own prompt to drive the opening should
-	// set OutboundOpeningInstruction (or their own text) here.
-	//
-	// Empty means DefaultOpeningInstruction.
-	OpeningInstruction string
-
 	// OpeningMessage, when non-empty, is spoken verbatim as the bot's first
-	// turn and no LLM call is made at all. Deterministic (the caller hears
-	// exactly what was configured, every time) and it removes an LLM
-	// round-trip from the start of every call. Takes precedence over
-	// OpeningInstruction.
+	// turn and no LLM call is made at all. This is opt-in: a customer who
+	// wants a scripted first line gets exactly that line every time, and the
+	// call skips an LLM round-trip. Leave it empty and the agent improvises
+	// its own opening from its prompt, which is the default.
+	//
+	// Takes precedence over OpeningInstruction.
 	OpeningMessage string
+
+	// OpeningInstruction overrides the nudge that triggers the bot's first
+	// turn. Injected as a USER-role message, so it outranks the agent's system
+	// prompt for that turn — which is exactly why the default (OpeningTrigger)
+	// prescribes no content at all. Set this only to change the *mechanism*,
+	// never to put words in an agent's mouth; that belongs in its prompt.
+	//
+	// Empty means OpeningTrigger.
+	OpeningInstruction string
 
 	// PostInterruptBackoff: after a confirmed barge-in, wait this long from
 	// the interrupt (not from when the response is ready) before the bot's

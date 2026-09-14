@@ -18,14 +18,14 @@ func TestResolveOpening(t *testing.T) {
 		wantInstr  string
 	}{
 		{
-			name:      "default is the inbound greeting",
+			name:      "default prescribes no content",
 			cfg:       Config{},
-			wantInstr: DefaultOpeningInstruction,
+			wantInstr: OpeningTrigger,
 		},
 		{
-			name:      "outbound defers to the agent's own prompt",
-			cfg:       Config{OpeningInstruction: OutboundOpeningInstruction},
-			wantInstr: OutboundOpeningInstruction,
+			name:      "explicit instruction is honoured",
+			cfg:       Config{OpeningInstruction: "Open with the Q3 promo."},
+			wantInstr: "Open with the Q3 promo.",
 		},
 		{
 			name:       "configured message is spoken verbatim, no LLM",
@@ -36,19 +36,19 @@ func TestResolveOpening(t *testing.T) {
 			name: "verbatim message beats any instruction",
 			cfg: Config{
 				OpeningMessage:     "Hola, le llamo de Acme.",
-				OpeningInstruction: OutboundOpeningInstruction,
+				OpeningInstruction: "Open with the Q3 promo.",
 			},
 			wantVerbat: "Hola, le llamo de Acme.",
 		},
 		{
 			name:      "whitespace-only message falls back to the instruction",
-			cfg:       Config{OpeningMessage: "   \n ", OpeningInstruction: OutboundOpeningInstruction},
-			wantInstr: OutboundOpeningInstruction,
+			cfg:       Config{OpeningMessage: "   \n ", OpeningInstruction: "Open with the Q3 promo."},
+			wantInstr: "Open with the Q3 promo.",
 		},
 		{
 			name:      "whitespace-only instruction falls back to the default",
 			cfg:       Config{OpeningInstruction: "  "},
-			wantInstr: DefaultOpeningInstruction,
+			wantInstr: OpeningTrigger,
 		},
 	}
 
@@ -68,30 +68,29 @@ func TestResolveOpening(t *testing.T) {
 	}
 }
 
-// The outbound instruction must not itself reintroduce the behavior it exists
-// to prevent. SkipBotGreeting was set for outbound for exactly this purpose and
-// silently did nothing, so assert on content rather than trusting a flag.
-func TestOutboundOpeningDoesNotAskHowToHelp(t *testing.T) {
-	lower := strings.ToLower(OutboundOpeningInstruction)
-	for _, bad := range []string{"ask how you can help", "how can i help"} {
-		if strings.Contains(lower, bad) && !strings.Contains(lower, "do not ask") {
-			t.Errorf("outbound opening instruction still tells the model to offer help: %q",
-				OutboundOpeningInstruction)
+// The default trigger must not put words in the agent's mouth. The whole bug
+// was the orchestrator prescribing content that outranked the agent's prompt,
+// so assert on the text rather than trusting that nobody reintroduces it.
+func TestOpeningTriggerPrescribesNoContent(t *testing.T) {
+	lower := strings.ToLower(OpeningTrigger)
+	for _, banned := range []string{
+		"how can i help", "how you can help", "greeting", "greet",
+		"hello", "hi there", "good morning", "welcome",
+	} {
+		if strings.Contains(lower, banned) {
+			t.Errorf("OpeningTrigger prescribes content (%q): %q", banned, OpeningTrigger)
 		}
-	}
-	if !strings.Contains(lower, "do not ask") {
-		t.Error("outbound opening instruction should explicitly rule out the greeting-and-yield behavior")
 	}
 }
 
-// SkipBotGreeting is dead. If someone revives it as a real control they must
-// also wire it into the opening path; this documents that it is currently inert
-// so a future reader doesn't set it and assume it took effect.
-func TestSkipBotGreetingIsInert(t *testing.T) {
-	_, withFlag := resolveOpening(Config{SkipBotGreeting: true})
-	_, without := resolveOpening(Config{})
-	if withFlag != without {
-		t.Fatalf("SkipBotGreeting now changes behavior (%q vs %q) — update its doc comment "+
-			"and the outbound path in voice_agent_telnyx.go", withFlag, without)
+// With nothing configured, the agent improvises from its own prompt — there is
+// no orchestrator-supplied script and no verbatim line.
+func TestDefaultOpeningIsLLMDriven(t *testing.T) {
+	verbatim, instr := resolveOpening(Config{})
+	if verbatim != "" {
+		t.Errorf("default should not speak a canned line, got %q", verbatim)
+	}
+	if instr != OpeningTrigger {
+		t.Errorf("default instruction = %q, want OpeningTrigger", instr)
 	}
 }
