@@ -1092,11 +1092,19 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// onVADStart/handleAudio and will reach processUtterance on its
 			// own once it, in turn, looks complete (or times out here too).
 			// truly_incomplete=true is ground truth: the user did resume, so
-			// the lexical gate was right to wait. turno_label on the same
-			// line says whether Turno would have agreed.
+			// the lexical gate was right to wait. The full Turno prediction
+			// is repeated here rather than left to be joined against the
+			// shadow line above -- log lines carry no call/utterance id, so
+			// in a pod running concurrent calls a join would be guesswork.
+			// Self-contained lines make the analysis a single pass.
 			ms.logger.Info("Utterance looked incomplete and user resumed speaking, abandoning response",
 				"transcript", transcript, "wait_ms", waitMs,
-				"truly_incomplete", true, "turno_label", turnoLabel)
+				"truly_incomplete", true,
+				"turno_model", "v6", "turno_label", turnoLabel,
+				"p_complete", turnoState[0], "p_incomplete", turnoState[1],
+				"p_backchannel", turnoState[2], "p_wait", turnoState[3],
+				"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
+				"p_end_800ms", turnoHorizon[2], "speech_frames", turnoFrames)
 			ms.mu.Lock()
 			if ms.confirmationGate == gate {
 				ms.confirmationGate = nil
@@ -1112,10 +1120,18 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			ms.mu.Unlock()
 			// truly_incomplete=false: the lexical gate made us wait waitMs for
 			// a continuation that never came. If Turno said "complete" here,
-			// that wait was latency the horizon head could have saved.
+			// that wait was latency the horizon head could have saved. Note
+			// this label means "did not resume within waitMs", not "the turn
+			// was definitively over" -- a user resuming at waitMs+1 lands
+			// here too, so it is a slightly optimistic negative.
 			ms.logger.Info("Utterance looked incomplete but no continuation arrived, proceeding",
 				"transcript", transcript, "wait_ms", waitMs,
-				"truly_incomplete", false, "turno_label", turnoLabel)
+				"truly_incomplete", false,
+				"turno_model", "v6", "turno_label", turnoLabel,
+				"p_complete", turnoState[0], "p_incomplete", turnoState[1],
+				"p_backchannel", turnoState[2], "p_wait", turnoState[3],
+				"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
+				"p_end_800ms", turnoHorizon[2], "speech_frames", turnoFrames)
 		case <-ctx.Done():
 			return
 		}
