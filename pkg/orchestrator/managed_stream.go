@@ -2424,12 +2424,8 @@ func (ms *ManagedStream) updateActivity() {
 func (ms *ManagedStream) monitorInactivity() {
 	ms.mu.Lock()
 	timeout := 10 * time.Second
-	maxUtterance := time.Duration(0)
 	if ms.orch != nil {
 		timeout = ms.orch.config.SilenceTimeout
-		if sec := ms.orch.config.MaxUtteranceSec; sec > 0 {
-			maxUtterance = time.Duration(sec) * time.Second
-		}
 	}
 	ms.mu.Unlock()
 
@@ -2454,32 +2450,6 @@ func (ms *ManagedStream) monitorInactivity() {
 
 			if ms.isClosed.Load() {
 				return
-			}
-
-			// A VAD that latches on never fires SpeechEnd, so the turn never
-			// completes and every recovery path below is skipped (they all
-			// require the user to be silent). Force the turn closed instead of
-			// leaving the caller in permanent silence: onVADEnd transcribes
-			// whatever was captured, so a stuck VAD degrades to a normal — if
-			// long — turn rather than a dead call.
-			if userSpeaking && maxUtterance > 0 {
-				ms.mu.Lock()
-				since := time.Since(ms.userSpeakingSince)
-				ms.mu.Unlock()
-				if since > maxUtterance {
-					ms.logger.Warn("VAD reported continuous speech past the ceiling — forcing end of turn",
-						"speaking_for_sec", int(since.Seconds()),
-						"ceiling_sec", int(maxUtterance.Seconds()))
-					ms.mu.Lock()
-					ms.vadSpeaking = false
-					prev := ms.state
-					ms.mu.Unlock()
-					if ms.vad != nil {
-						ms.vad.Reset()
-					}
-					ms.onVADEnd(prev)
-					continue
-				}
 			}
 
 			if !thinking && !speaking && !userSpeaking {

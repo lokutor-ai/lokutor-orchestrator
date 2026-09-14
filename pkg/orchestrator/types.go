@@ -247,18 +247,6 @@ type Config struct {
 	// Takes precedence over OpeningInstruction.
 	OpeningMessage string
 
-	// MaxUtteranceSec bounds how long VAD may report continuous speech before
-	// the turn is force-ended.
-	//
-	// If VAD latches on — noise, a held line, a device quirk — it never fires
-	// SpeechEnd, so nothing ever transcribes and the caller waits in silence
-	// forever. The silence nudge cannot rescue that either, because it is
-	// gated on the user NOT speaking. This is the ceiling that turns a stuck
-	// VAD into a completed turn instead of a dead call.
-	//
-	// Generous by design: a real monologue should never hit it. Zero disables.
-	MaxUtteranceSec int
-
 	// TurnoHoldThreshold guards the opposite failure from the horizon assist:
 	// the speaker finishes a sentence, pauses, and carries on — but the
 	// transcript already reads as complete, so the lexical gate applies no
@@ -501,7 +489,6 @@ func DefaultConfig() Config {
 		// disable (e.g. if the model asset genuinely isn't present).
 		TurnoModelPath:                "assets/onnx/turno/model.onnx",
 		TurnoTurnModelPath:            "assets/onnx/turno/turn_v6.onnx",
-		MaxUtteranceSec:               60,
 		TurnoHoldThreshold:            0.45,
 		TurnoHoldMs:                   350,
 		TurnoHorizonAssistThreshold:   0.35,

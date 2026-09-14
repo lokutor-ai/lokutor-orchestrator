@@ -59,18 +59,3 @@ func TestIdleStatesAreAllRecoverable(t *testing.T) {
 		}
 	}
 }
-
-// The stuck-VAD ceiling has to be generous enough that a real monologue never
-// trips it, but finite — an infinite ceiling is the bug it exists to fix.
-func TestMaxUtteranceCeilingIsSaneAndFinite(t *testing.T) {
-	cfg := DefaultConfig()
-	if cfg.MaxUtteranceSec <= 0 {
-		t.Fatal("no utterance ceiling: a latched VAD would strand the call forever")
-	}
-	if cfg.MaxUtteranceSec < 30 {
-		t.Errorf("ceiling %ds is short enough to cut off a real monologue", cfg.MaxUtteranceSec)
-	}
-	if cfg.MaxUtteranceSec > 300 {
-		t.Errorf("ceiling %ds leaves a stuck call silent for minutes", cfg.MaxUtteranceSec)
-	}
-}
