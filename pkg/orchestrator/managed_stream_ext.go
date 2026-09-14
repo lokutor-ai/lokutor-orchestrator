@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -328,6 +330,21 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	}()
 
 	var pendingSentence strings.Builder
+	// The FIRST chunk of a response is flushed to TTS eagerly (see the flush
+	// loop below) so the bot starts talking sooner: TTS time-to-first-audio
+	// scales with chunk length, so a long opening sentence otherwise makes the
+	// caller wait for the whole thing to synthesize before hearing anything.
+	// Once the first chunk is out, later chunks flush on sentence boundaries
+	// for natural prosody. Safe because the first chunk's playback time covers
+	// the next chunk's synthesis, so audio stays gapless.
+	firstChunkDone := false
+	const firstChunkClauseMin = 12 // don't flush a clause shorter than this
+	firstChunkMaxChars := 32       // hard cap on the opening chunk's length
+	if v := os.Getenv("TTS_FIRST_CHUNK_MAX_CHARS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= firstChunkClauseMin {
+			firstChunkMaxChars = n
+		}
+	}
 
 	flushSentence := func() {
 		s := strings.TrimSpace(pendingSentence.String())
@@ -374,18 +391,38 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 			buf := pendingSentence.String()
 
-			// Flush on sentence-ending punctuation
+			// Decide where to flush. Sentence-ending punctuation always flushes
+			// (natural prosody). For the FIRST chunk only, also flush at a clause
+			// boundary (comma/semicolon/colon) past a small minimum, and if no
+			// punctuation has appeared by firstChunkMaxChars, cut at the last
+			// word boundary — so the opening chunk stays short and the bot
+			// starts speaking quickly instead of waiting for a whole long
+			// sentence to synthesize.
+			flushEnd := -1 // exclusive byte index of the segment to flush
 			for i, c := range buf {
 				if c == '.' || c == '!' || c == '?' {
-					sentence := strings.TrimSpace(buf[:i+1])
-					if sentence != "" {
-						ttsQueue <- sentence
-					}
-					rest := strings.TrimSpace(buf[i+1:])
-					pendingSentence.Reset()
-					pendingSentence.WriteString(rest)
+					flushEnd = i + 1
 					break
 				}
+				if !firstChunkDone && (c == ',' || c == ';' || c == ':') && i >= firstChunkClauseMin {
+					flushEnd = i + 1
+					break
+				}
+			}
+			if flushEnd < 0 && !firstChunkDone && len(buf) >= firstChunkMaxChars {
+				if sp := strings.LastIndexByte(strings.TrimRight(buf[:firstChunkMaxChars], " "), ' '); sp > firstChunkClauseMin {
+					flushEnd = sp + 1
+				}
+			}
+			if flushEnd > 0 {
+				seg := strings.TrimSpace(buf[:flushEnd])
+				if seg != "" {
+					ttsQueue <- seg
+					firstChunkDone = true
+				}
+				rest := strings.TrimSpace(buf[flushEnd:])
+				pendingSentence.Reset()
+				pendingSentence.WriteString(rest)
 			}
 
 			return nil
