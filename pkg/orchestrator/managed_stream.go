@@ -1107,10 +1107,38 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			}, nil)
 	}
 
-	if ms.turnComp != nil && !lexicalComplete {
+	// Turno hold: the transcript reads as finished, but prosody says the
+	// speaker is not. Without this a sentence that merely *ends* — "I ordered
+	// it last Tuesday." followed by a breath and "...and it never arrived" —
+	// gets no confirmation window at all, because the lexical gate only fires
+	// on text that looks incomplete. That is the case where the agent talks
+	// over a continuation.
+	turnoSaysHold := false
+	if thr := ms.orch.config.TurnoHoldThreshold; thr > 0 && ms.turnoTurn != nil && turnoFrames > 0 {
+		// p_incomplete + p_wait: "not finished" and "pausing, expecting to go
+		// on" are both reasons to keep the floor with the caller.
+		turnoSaysHold = (turnoState[1] + turnoState[3]) >= thr
+	}
+
+	if ms.turnComp != nil && (!lexicalComplete || turnoSaysHold) {
 		waitMs := ms.orch.config.SilenceConfirmationMs
 		if waitMs <= 0 {
 			waitMs = 800
+		}
+		if lexicalComplete && turnoSaysHold {
+			// Text looks done and only prosody disagrees, so this is a grace
+			// window rather than a full mid-thought wait.
+			hold := ms.orch.config.TurnoHoldMs
+			if hold <= 0 {
+				hold = 350
+			}
+			if hold < waitMs {
+				waitMs = hold
+			}
+			ms.logger.Info("Turno hold: text looked complete but prosody says the speaker is not done",
+				"p_incomplete", turnoState[1], "p_wait", turnoState[3],
+				"threshold", ms.orch.config.TurnoHoldThreshold, "hold_ms", waitMs,
+				"transcript", transcript)
 		}
 
 		// Turno horizon assist: when the head predicts the speaker was
@@ -1125,6 +1153,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// reclaims the turn.
 		horizonAssisted := false
 		if thr := ms.orch.config.TurnoHorizonAssistThreshold; thr > 0 &&
+			!lexicalComplete && !turnoSaysHold &&
 			ms.turnoTurn != nil && turnoFrames > 0 && turnoHorizon[0] >= thr {
 			factor := ms.orch.config.TurnoHorizonAssistFactor
 			if factor <= 0 || factor >= 1 {

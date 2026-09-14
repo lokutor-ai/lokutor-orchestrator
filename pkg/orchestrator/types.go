@@ -247,6 +247,26 @@ type Config struct {
 	// Takes precedence over OpeningInstruction.
 	OpeningMessage string
 
+	// TurnoHoldThreshold guards the opposite failure from the horizon assist:
+	// the speaker finishes a sentence, pauses, and carries on — but the
+	// transcript already reads as complete, so the lexical gate applies no
+	// confirmation wait at all and the agent talks over the continuation.
+	//
+	// Turno's TurnState head sees prosody rather than punctuation, so it can
+	// tell "finished a sentence" from "finished speaking". When
+	// p_incomplete + p_wait reaches this value the turn is held briefly even
+	// though the text looks complete.
+	//
+	// A false positive here costs a short delay; a false negative talks over
+	// the user. Those are not symmetric, which is why this errs toward
+	// holding. Zero disables the hold.
+	TurnoHoldThreshold float32
+
+	// TurnoHoldMs is how long a Turno-flagged turn is held. Deliberately much
+	// shorter than SilenceConfirmationMs: the text does look complete, so this
+	// is a grace window, not a full mid-thought wait.
+	TurnoHoldMs int
+
 	// TurnoHorizonAssistThreshold: when Turno's horizon head predicts the
 	// speaker is finishing (p_end_within_200ms at or above this value), the
 	// mid-thought confirmation wait is shortened by
@@ -469,6 +489,8 @@ func DefaultConfig() Config {
 		// disable (e.g. if the model asset genuinely isn't present).
 		TurnoModelPath:                "assets/onnx/turno/model.onnx",
 		TurnoTurnModelPath:            "assets/onnx/turno/turn_v6.onnx",
+		TurnoHoldThreshold:            0.45,
+		TurnoHoldMs:                   350,
 		TurnoHorizonAssistThreshold:   0.35,
 		TurnoHorizonAssistFactor:      0.25,
 		TurnoHorizonAssistMinMs:       120,

@@ -134,3 +134,47 @@ func TestHorizonThresholdIsReachable(t *testing.T) {
 			cfg.TurnoHorizonAssistThreshold)
 	}
 }
+
+// The hold and the horizon assist push in opposite directions, and they must
+// never both apply to the same turn — shortening a wait that exists precisely
+// because prosody says the speaker is still going would reintroduce the bug.
+func TestHoldAndHorizonAreMutuallyExclusive(t *testing.T) {
+	cfg := DefaultConfig()
+	type turn struct {
+		lexicalComplete bool
+		pIncomplete, pWait, pEnd200 float32
+	}
+	check := func(name string, tr turn, wantHold, wantAssist bool) {
+		t.Helper()
+		hold := cfg.TurnoHoldThreshold > 0 && (tr.pIncomplete+tr.pWait) >= cfg.TurnoHoldThreshold
+		assist := cfg.TurnoHorizonAssistThreshold > 0 && !tr.lexicalComplete && !hold &&
+			tr.pEnd200 >= cfg.TurnoHorizonAssistThreshold
+		if hold != wantHold || assist != wantAssist {
+			t.Errorf("%s: hold=%v assist=%v, want hold=%v assist=%v", name, hold, assist, wantHold, wantAssist)
+		}
+		if hold && assist {
+			t.Errorf("%s: both hold and assist applied to one turn", name)
+		}
+	}
+	// Text reads complete, prosody says still going -> hold, no assist.
+	check("complete text, prosody says continuing", turn{true, 0.40, 0.20, 0.40}, true, false)
+	// Text reads incomplete, horizon says ending -> assist, no hold.
+	check("incomplete text, horizon says ending", turn{false, 0.10, 0.05, 0.40}, false, true)
+	// Incomplete text AND prosody says continuing -> hold wins, full wait kept.
+	check("incomplete text, prosody says continuing", turn{false, 0.40, 0.20, 0.45}, true, false)
+	// Nothing conclusive -> neither.
+	check("no signal", turn{true, 0.10, 0.05, 0.10}, false, false)
+}
+
+// Holding must never cost more than the mid-thought wait it sits beside: the
+// text did look finished, so this is a grace window, not a full re-wait.
+func TestHoldIsShorterThanTheMidThoughtWait(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.TurnoHoldMs <= 0 {
+		t.Fatal("hold disabled by default")
+	}
+	if cfg.TurnoHoldMs >= cfg.SilenceConfirmationMs && cfg.SilenceConfirmationMs > 0 {
+		t.Errorf("hold %dms is not shorter than the mid-thought wait %dms",
+			cfg.TurnoHoldMs, cfg.SilenceConfirmationMs)
+	}
+}
