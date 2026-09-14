@@ -805,6 +805,26 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 		return
 	}
 	ms.pendingBargeIn = false
+
+	// Never resume playback into someone who is still talking.
+	//
+	// A tentative barge-in is rejected for several reasons that say nothing
+	// about whether the caller has stopped: the utterance was under minDur,
+	// isLikelyNoise, or it carried fewer than MinWordsToInterrupt words. All
+	// of those can fire while the caller is mid-sentence — they remembered
+	// something, started again, and the first fragment was simply too short
+	// to clear the gate. Resuming there is the worst possible moment: the
+	// agent talks straight over a speaking human.
+	//
+	// If VAD still reports speech, stay muted and leave the pipeline alone.
+	// The utterance in flight will resolve this on its own — confirming a
+	// real barge-in once enough words arrive, or calling back here once the
+	// caller actually stops.
+	if ms.vadSpeaking {
+		ms.state = StateListening
+		return
+	}
+
 	switch {
 	case ms.ttsCancel != nil:
 		ms.state = StateSpeaking
