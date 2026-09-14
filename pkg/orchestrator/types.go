@@ -247,6 +247,15 @@ type Config struct {
 	// Takes precedence over OpeningInstruction.
 	OpeningMessage string
 
+	// RecordExperiment, when set, receives champion/challenger observations
+	// (see the turn-completion shadow in turno_bargein.go). A hook rather than
+	// a direct dependency: this module has no business knowing where
+	// observations are stored, and the host already owns that.
+	//
+	// Implementations MUST NOT block — this is called from the audio path.
+	// Nil means no recording.
+	RecordExperiment func(experiment, variant, unitID string, metrics, label map[string]interface{})
+
 	// OpeningInstruction overrides the nudge that triggers the bot's first
 	// turn. Injected as a USER-role message, so it outranks the agent's system
 	// prompt for that turn — which is exactly why the default (OpeningTrigger)

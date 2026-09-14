@@ -34,7 +34,10 @@ package orchestrator
 // Both are purely additive: when ms.turno is nil (TurnoModelPath
 // unset, or the model failed to load), feedTurno is a no-op.
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"strconv"
+)
 
 const turnoSampleRate = 16000
 const turnoFrameBytes = 320 * 2 // Hop samples * 2 bytes/sample (int16 PCM)
@@ -57,6 +60,32 @@ const turnoShadowLogEveryNFrames = 50
 // stops would record a verdict about silence and compare it against a
 // transcript, which is not the comparison we want to draw conclusions from.
 const turnoTurnStateVADFloor = 0.5
+
+// turnoTurnCompletionExperiment names the champion/challenger comparison
+// between the incumbent lexical end-of-turn gate and Turno's TurnState/Horizon
+// heads. See pkg/experiments in the host repo for how observations are stored.
+const turnoTurnCompletionExperiment = "turno_turn_completion"
+
+// recordExperiment forwards an observation to the host's recorder, if one is
+// configured. Nil-safe and non-blocking by contract, so call sites in the
+// audio path don't need to guard.
+func (ms *ManagedStream) recordExperiment(experiment, variant, unitID string, metrics, label map[string]interface{}) {
+	if ms.orch == nil || ms.orch.config.RecordExperiment == nil {
+		return
+	}
+	ms.orch.config.RecordExperiment(experiment, variant, unitID, metrics, label)
+}
+
+// openingUnitID identifies one utterance across the several observations it
+// produces (a prediction now, its ground-truth label a second later), so the
+// two can be joined without depending on log ordering.
+func (ms *ManagedStream) openingUnitID(seq int) string {
+	id := ""
+	if ms.session != nil {
+		id = ms.session.ID
+	}
+	return id + "#" + strconv.Itoa(seq)
+}
 
 // noteFarEndAudio appends the bot's own outgoing audio (already resampled
 // to 16kHz PCM16 by the caller) to the far-end ring buffer that feedTurno

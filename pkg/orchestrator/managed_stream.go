@@ -1085,6 +1085,26 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			"p_end_800ms", turnoHorizon[2],
 			"speech_frames", turnoFrames,
 			"transcript", transcript)
+
+		// Same observation, durably. The log line stays for live debugging;
+		// this is what the analysis actually reads. No transcript goes in —
+		// rows are aggregated across companies, so only derived features are
+		// safe here.
+		ms.recordExperiment(turnoTurnCompletionExperiment, "v6", ms.openingUnitID(seq),
+			map[string]interface{}{
+				"lexical_complete": lexicalComplete,
+				"turno_label":      turnoLabel,
+				"p_complete":       turnoState[0],
+				"p_incomplete":     turnoState[1],
+				"p_backchannel":    turnoState[2],
+				"p_wait":           turnoState[3],
+				"p_end_200ms":      turnoHorizon[0],
+				"p_end_500ms":      turnoHorizon[1],
+				"p_end_800ms":      turnoHorizon[2],
+				"speech_frames":    turnoFrames,
+				"transcript_chars": len(transcript),
+				"transcript_words": countWords(transcript),
+			}, nil)
 	}
 
 	if ms.turnComp != nil && !lexicalComplete {
@@ -1118,6 +1138,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"p_backchannel", turnoState[2], "p_wait", turnoState[3],
 				"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
 				"p_end_800ms", turnoHorizon[2], "speech_frames", turnoFrames)
+			ms.recordExperiment(turnoTurnCompletionExperiment, "v6", ms.openingUnitID(seq), nil,
+				map[string]interface{}{"truly_incomplete": true, "wait_ms": waitMs})
 			ms.mu.Lock()
 			if ms.confirmationGate == gate {
 				ms.confirmationGate = nil
@@ -1145,6 +1167,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"p_backchannel", turnoState[2], "p_wait", turnoState[3],
 				"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
 				"p_end_800ms", turnoHorizon[2], "speech_frames", turnoFrames)
+			ms.recordExperiment(turnoTurnCompletionExperiment, "v6", ms.openingUnitID(seq), nil,
+				map[string]interface{}{"truly_incomplete": false, "wait_ms": waitMs})
 		case <-ctx.Done():
 			return
 		}
