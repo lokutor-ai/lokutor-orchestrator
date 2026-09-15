@@ -246,6 +246,24 @@ type Config struct {
 	FirstSpeaker             FirstSpeaker
 	SilenceTimeout           time.Duration
 
+	// TurnoEarlyEndThreshold, when > 0, lets Turno's horizon head cut the VAD
+	// hangover short. The hangover (~448ms) exists to be certain a pause is
+	// really the end of a turn using energy alone; a turn-detection model
+	// removes exactly that uncertainty, so sitting out the full wait when the
+	// model is confident is latency spent for nothing.
+	//
+	// Off by default. It is the one signal here that can make the agent
+	// interrupt: everything downstream (the lexical gate, the confirmation
+	// window) still runs, so a false positive costs a slightly early answer
+	// rather than talking over someone — but it is still the riskiest of the
+	// Turno hooks, so it ships dark and is enabled deliberately.
+	TurnoEarlyEndThreshold float32
+
+	// TurnoEarlyEndMs is the silence required once the horizon head is
+	// confident. Floored at TurnoEarlyEndMinMs so this can never become a
+	// hair-trigger.
+	TurnoEarlyEndMs int
+
 	// RecordingNotice, when non-empty, is spoken verbatim at the very start of
 	// the call, before any substantive conversation. It exists to satisfy
 	// call-recording consent law, which is why it must not be left to the

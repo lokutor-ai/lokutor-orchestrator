@@ -12,8 +12,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/lokutor-ai/lokutor-orchestrator/pkg/turno"
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/prosody"
+	"github.com/lokutor-ai/lokutor-orchestrator/pkg/turno"
 )
 
 // byteBufPool recycles byte slices to reduce GC pressure in the audio hot path.
@@ -71,12 +71,12 @@ type ManagedStream struct {
 	// retrain (see types.go: TurnoBargeinAssistThreshold) — it no longer
 	// confirms one unilaterally either; that decision stays with the
 	// existing STT-based checks. nil when TurnoModelPath isn't configured.
-	turno             *turno.Runtime
+	turno *turno.Runtime
 	// turnoTurn is a second, independent Turno instance used ONLY to record
 	// the TurnState/Horizon heads. It gates nothing; its VAD and bargein
 	// outputs are discarded. See TurnoTurnModelPath for why the gating model
 	// can't supply these (dead horizon head).
-	turnoTurn *turno.Runtime
+	turnoTurn               *turno.Runtime
 	turnoBargeinAssistThr   float32
 	turnoBargeinWordsRelief int
 	turnoBargeinPeakScore   float32 // max bargein score seen during the current pendingBargeGen window
@@ -93,8 +93,8 @@ type ManagedStream struct {
 	turnoLastTurnState   [4]float32
 	turnoLastHorizon     [3]float32
 	turnoLastTurnLabel   string
-	turnoTurnStateFrames int // frames captured since the last utterance, 0 = no Turno audio seen
-	farEndBuf            []byte  // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
+	turnoTurnStateFrames int    // frames captured since the last utterance, 0 = no Turno audio seen
+	farEndBuf            []byte // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
 	farEndMu             sync.Mutex
 
 	cmdChan       chan []byte
@@ -609,6 +609,13 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	// ever say the user stopped talking.
 	ms.updatePauseSpeculationTrigger(chunk)
 
+	// Turno early end. Speculation above only pre-computes; the hangover is
+	// still what commits the turn, so it is the hangover that has to shrink
+	// for the caller to hear a reply sooner. The horizon head predicts
+	// end-of-turn ~200ms ahead, which is precisely the certainty the hangover
+	// is spending time to establish from energy alone.
+	ms.maybeArmTurnoEarlyEnd()
+
 	switch {
 	case event != nil && event.Type == VADSpeechStart:
 		ms.onVADStart(state)
@@ -628,6 +635,45 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		ms.updateActivity()
 	}
 }
+
+// maybeArmTurnoEarlyEnd shortens the current utterance's hangover when Turno's
+// horizon head is confident the turn is ending.
+//
+// Only ever shortens, only for the utterance in flight, and only while the
+// caller is actually speaking — arming during silence would let a stale frame
+// clip the very next utterance. Every downstream guard still runs, so the
+// worst case is answering a shade early, not talking over someone.
+func (ms *ManagedStream) maybeArmTurnoEarlyEnd() {
+	thr := ms.orch.config.TurnoEarlyEndThreshold
+	if thr <= 0 || ms.turnoTurn == nil || ms.turnoTurnStateFrames == 0 {
+		return
+	}
+	if !ms.vadSpeaking {
+		return
+	}
+	// Horizon[0] is the 200ms-ahead prediction — the shortest and most
+	// confident of the three, and the only one worth acting on this late.
+	if ms.turnoLastHorizon[0] < thr {
+		return
+	}
+
+	earlyMs := ms.orch.config.TurnoEarlyEndMs
+	if earlyMs <= 0 {
+		earlyMs = 200
+	}
+	if earlyMs < turnoEarlyEndMinMs {
+		earlyMs = turnoEarlyEndMinMs
+	}
+
+	if v, ok := ms.vad.(interface{ ArmEarlyEnd(time.Duration) }); ok {
+		v.ArmEarlyEnd(time.Duration(earlyMs) * time.Millisecond)
+	}
+}
+
+// turnoEarlyEndMinMs is the floor on the shortened hangover. Below roughly
+// this, normal within-sentence breathing pauses start ending turns, which is
+// the failure the hangover exists to prevent in the first place.
+const turnoEarlyEndMinMs = 150
 
 // resampleTo16k resamples audio from the input sample rate to 16kHz using linear interpolation.
 func resampleTo16k(audio []byte, inputSampleRate int) []byte {

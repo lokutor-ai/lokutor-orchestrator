@@ -12,8 +12,17 @@ type ImprovedRMSVAD struct {
 	mu           sync.Mutex
 	threshold    float64
 	silenceLimit time.Duration
-	isSpeaking   bool
-	silenceStart time.Time
+
+	// earlyEndLimit, when non-zero, replaces silenceLimit for the CURRENT
+	// silence run only. Turno's horizon head predicts end-of-turn ~200ms
+	// ahead, so when it is confident there is no reason to sit out the full
+	// hangover — that hangover exists to be certain from energy alone, which
+	// is precisely the uncertainty a turn-detection model removes. Cleared on
+	// every speech start and on every emitted end, so it can never leak into
+	// an utterance nobody armed it for.
+	earlyEndLimit time.Duration
+	isSpeaking    bool
+	silenceStart  time.Time
 
 	noiseFloor float64
 	emaRMS     float64
@@ -48,6 +57,17 @@ type ImprovedRMSVAD struct {
 
 	adaptiveMode bool
 	sampleRate   int
+}
+
+// ArmEarlyEnd shortens the silence required to end the current utterance.
+// It only ever shortens: passing a limit longer than the configured hangover
+// is ignored, so arming this can never make the agent slower to respond, and a
+// caller that keeps talking still holds the floor because speech resets it.
+func (v *ImprovedRMSVAD) ArmEarlyEnd(limit time.Duration) {
+	if limit <= 0 || limit >= v.silenceLimit {
+		return
+	}
+	v.earlyEndLimit = limit
 }
 
 func NewImprovedRMSVAD(threshold float64, silenceLimit time.Duration, sampleRate int) *ImprovedRMSVAD {
@@ -293,6 +313,8 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 			if v.consecutiveFrames >= v.minConfirmed {
 				v.isSpeaking = true
 				v.silenceStart = time.Time{}
+				// A new utterance must never inherit the previous one's arming.
+				v.earlyEndLimit = 0
 				return &VADEvent{Type: VADSpeechStart, Timestamp: now.UnixMilli()}, nil
 			}
 		} else {
@@ -308,9 +330,14 @@ func (v *ImprovedRMSVAD) Process(chunk []byte) (*VADEvent, error) {
 			v.silenceStart = now
 		}
 
-		if now.Sub(v.silenceStart) >= v.silenceLimit {
+		limit := v.silenceLimit
+		if v.earlyEndLimit > 0 && v.earlyEndLimit < limit {
+			limit = v.earlyEndLimit
+		}
+		if now.Sub(v.silenceStart) >= limit {
 			v.isSpeaking = false
 			v.silenceStart = time.Time{}
+			v.earlyEndLimit = 0
 			// Reset EMA so post-speech decay doesn't cause false re-trigger
 			v.emaRMS = v.noiseFloor
 			// Reset the min tracker so noise floor adapts from current baseline
