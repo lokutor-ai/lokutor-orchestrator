@@ -197,6 +197,9 @@ type ManagedStream struct {
 	ckGateMs   int64 // through the confirmation gate
 	ckBargeMs  int64 // through the echo check and barge-in resolution
 	ckCacheMs  int64 // through the response cache and RAG injection
+	// lastDropLogGen rate-limits the dropped-audio warning to one line per
+	// response rather than one per frame.
+	lastDropLogGen int
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -1783,6 +1786,14 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// since nothing here checked whether the pipeline had already been torn
 	// down before starting a new one.
 	if ctx.Err() != nil {
+		// Say so. This return is correct but it was silent, and silent is what
+		// made it untraceable: an utterance would be transcribed, answered, and
+		// then produce no audio and no log line at all — the caller hears
+		// nothing and the turn leaves no evidence it existed. Four turns of one
+		// live call ended here or at the AudioChunk state gate with nothing
+		// recorded anywhere.
+		ms.logger.Info("Not speaking: pipeline already cancelled for this turn",
+			"gen", gen, "text_len", len(text), "reason", ctx.Err().Error())
 		return
 	}
 
@@ -2573,9 +2584,27 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		}
 		ms.lastBotSpeakGen = gen
 	}
+	// Decide (and rate-limit) the dropped-audio warning while still holding the
+	// lock — lastDropLogGen and state are both guarded by it, and the audio
+	// path runs concurrently with the turn pipeline that mutates state.
+	logDrop := false
+	dropState := ms.state
+	if eventType == AudioChunk && !speaking && ms.lastDropLogGen != gen {
+		ms.lastDropLogGen = gen
+		logDrop = true
+	}
 	ms.mu.Unlock()
 
 	if eventType == AudioChunk && !speaking {
+		// Every audio frame of a response can be dropped here — the stream is
+		// not in StateSpeaking, so the caller gets silence — and this used to
+		// happen without a single line anywhere. Logged once per generation
+		// rather than per frame: the interesting fact is that a response was
+		// silenced, not how many frames it had.
+		if logDrop {
+			ms.logger.Info("Dropping bot audio: stream is not in speaking state",
+				"gen", gen, "state", dropState)
+		}
 		return
 	}
 
