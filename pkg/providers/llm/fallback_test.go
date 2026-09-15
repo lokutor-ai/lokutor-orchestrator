@@ -67,18 +67,50 @@ func TestFallbackLLM_Complete_FailsOverOnRateLimit(t *testing.T) {
 	}
 }
 
-func TestFallbackLLM_Complete_DoesNotFailOverOnOtherErrors(t *testing.T) {
-	wantErr := errors.New("groq api error (status 400): bad request")
-	primary := &mockStreamingLLM{name: "primary", err: wantErr}
-	secondary := &mockStreamingLLM{name: "secondary"}
+// Failing over only on 429 made the first provider a single point of failure
+// for every other way a provider can break — an expired key (401), a bad model
+// name (404), a rejected parameter (400), an outage (5xx). Those are the cases
+// where a healthy backend is sitting one slot down the chain, so the chain must
+// use it rather than hand the caller silence.
+func TestFallbackLLM_Complete_FailsOverOnNonRateLimitErrors(t *testing.T) {
+	for _, primaryErr := range []string{
+		"cerebras api error (status 401): invalid api key",
+		"groq api error (status 404): model not found",
+		"groq api error (status 400): bad request",
+		"cerebras api error (status 503): service unavailable",
+		"dial tcp: lookup api.cerebras.ai: no such host",
+	} {
+		primary := &mockStreamingLLM{name: "primary", err: errors.New(primaryErr)}
+		secondary := &mockStreamingLLM{name: "secondary"}
+		f := NewChainLLM("test", primary, secondary)
+
+		text, err := f.Complete(context.Background(), nil, nil)
+		if err != nil {
+			t.Fatalf("primary %q: expected failover to succeed, got error: %v", primaryErr, err)
+		}
+		if text != "response from secondary" {
+			t.Errorf("primary %q: expected response from secondary, got %q", primaryErr, text)
+		}
+		if secondary.calls != 1 {
+			t.Errorf("primary %q: expected secondary to be called once, got %d", primaryErr, secondary.calls)
+		}
+	}
+}
+
+// The last provider's error is what the caller sees: once the chain is
+// exhausted there is nothing left to try, so the failure must not be swallowed.
+func TestFallbackLLM_Complete_SurfacesLastErrorWhenAllFail(t *testing.T) {
+	lastErr := errors.New("groq api error (status 400): bad request")
+	primary := &mockStreamingLLM{name: "primary", err: errors.New("cerebras api error (status 401): invalid api key")}
+	secondary := &mockStreamingLLM{name: "secondary", err: lastErr}
 	f := NewChainLLM("test", primary, secondary)
 
 	_, err := f.Complete(context.Background(), nil, nil)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("expected the primary's non-rate-limit error to surface unchanged, got: %v", err)
+	if !errors.Is(err, lastErr) {
+		t.Fatalf("expected the last provider's error to surface, got: %v", err)
 	}
-	if secondary.calls != 0 {
-		t.Errorf("secondary should never be called for a non-rate-limit error, got %d calls", secondary.calls)
+	if primary.calls != 1 || secondary.calls != 1 {
+		t.Errorf("expected one call to each, got primary=%d secondary=%d", primary.calls, secondary.calls)
 	}
 }
 

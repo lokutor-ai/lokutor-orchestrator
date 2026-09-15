@@ -3,26 +3,30 @@ package llm
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	orchestrator "github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
 
-// isRateLimited reports whether err looks like a rate-limit/quota rejection
-// rather than a genuine failure (bad request, model error, network issue).
-// Every LLM provider in this package embeds the HTTP status code in its
-// error text as "... (status %d): ..." — checking for 429 there covers all
-// of them; RESOURCE_EXHAUSTED is Gemini's specific quota-exceeded reason
-// string, kept as a defensive backup in case the status code isn't
-// surfaced for some response shape.
-func isRateLimited(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "status 429") ||
-		strings.Contains(msg, "RESOURCE_EXHAUSTED") ||
-		strings.Contains(msg, "rate_limit")
+// shouldFailover decides whether the next provider in the chain gets a turn.
+//
+// This used to match rate-limit-shaped errors only (HTTP 429, Gemini's
+// RESOURCE_EXHAUSTED), which quietly made the first provider a single point of
+// failure for everything except quota: an expired or revoked
+// key answers 401, a wrong model name answers 404, a rejected parameter answers
+// 400, and a provider outage answers 5xx or fails to connect before any status
+// exists at all. Every one of those returned the error straight to the caller
+// with the healthy providers behind it never tried — a broken agent while a
+// working backend sits idle one slot down the chain, which is exactly the
+// failure the chain exists to prevent.
+//
+// We only reach here when the provider produced no output whatsoever, so trying
+// the next one cannot duplicate or truncate speech. That makes "it failed and
+// said nothing" sufficient grounds on its own, and no error class is worth
+// spending a whole turn's silence on rather than one more round trip. Context
+// cancellation is the exception and is checked by the caller: that turn is
+// already gone, and a barge-in must not fan out across the whole chain.
+func shouldFailover(err error) bool {
+	return err != nil
 }
 
 // ChainLLM wraps an ordered list of LLM providers and automatically retries
@@ -56,7 +60,7 @@ func (c *ChainLLM) Complete(ctx context.Context, messages []orchestrator.Message
 	var lastErr error
 	for _, p := range c.providers {
 		text, err := p.Complete(ctx, messages, tools)
-		if err == nil || ctx.Err() != nil || !isRateLimited(err) {
+		if err == nil || ctx.Err() != nil || !shouldFailover(err) {
 			return text, err
 		}
 		lastErr = err
@@ -91,7 +95,7 @@ func (c *ChainLLM) StreamComplete(
 			text, err = p.Complete(ctx, messages, tools)
 		}
 
-		if err == nil || started || ctx.Err() != nil || !isRateLimited(err) {
+		if err == nil || started || ctx.Err() != nil || !shouldFailover(err) {
 			return text, err
 		}
 		lastErr = err
