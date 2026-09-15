@@ -696,12 +696,40 @@ func (ms *ManagedStream) logTurnLatency() {
 		return // bot-initiated turn, or clocks that make the split meaningless
 	}
 
+	// The stages below tile userSpeechEnd -> first audio byte end to end, with
+	// no gaps. That completeness is the point: the first version logged only
+	// stt/llm/tts, and those three summed to ~400 ms less than ttfa_ms on real
+	// traffic with nothing to say where the rest went. The answer turned out to
+	// be turn_gate_ms — the mid-thought confirmation wait (SILENCE_CONFIRMATION_MS,
+	// 800 ms in production) fires between STT returning and the LLM starting,
+	// so it was invisible in exactly the window being optimised.
+	ttfa := first.Sub(end).Milliseconds()
+	sttQueue := stageMs(end, ms.sttStartTime)
+	stt := stageMs(ms.sttStartTime, ms.sttEndTime)
+	gate := stageMs(ms.sttEndTime, ms.llmStartTime)
+	llm := stageMs(ms.llmStartTime, ms.llmEndTime)
+	llmToTTS := stageMs(ms.llmEndTime, ms.ttsStartTime)
+	ttsFirst := stageMs(ms.ttsStartTime, first)
+
+	// Whatever the named stages fail to explain, stated rather than left for
+	// someone to work out by subtraction later. A non-trivial value here means
+	// a stage is missing from this list, not that the turn was slow for free.
+	unaccounted := ttfa
+	for _, d := range []int64{sttQueue, stt, gate, llm, llmToTTS, ttsFirst} {
+		if d > 0 {
+			unaccounted -= d
+		}
+	}
+
 	ms.logger.Info("turn latency",
-		"ttfa_ms", first.Sub(end).Milliseconds(),
-		"stt_ms", stageMs(ms.sttStartTime, ms.sttEndTime),
-		"llm_ms", stageMs(ms.llmStartTime, ms.llmEndTime),
-		"tts_first_chunk_ms", stageMs(ms.ttsStartTime, first),
-		"stt_queue_ms", stageMs(end, ms.sttStartTime),
+		"ttfa_ms", ttfa,
+		"stt_queue_ms", sttQueue,
+		"stt_ms", stt,
+		"turn_gate_ms", gate,
+		"llm_ms", llm,
+		"llm_to_tts_ms", llmToTTS,
+		"tts_first_chunk_ms", ttsFirst,
+		"unaccounted_ms", unaccounted,
 	)
 }
 
