@@ -144,3 +144,50 @@ func TestSpecSTTEnabledByDefault(t *testing.T) {
 		}
 	}
 }
+
+// StartFromTranscript exists so the speculative LLM can begin during the VAD
+// hangover on a transcript that already exists, instead of re-transcribing the
+// same audio. These guard the preconditions; the win is only real if it
+// actually starts, and only safe if a mismatched guess is still discarded.
+
+func TestStartFromTranscriptRefusesWithoutAnLLM(t *testing.T) {
+	se := NewSpeculativeExecutor(300)
+	// orch nil: nothing to generate with. Must not claim the executor, or the
+	// next legitimate speculation would be refused as "already running".
+	se.StartFromTranscript(context.Background(), nil, "what are your hours", nil, nil)
+	if got := se.State(); got != SpecIdle {
+		t.Errorf("state = %v, want SpecIdle — a refused start must leave the executor free", got)
+	}
+}
+
+func TestStartFromTranscriptRefusesTrivialTranscripts(t *testing.T) {
+	se := NewSpeculativeExecutor(300)
+	for _, tr := range []string{"", "  ", "a"} {
+		se.StartFromTranscript(context.Background(), nil, tr, nil, nil)
+		if got := se.State(); got != SpecIdle {
+			t.Errorf("transcript %q: state = %v, want SpecIdle", tr, got)
+		}
+	}
+}
+
+// Await must still reject a response generated for different words — that
+// rejection is the entire safety argument for speculating early.
+func TestAwaitRejectsMismatchedTranscript(t *testing.T) {
+	se := NewSpeculativeExecutor(300)
+	se.mu.Lock()
+	se.state = SpecReady
+	se.result = &SpeculativeResult{
+		PartialTranscript: "what are your opening",
+		Response:          "We open at nine.",
+	}
+	se.done = make(chan struct{})
+	close(se.done)
+	se.mu.Unlock()
+
+	if _, ok := se.Await(context.Background(), "what are your opening hours on Saturday"); ok {
+		t.Error("a response generated for a half-finished sentence must not be used")
+	}
+	if got, ok := se.Await(context.Background(), "  What Are Your Opening  "); !ok || got != "We open at nine." {
+		t.Errorf("an equivalent transcript must match (case/space-insensitive): got %q ok=%v", got, ok)
+	}
+}

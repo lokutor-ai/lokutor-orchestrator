@@ -117,6 +117,21 @@ func specSTTMaxTailMs() int {
 	return defaultSpecSTTMaxTailMs
 }
 
+// specLLMFromTranscriptEnabled reports whether a completed speculative
+// transcription should immediately seed the speculative LLM.
+//
+// Gated on the speculator existing and SpeculativeLLM being on, so it inherits
+// the same switch as every other speculation. SPECULATIVE_STT_CHAIN_LLM=false
+// disables just the chaining without disabling either half, which is the knob
+// to reach for if a wrong guess ever turns out to cost more than it saves.
+func (ms *ManagedStream) specLLMFromTranscriptEnabled() bool {
+	if ms.speculator == nil || ms.orch == nil || !ms.orch.config.SpeculativeLLM {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SPECULATIVE_STT_CHAIN_LLM")))
+	return v != "false" && v != "0" && v != "off"
+}
+
 // silenceFramesProvider is implemented by SileroVAD. Asserted rather than added
 // to VADProvider so the RMS fallback and any test double keep working — they
 // simply never speculate.
@@ -178,6 +193,29 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		defer cancel()
 		res, err := ms.orch.Transcribe(ctx, snapshot, lang)
 		ms.specSTT.finish(res, err)
+
+		// Hand the transcript straight to the speculative LLM rather than
+		// letting it transcribe the same audio again.
+		//
+		// This is the chain that matters. The hangover is dead time we are
+		// already spending; spending it on the LLM as well as the STT means
+		// that on a turn the caller has genuinely finished, the response is
+		// frequently generated before end-of-turn is even declared — llm_ms
+		// goes to zero rather than ~200ms. Without it the speculator ran its
+		// own redundant Parakeet pass and started generating strictly later.
+		//
+		// Guessing wrong costs one LLM call on an otherwise idle CPU: Await
+		// returns a response only when its transcript matches the confirmed
+		// one, so a guess made on a half-finished sentence is discarded.
+		if err != nil || !ms.specLLMFromTranscriptEnabled() {
+			return
+		}
+		text := strings.TrimSpace(res.Text)
+		if text == "" {
+			return
+		}
+		ms.speculator.StartFromTranscript(ms.ctx, ms.orch, text,
+			ms.session.GetContextCopy(), ms.session.GetTools())
 	}()
 }
 

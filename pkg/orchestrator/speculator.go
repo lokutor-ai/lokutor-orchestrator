@@ -54,6 +54,16 @@ func NewSpeculativeExecutor(intervalMs int) *SpeculativeExecutor {
 	}
 }
 
+// State reports the executor's current state. Exists so callers and tests can
+// assert that a refused start left the executor free rather than claimed —
+// a start that claims the executor and then bails would block the next
+// legitimate speculation for the rest of the call.
+func (se *SpeculativeExecutor) State() SpeculativeState {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	return se.state
+}
+
 func (se *SpeculativeExecutor) SetOnPartial(cb func(transcript string)) {
 	se.mu.Lock()
 	defer se.mu.Unlock()
@@ -179,6 +189,87 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 		}
 
 		finish(&SpeculativeResult{PartialTranscript: partial, Response: response})
+	}()
+}
+
+// StartFromTranscript speculates on a transcript that has already been
+// produced, skipping this executor's own STT pass.
+//
+// Speculative STT already transcribes the utterance during the VAD hangover —
+// that is what took stt_ms to zero on most turns. Having the speculator then
+// run TranscribeRaw over the same audio is a second Parakeet call for a
+// transcript we are holding, and it starts the LLM later than it needs to.
+// Feeding the finished transcript straight in means the LLM begins while the
+// hangover is still counting down, so on a turn the caller has genuinely
+// finished the response is often already generated when end-of-turn fires.
+// That is what takes llm_ms toward zero, and it is the only way a cascaded
+// pipeline gets near a native speech-to-speech model's time to first audio.
+//
+// Being wrong stays cheap: Await only returns a response whose transcript
+// matches the confirmed one, so a guess made on a half-finished sentence is
+// discarded exactly as before.
+func (se *SpeculativeExecutor) StartFromTranscript(
+	ctx context.Context,
+	orch *Orchestrator,
+	transcript string,
+	historySnapshot []Message,
+	tools []Tool,
+) {
+	transcript = strings.TrimSpace(transcript)
+	if orch == nil || orch.llm == nil || len(transcript) < 2 {
+		return
+	}
+
+	se.mu.Lock()
+	if se.state != SpecIdle {
+		se.mu.Unlock()
+		return
+	}
+	se.state = SpecRunning
+	se.result = nil
+	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
+	se.cancel = sCancel
+	done := make(chan struct{})
+	se.done = done
+	onPartial := se.onPartial
+	se.mu.Unlock()
+
+	finish := func(result *SpeculativeResult) {
+		se.mu.Lock()
+		if se.state == SpecRunning {
+			se.result = result
+			if result != nil {
+				se.state = SpecReady
+			} else {
+				se.state = SpecIdle
+			}
+		}
+		se.cancel = nil
+		se.mu.Unlock()
+		close(done)
+	}
+
+	go func() {
+		defer sCancel()
+		defer func() {
+			if r := recover(); r != nil {
+				finish(nil)
+			}
+		}()
+
+		if onPartial != nil {
+			onPartial(transcript)
+		}
+
+		messages := append(append([]Message{}, historySnapshot...), Message{Role: "user", Content: transcript})
+		response, err := orch.llm.Complete(sCtx, messages, tools)
+		if err != nil || sCtx.Err() != nil || strings.TrimSpace(response) == "" {
+			// Record the transcript even without a response, so Await's caller
+			// can tell speculation ran rather than never having been attempted.
+			finish(&SpeculativeResult{PartialTranscript: transcript})
+			return
+		}
+		finish(&SpeculativeResult{PartialTranscript: transcript, Response: response})
 	}()
 }
 
