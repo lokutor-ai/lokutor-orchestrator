@@ -39,16 +39,25 @@ import (
 // of a right guess is ~400ms off every single turn.
 
 const (
-	// Start speculating after this many consecutive silent frames. One frame
-	// (32ms) is too eager — a single sub-threshold frame mid-word is common,
-	// and each false start burns a transcription. Two frames (~64ms) still
-	// leaves ~416ms of hangover to cover the STT pass.
-	defaultSpecSTTSilenceFrames = 2
+	// Start speculating after this many consecutive silent frames.
+	//
+	// Every frame spent waiting here is a frame the transcription does not get
+	// to run inside the hangover, and the hangover is the entire budget this
+	// feature has. One frame (32ms) risks firing on a sub-threshold frame
+	// mid-word, but that costs one wasted transcription on an idle CPU, while
+	// being late costs the caller real milliseconds on a turn that counts.
+	// With a shortened hangover the head start matters more, not less.
+	defaultSpecSTTSilenceFrames = 1
 
-	// Don't speculate on buffers too short to be a real utterance; these are
-	// the ones most likely to be noise, and they are also the cheapest to
-	// transcribe normally, so there is nothing to win.
-	defaultSpecSTTMinBytes = 8000 // ~250ms at 16kHz mono PCM16
+	// Don't speculate on buffers too short to be a real utterance. Measured at
+	// 8000 bytes (~250ms at 16kHz) this skipped short replies — "yes", "that's
+	// right" — and those turns paid the full STT wait: 212ms and 351ms on
+	// turns that could have paid nothing. Speculation coverage was 7/10.
+	//
+	// 3200 bytes is ~100ms of speech, below which a buffer is far more likely
+	// to be a cough than a word, and the transcription is cheap enough that a
+	// wasted one costs nothing worth counting.
+	defaultSpecSTTMinBytes = 3200 // ~100ms at 16kHz mono PCM16
 
 	// A speculative result is only usable if the audio appended after the
 	// snapshot is plausibly just the rest of the hangover. If the caller

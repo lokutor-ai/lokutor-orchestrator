@@ -172,6 +172,17 @@ type ManagedStream struct {
 	// rate is noticeable.
 	sttSpeculative bool
 	specSTT        specSTT
+	// lastVoicedAt is the last frame on which the VAD saw speech. The VAD
+	// hangover sits between this and userSpeechEnd.
+	lastVoicedAt time.Time
+	// discardedMs accumulates time spent on responses that were generated and
+	// then thrown away this turn — the barge-in discard path. Without it that
+	// work landed in unaccounted_ms and looked like an unexplained stall: one
+	// turn reported 3966ms with 3002ms unaccounted, which was not a wait at
+	// all but a response binned and redone.
+	discardedMs int64
+	// discardStart marks when the work that is about to be discarded began.
+	discardStart time.Time
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -600,6 +611,15 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 			}
 		}
 
+		// The last frame that actually carried voice. This — not userSpeechEnd,
+		// which is a whole hangover later — is where the caller's own clock
+		// starts: they stopped talking, and everything after it is us. Without
+		// it the turn log could only measure from a point ~480ms into our own
+		// latency budget, which flatters every number in it.
+		if sf, ok := ms.vad.(silenceFramesProvider); ok && sf.SilenceFrames() == 0 {
+			ms.lastVoicedAt = time.Now()
+		}
+
 		// Spend the VAD hangover transcribing rather than waiting. By the time
 		// the hangover starts counting, every speech sample is already in the
 		// buffer — see speculative_stt.go.
@@ -707,13 +727,22 @@ func (ms *ManagedStream) logTurnLatency() {
 		return // bot-initiated turn, or clocks that make the split meaningless
 	}
 
-	// The stages below tile userSpeechEnd -> first audio byte end to end, with
-	// no gaps. That completeness is the point: the first version logged only
-	// stt/llm/tts, and those three summed to ~400 ms less than ttfa_ms on real
-	// traffic with nothing to say where the rest went. The answer turned out to
-	// be turn_gate_ms — the mid-thought confirmation wait (SILENCE_CONFIRMATION_MS,
-	// 800 ms in production) fires between STT returning and the LLM starting,
-	// so it was invisible in exactly the window being optimised.
+	// The number that matters is the one the caller experiences: from the last
+	// frame on which they were actually speaking, to the first byte of audio
+	// leaving us. Everything else in this line is a component of it.
+	//
+	// ttfa_ms used to be the headline, and it is anchored at userSpeechEnd —
+	// which is a full VAD hangover (480ms in production) after the caller
+	// stopped. That silently excluded the single largest fixed cost in the
+	// pipeline from the number we were optimising against. Both are logged now,
+	// but e2e_ms is the real one.
+	voiced := ms.lastVoicedAt
+	hangover := stageMs(voiced, end)
+	e2e := int64(-1)
+	if !voiced.IsZero() && !first.Before(voiced) {
+		e2e = first.Sub(voiced).Milliseconds()
+	}
+
 	ttfa := first.Sub(end).Milliseconds()
 	sttQueue := stageMs(end, ms.sttStartTime)
 	stt := stageMs(ms.sttStartTime, ms.sttEndTime)
@@ -722,18 +751,30 @@ func (ms *ManagedStream) logTurnLatency() {
 	llmToTTS := stageMs(ms.llmEndTime, ms.ttsStartTime)
 	ttsFirst := stageMs(ms.ttsStartTime, first)
 
-	// Whatever the named stages fail to explain, stated rather than left for
-	// someone to work out by subtraction later. A non-trivial value here means
-	// a stage is missing from this list, not that the turn was slow for free.
-	unaccounted := ttfa
-	for _, d := range []int64{sttQueue, stt, gate, llm, llmToTTS, ttsFirst} {
+	// Work that was done and then thrown away — a response generated for a turn
+	// the caller then talked over. Real elapsed time that is not attributable
+	// to any stage of the response we finally played, so it is named rather
+	// than left to swell unaccounted_ms and read as a mystery stall.
+	discarded := ms.discardedMs
+
+	// Whatever the named stages still fail to explain. On a healthy turn this
+	// should be single-digit milliseconds; anything larger means a stage is
+	// missing from this list, not that the turn was slow for free.
+	unaccounted := e2e
+	if unaccounted < 0 {
+		unaccounted = ttfa
+	}
+	for _, d := range []int64{hangover, sttQueue, stt, gate, llm, llmToTTS, ttsFirst, discarded} {
 		if d > 0 {
 			unaccounted -= d
 		}
 	}
 
 	ms.logger.Info("turn latency",
-		"ttfa_ms", ttfa,
+		// The caller's clock: last voiced frame -> first audio out.
+		"e2e_ms", e2e,
+		// Silence the VAD required before it would call the turn over.
+		"hangover_ms", hangover,
 		"stt_queue_ms", sttQueue,
 		"stt_ms", stt,
 		// Whether this turn's transcript came free from the hangover window.
@@ -745,7 +786,11 @@ func (ms *ManagedStream) logTurnLatency() {
 		"llm_ms", llm,
 		"llm_to_tts_ms", llmToTTS,
 		"tts_first_chunk_ms", ttsFirst,
+		"discarded_ms", discarded,
 		"unaccounted_ms", unaccounted,
+		// Kept for continuity with earlier measurements: same clock as before,
+		// anchored after the hangover.
+		"ttfa_ms", ttfa,
 	)
 }
 
@@ -998,6 +1043,12 @@ func (ms *ManagedStream) confirmBargeInIfPending() {
 
 func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.userSpeechEnd = time.Now()
+	// Each caller turn accounts for its own discarded work. Carrying it across
+	// turns would charge one turn for a response abandoned on a previous one.
+	ms.mu.Lock()
+	ms.discardedMs = 0
+	ms.discardStart = time.Time{}
+	ms.mu.Unlock()
 	ms.emit(UserStopped, nil)
 
 	// Finalize streaming STT session. Closing sttAudioChan is what lets
@@ -1509,6 +1560,16 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 
 	// Check response cache before calling LLM
 	if response, audio, ok := ms.checkResponseCache(transcript); ok {
+		// Mark the LLM stage as taken-but-instant, exactly as the speculative
+		// path does. This branch returns before runLLMAndTTS, so it used to
+		// leave llmStartTime/llmEndTime unset — the turn then logged llm_ms:-1,
+		// llm_to_tts_ms:-1, and everything between STT and playback fell into
+		// unaccounted_ms. That is what an "unexplained" 3-second turn looked
+		// like. A cache hit is a real, measurable zero, not an absence.
+		now := time.Now()
+		ms.llmStartTime = now
+		ms.llmEndTime = now
+		ms.ttsStartTime = now
 		ms.emit(BotResponse, response)
 		if audio != nil {
 			frameSize := int(float64(ms.playbackRate)*0.06) * 2
@@ -1566,6 +1627,11 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	defer rCancel()
 
 	ms.emitWithGen(BotThinking, nil, gen)
+	// Work from here is discardable: if the caller resumes before playback
+	// starts, everything after this point is thrown away.
+	ms.mu.Lock()
+	ms.discardStart = time.Now()
+	ms.mu.Unlock()
 	ms.llmStartTime = time.Now()
 	// runStreamingLLM below only sets llmEndTime the first time it's zero
 	// (capturing first-token arrival, not stream completion) — but that
@@ -1687,13 +1753,22 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	userTalking := ms.vadSpeaking
 	ms.mu.Unlock()
 	if userTalking {
-		ms.logger.Info("Discarding generated response: caller started speaking again before playback began",
-			"text_len", len(text))
+		// Charge the abandoned work to discarded_ms rather than letting it swell
+		// unaccounted_ms on whichever turn eventually plays. This is what made
+		// one turn read 3966ms with 3002ms unexplained: not a stall, but a
+		// response built for a turn the caller talked over, then rebuilt.
 		ms.mu.Lock()
+		if !ms.discardStart.IsZero() {
+			ms.discardedMs += time.Since(ms.discardStart).Milliseconds()
+			ms.discardStart = time.Time{}
+		}
 		if ms.state == StateProcessing {
 			ms.state = StateListening
 		}
+		discarded := ms.discardedMs
 		ms.mu.Unlock()
+		ms.logger.Info("Discarding generated response: caller started speaking again before playback began",
+			"text_len", len(text), "discarded_ms_total", discarded)
 		return
 	}
 
