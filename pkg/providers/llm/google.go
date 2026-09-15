@@ -218,7 +218,7 @@ func (l *GoogleLLM) Complete(ctx context.Context, messages []orchestrator.Messag
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -285,7 +285,7 @@ func (l *GoogleLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}

@@ -23,6 +23,10 @@ type CerebrasLLM struct {
 	apiKey string
 	url    string
 	model  string
+	// reasoningEffort is sent as "reasoning_effort" when non-empty. Cerebras's
+	// default model here is gpt-oss-120b, a reasoning model — see
+	// defaultReasoningEffort for what that costs a voice agent by default.
+	reasoningEffort string
 }
 
 func NewCerebrasLLM(apiKey string, model string) *CerebrasLLM {
@@ -30,10 +34,15 @@ func NewCerebrasLLM(apiKey string, model string) *CerebrasLLM {
 		model = "gpt-oss-120b"
 	}
 	return &CerebrasLLM{
-		apiKey: apiKey,
-		url:    "https://api.cerebras.ai/v1/chat/completions",
-		model:  model,
+		apiKey:          apiKey,
+		url:             "https://api.cerebras.ai/v1/chat/completions",
+		model:           model,
+		reasoningEffort: defaultReasoningEffort(model),
 	}
+}
+
+func (l *CerebrasLLM) applyReasoningEffort(payload map[string]interface{}) {
+	setReasoningEffort(payload, l.reasoningEffort)
 }
 
 func (l *CerebrasLLM) Name() string { return "cerebras-llm" }
@@ -43,6 +52,7 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 		"model":    l.model,
 		"messages": messages,
 	}
+	l.applyReasoningEffort(payload)
 	if len(tools) > 0 {
 		payload["tools"] = tools
 		payload["tool_choice"] = "auto"
@@ -94,6 +104,7 @@ func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrato
 		"messages": messages,
 		"stream":   true,
 	}
+	l.applyReasoningEffort(payload)
 	if len(tools) > 0 {
 		payload["tools"] = tools
 		payload["tool_choice"] = "auto"

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
@@ -36,36 +35,8 @@ func NewGroqLLM(apiKey string, model string) *GroqLLM {
 	}
 }
 
-// Reasoning models emit their whole chain of thought before the first token
-// the caller can speak. Measured against production's openai/gpt-oss-120b from
-// the worker pod, a typical agent turn spends 24-66 reasoning deltas getting
-// to the first content token: median 643 ms at the API default, versus 306 ms
-// at "low" — for a byte-identical answer on the same prompt. In a voice agent
-// that is ~340 ms of pure dead air on every single turn, and it was by far the
-// largest share of our measured LLM stage.
-//
-// Only the gpt-oss family accepts the parameter; Groq answers 400 for models
-// that don't, so this must stay keyed on the model rather than sent blindly.
-// GROQ_REASONING_EFFORT overrides it ("low"/"medium"/"high", or "default" to
-// send nothing) without a rebuild, so a turn quality regression is one env
-// change away from being reverted.
-func defaultReasoningEffort(model string) string {
-	if v := strings.TrimSpace(os.Getenv("GROQ_REASONING_EFFORT")); v != "" {
-		if strings.EqualFold(v, "default") || strings.EqualFold(v, "off") {
-			return ""
-		}
-		return strings.ToLower(v)
-	}
-	if strings.Contains(strings.ToLower(model), "gpt-oss") {
-		return "low"
-	}
-	return ""
-}
-
 func (l *GroqLLM) applyReasoningEffort(payload map[string]interface{}) {
-	if l.reasoningEffort != "" {
-		payload["reasoning_effort"] = l.reasoningEffort
-	}
+	setReasoningEffort(payload, l.reasoningEffort)
 }
 
 func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
@@ -92,7 +63,7 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -147,7 +118,7 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}

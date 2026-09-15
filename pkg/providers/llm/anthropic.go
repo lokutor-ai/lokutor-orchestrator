@@ -89,7 +89,7 @@ func (l *AnthropicLLM) Complete(ctx context.Context, messages []orchestrator.Mes
 	req.Header.Set("x-api-key", l.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}

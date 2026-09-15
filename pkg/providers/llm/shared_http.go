@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -50,6 +52,41 @@ func getSharedLLMClient() *http.Client {
 		}
 	})
 	return sharedLLMClient
+}
+
+// Reasoning models emit their entire chain of thought before the first token
+// a voice agent can actually speak, and that silence lands on the caller.
+// Measured from the production worker against openai/gpt-oss-120b with a
+// realistic agent prompt: 24-66 reasoning deltas before the first content
+// token, median 643ms at the API default versus 306ms at "low" — for the same
+// answer, word for word. Both Groq and Cerebras serve gpt-oss and both accept
+// the parameter, so the default lives here rather than in either provider.
+//
+// Only the gpt-oss family takes it; the APIs answer 400 for models that don't,
+// so this stays keyed on the model name rather than sent blindly.
+// GROQ_REASONING_EFFORT overrides it ("low"/"medium"/"high", or "default"/"off"
+// to send nothing) without a rebuild, so a turn-quality regression is one env
+// change away from being reverted.
+func defaultReasoningEffort(model string) string {
+	if v := strings.TrimSpace(os.Getenv("GROQ_REASONING_EFFORT")); v != "" {
+		if strings.EqualFold(v, "default") || strings.EqualFold(v, "off") {
+			return ""
+		}
+		return strings.ToLower(v)
+	}
+	if strings.Contains(strings.ToLower(model), "gpt-oss") {
+		return "low"
+	}
+	return ""
+}
+
+// setReasoningEffort adds the parameter only when one is configured. An
+// explicit null or empty string is a 400 just as surely as the wrong model, so
+// the key must be absent rather than present-and-empty.
+func setReasoningEffort(payload map[string]interface{}, effort string) {
+	if effort != "" {
+		payload["reasoning_effort"] = effort
+	}
 }
 
 // WarmupHost opens (and pools, via keep-alive) a TCP+TLS connection to host

@@ -50,7 +50,7 @@ func (l *OpenAILLM) Complete(ctx context.Context, messages []orchestrator.Messag
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := getSharedLLMClient().Do(req)
 	if err != nil {
 		return "", err
 	}
