@@ -1651,7 +1651,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// Turn-time RAG: if a RAG provider is configured, retrieve relevant context
 	// for the user's transcript and inject it into context before the LLM call
 	// (LiveKit pattern — avoids extra tool round-trips).
-	ms.injectRagContext(transcript)
+	ms.injectRagContext(ctx, transcript)
 
 	ms.mu.Lock()
 	ms.ckCacheMs = time.Since(ms.sttEndTime).Milliseconds()
@@ -2089,28 +2089,47 @@ func (ms *ManagedStream) truncateSpokenContext() {
 	}
 }
 
-// injectRagContext retrieves relevant knowledge-base context for the user's
-// transcript and injects it into the session context before the LLM call.
-// This is a no-op unless a RAG provider is configured on the orchestrator.
-func (ms *ManagedStream) injectRagContext(transcript string) {
+// injectRagContext retrieves knowledge-base context for this turn and puts it
+// in front of the model BEFORE the LLM call.
+//
+// It used to run in a detached goroutine "so it doesn't block the turn", which
+// meant the retrieved context landed in the session at an arbitrary point —
+// usually after the LLM call it was meant to inform had already been made. The
+// turn it was retrieved for did not see it. Retrieval that arrives after the
+// answer is not retrieval-augmented generation; it is a race the model usually
+// loses.
+//
+// So this is synchronous, and bounded instead: the provider carries its own
+// timeout (a few hundred milliseconds) and returns empty rather than erroring
+// when nothing matches. The cost is real and it is on the critical path, which
+// is the honest trade — it replaces a tool call that cost an entire extra LLM
+// round trip plus a filler utterance to cover the gap.
+func (ms *ManagedStream) injectRagContext(ctx context.Context, transcript string) {
 	if ms.orch == nil || ms.orch.rag == nil {
 		return
 	}
-	// Retrieve context asynchronously so it doesn't block the turn
-	go func(query string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
-		contextText, err := ms.orch.rag.Retrieve(ctx, query)
-		if err != nil || contextText == "" {
-			return
-		}
-		// Inject as a system message so the LLM sees it as reference material
-		ms.session.AddMessageRaw(Message{
-			Role:    "system",
-			Content: "[Relevant context: " + contextText + "]",
-		})
-		ms.logger.Info("RAG context injected", "query_len", len(query), "context_len", len(contextText))
-	}(transcript)
+	started := time.Now()
+	contextText, err := ms.orch.rag.Retrieve(ctx, transcript)
+	elapsed := time.Since(started).Milliseconds()
+	if err != nil {
+		// A knowledge base that is down must cost this turn its context, not
+		// the turn itself. The model answers from its prompt.
+		ms.logger.Warn("RAG retrieval failed, answering without knowledge context",
+			"error", err, "elapsed_ms", elapsed)
+		return
+	}
+	if contextText == "" {
+		ms.logger.Info("RAG: nothing matched", "elapsed_ms", elapsed)
+		return
+	}
+	// A system message, not a user one: this is reference material the model
+	// may use, not something the caller said.
+	ms.session.AddMessageRaw(Message{
+		Role:    "system",
+		Content: "[Knowledge base context for this question. Use it if relevant; do not mention that you looked it up.]\n" + contextText,
+	})
+	ms.logger.Info("RAG context injected",
+		"query_len", len(transcript), "context_len", len(contextText), "elapsed_ms", elapsed)
 }
 
 // removeLastAssistantMessage removes the most recent assistant message from
