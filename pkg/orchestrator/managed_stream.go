@@ -166,6 +166,12 @@ type ManagedStream struct {
 
 	sttStartTime      time.Time
 	sttEndTime        time.Time
+	// sttSpeculative records whether this turn's transcript came from the
+	// pass launched during the VAD hangover rather than a blocking call after
+	// it. Logged per turn so the win is visible and a regression in the accept
+	// rate is noticeable.
+	sttSpeculative bool
+	specSTT        specSTT
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -594,6 +600,11 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 			}
 		}
 
+		// Spend the VAD hangover transcribing rather than waiting. By the time
+		// the hangover starts counting, every speech sample is already in the
+		// buffer — see speculative_stt.go.
+		ms.maybeSpeculateSTT(ms.utteranceSeq)
+
 		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
 			speechDuration := time.Since(ms.userSpeakingSince)
 			if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
@@ -725,6 +736,11 @@ func (ms *ManagedStream) logTurnLatency() {
 		"ttfa_ms", ttfa,
 		"stt_queue_ms", sttQueue,
 		"stt_ms", stt,
+		// Whether this turn's transcript came free from the hangover window.
+		// When false on a turn that should have qualified, the accept check in
+		// specSTT.awaitUsable rejected it — worth knowing, because the
+		// difference between true and false here is most of stt_ms.
+		"stt_speculative", ms.sttSpeculative,
 		"turn_gate_ms", gate,
 		"llm_ms", llm,
 		"llm_to_tts_ms", llmToTTS,
@@ -1153,10 +1169,28 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.sttResultChan = nil
 	}
 
+	// A speculative pass launched at the start of the VAD hangover has usually
+	// already finished by now, which takes the whole STT stage out of
+	// time-to-first-audio. It is only used when the audio appended since the
+	// snapshot is short enough to be the hangover's own silence rather than
+	// speech the caller resumed with.
+	specUsed := false
+	if result.Text == "" {
+		bytesPerMs := int(ms.inputSampleRate) * 2 / 1000
+		if spec, ok, waited := ms.specSTT.awaitUsable(ctx, seq, len(audioData), bytesPerMs, specSTTMaxTailMs()); ok {
+			result = spec
+			specUsed = true
+			ms.logger.Info("Using speculative STT from the VAD hangover",
+				"waited_ms", waited.Milliseconds(), "text", result.Text)
+		}
+	}
+
 	// Use batch STT if streaming didn't produce a result (more accurate)
 	if result.Text == "" {
 		result, err = ms.orch.Transcribe(ctx, audioData, ms.session.GetCurrentLanguage())
 	}
+	ms.specSTT.invalidate()
+	ms.sttSpeculative = specUsed
 	if err != nil {
 		ms.mu.Lock()
 		if ms.state != StateInterrupted {
