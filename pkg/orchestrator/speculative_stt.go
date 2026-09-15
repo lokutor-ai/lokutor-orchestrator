@@ -214,8 +214,14 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		if text == "" {
 			return
 		}
+		// Logged because the win is invisible otherwise: if this never starts,
+		// or starts and is never matched at end-of-turn, llm_ms simply stays at
+		// its normal value and nothing says why.
+		before := ms.speculator.State()
 		ms.speculator.StartFromTranscript(ms.ctx, ms.orch, text,
 			ms.session.GetContextCopy(), ms.session.GetTools())
+		ms.logger.Info("Speculative LLM seeded from hangover transcript",
+			"transcript", text, "state_before", before, "state_after", ms.speculator.State())
 	}()
 }
 

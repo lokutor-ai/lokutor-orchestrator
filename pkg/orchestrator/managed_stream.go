@@ -1320,6 +1320,16 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	}
 
 	transcript := strings.TrimSpace(result.Text)
+	// Parakeet emits punctuation but never '?', so a question arrives as a
+	// statement and the model answers as though nothing was asked. Restore it
+	// before anything downstream reads the text — the lexical gate, the LLM and
+	// the stored conversation history all benefit from knowing it was a
+	// question. See question_mark.go for why this is lexical and conservative.
+	if restored := restoreQuestionMark(transcript, ms.session.GetCurrentLanguage()); restored != transcript {
+		ms.logger.Info("Restored question mark the recogniser omitted",
+			"before", transcript, "after", restored)
+		transcript = restored
+	}
 	if transcript == "" {
 		ms.logger.Info("Utterance discarded: empty transcript, resuming bot",
 			"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
