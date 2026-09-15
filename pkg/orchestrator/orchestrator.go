@@ -245,6 +245,13 @@ func (o *Orchestrator) SetOpeningMessage(msg string) {
 	o.config.OpeningMessage = msg
 }
 
+// SetRecordingNotice sets the consent disclosure spoken verbatim at the very
+// start of a recorded call. Set it only when the call is actually being
+// recorded: announcing a recording that is not happening is its own problem.
+func (o *Orchestrator) SetRecordingNotice(notice string) {
+	o.config.RecordingNotice = notice
+}
+
 func (o *Orchestrator) GenerateSilent(ctx context.Context, text string, voice Voice, lang Language) ([]byte, error) {
 	// Try Synthesize (REST) first — avoids WS conflicts with streaming TTS
 	audio, err := o.tts.Synthesize(ctx, text, voice, lang)

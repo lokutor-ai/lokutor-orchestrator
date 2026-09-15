@@ -204,7 +204,15 @@ const OpeningTrigger = "The conversation has just started and you are speaking f
 // how it can help" bug shipped twice because the real decision lived inline in
 // a goroutine where nothing could assert on it.
 func resolveOpening(cfg Config) (verbatim string, instruction string) {
+	// A recording notice is a legal disclosure, so it is never left to the
+	// model: it is spoken verbatim, before anything else, whatever the agent's
+	// prompt says. Folding it into a verbatim opening keeps it to one TTS turn;
+	// the LLM-opening path speaks it separately (see managed_stream).
+	notice := strings.TrimSpace(cfg.RecordingNotice)
 	if msg := strings.TrimSpace(cfg.OpeningMessage); msg != "" {
+		if notice != "" {
+			return notice + " " + msg, ""
+		}
 		return msg, ""
 	}
 	instr := strings.TrimSpace(cfg.OpeningInstruction)
@@ -237,6 +245,13 @@ type Config struct {
 	EchoSuppressionThreshold float64
 	FirstSpeaker             FirstSpeaker
 	SilenceTimeout           time.Duration
+
+	// RecordingNotice, when non-empty, is spoken verbatim at the very start of
+	// the call, before any substantive conversation. It exists to satisfy
+	// call-recording consent law, which is why it must not be left to the
+	// model to remember: an agent that forgets to say it turns a recorded call
+	// into an unlawful one.
+	RecordingNotice string
 
 	// OpeningMessage, when non-empty, is spoken verbatim as the bot's first
 	// turn and no LLM call is made at all. This is opt-in: a customer who

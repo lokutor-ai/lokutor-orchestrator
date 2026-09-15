@@ -178,3 +178,51 @@ func TestHoldIsShorterThanTheMidThoughtWait(t *testing.T) {
 			cfg.TurnoHoldMs, cfg.SilenceConfirmationMs)
 	}
 }
+
+// The recording notice is a consent disclosure, not a nicety: if it stops
+// being spoken, or stops coming first, recorded calls become unlawful in
+// all-party-consent jurisdictions. These assertions exist so that failure is
+// a red test rather than a legal problem discovered later.
+func TestRecordingNoticeAlwaysLeadsTheOpening(t *testing.T) {
+	const notice = "This call is recorded."
+
+	t.Run("prepended to a verbatim opening", func(t *testing.T) {
+		verbatim, instr := resolveOpening(Config{
+			RecordingNotice: notice,
+			OpeningMessage:  "Hi, this is Nova from Acme.",
+		})
+		if instr != "" {
+			t.Fatalf("expected a verbatim opening, got instruction %q", instr)
+		}
+		if !strings.HasPrefix(verbatim, notice) {
+			t.Errorf("notice must come first, got %q", verbatim)
+		}
+		if !strings.Contains(verbatim, "Hi, this is Nova from Acme.") {
+			t.Errorf("the configured opening must survive, got %q", verbatim)
+		}
+	})
+
+	t.Run("no notice configured leaves the opening untouched", func(t *testing.T) {
+		verbatim, _ := resolveOpening(Config{OpeningMessage: "Hi, this is Nova."})
+		if verbatim != "Hi, this is Nova." {
+			t.Errorf("unrecorded calls must not gain a notice, got %q", verbatim)
+		}
+	})
+
+	t.Run("LLM opening still yields an instruction, notice spoken separately", func(t *testing.T) {
+		verbatim, instr := resolveOpening(Config{RecordingNotice: notice})
+		if verbatim != "" {
+			t.Errorf("with no OpeningMessage the notice is spoken by the caller of resolveOpening, not folded in; got %q", verbatim)
+		}
+		if instr == "" {
+			t.Error("the model must still be asked to open")
+		}
+	})
+
+	t.Run("whitespace-only notice is not spoken", func(t *testing.T) {
+		verbatim, _ := resolveOpening(Config{RecordingNotice: "   ", OpeningMessage: "Hello."})
+		if verbatim != "Hello." {
+			t.Errorf("a blank notice must not prepend whitespace, got %q", verbatim)
+		}
+	})
+}

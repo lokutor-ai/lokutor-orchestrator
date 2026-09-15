@@ -399,6 +399,19 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 				return
 			}
 
+			// No verbatim opening, so the recording notice (if any) is spoken
+			// on its own before the model takes its first turn. It still has to
+			// come first: the disclosure is only worth anything if it precedes
+			// the conversation it is disclosing.
+			if notice := strings.TrimSpace(o.config.RecordingNotice); notice != "" {
+				ms.mu.Lock()
+				ms.state = StateSpeaking
+				gen := ms.payloadGen
+				ms.mu.Unlock()
+				ms.session.AddMessage("assistant", notice)
+				ms.speakText(ms.ctx, notice, gen)
+			}
+
 			ms.session.AddMessage("user", instr)
 			ms.runLLMAndTTS(ms.ctx, "")
 		}()
