@@ -675,6 +675,45 @@ func (ms *ManagedStream) maybeArmTurnoEarlyEnd() {
 // the failure the hangover exists to prevent in the first place.
 const turnoEarlyEndMinMs = 150
 
+// logTurnLatency emits one structured line per turn with the stage breakdown
+// behind time-to-first-audio.
+//
+// Every timestamp it reads already existed and nothing consumed them, so the
+// system could not answer "which stage is slow" — the documented latency
+// budget drifted badly out of date (it still credited the LLM with 550ms when
+// the provider had changed and measures ~40ms) and nobody could tell, because
+// there was no per-turn ground truth to contradict it. The Prometheus
+// VoiceAgentTTFB histogram beside it is declared and never observed, so it
+// emits nothing at all.
+//
+// A log line rather than a metric on purpose: it survives pod restarts in the
+// log aggregator, carries the full breakdown rather than one number, and needs
+// no scrape target to be useful.
+func (ms *ManagedStream) logTurnLatency() {
+	end := ms.userSpeechEnd
+	first := ms.ttsFirstChunkTime
+	if end.IsZero() || first.IsZero() || first.Before(end) {
+		return // bot-initiated turn, or clocks that make the split meaningless
+	}
+
+	ms.logger.Info("turn latency",
+		"ttfa_ms", first.Sub(end).Milliseconds(),
+		"stt_ms", stageMs(ms.sttStartTime, ms.sttEndTime),
+		"llm_ms", stageMs(ms.llmStartTime, ms.llmEndTime),
+		"tts_first_chunk_ms", stageMs(ms.ttsStartTime, first),
+		"stt_queue_ms", stageMs(end, ms.sttStartTime),
+	)
+}
+
+// stageMs returns a stage duration in milliseconds, or -1 when either end is
+// unset — an explicit "not measured" rather than a zero that reads as instant.
+func stageMs(from, to time.Time) int64 {
+	if from.IsZero() || to.IsZero() || to.Before(from) {
+		return -1
+	}
+	return to.Sub(from).Milliseconds()
+}
+
 // resampleTo16k resamples audio from the input sample rate to 16kHz using linear interpolation.
 func resampleTo16k(audio []byte, inputSampleRate int) []byte {
 	if inputSampleRate == 16000 {
@@ -1570,6 +1609,32 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		time.Sleep(backoff - sinceInterrupt)
 	}
 
+	// The late "did the user actually finish talking" recheck that onVADEnd
+	// documents and depends on. Generation deliberately starts without a
+	// pre-generation wait — that wait was most of the old per-turn latency —
+	// and the design rests on catching a resumed speaker here instead. The
+	// check was described in onVADEnd but never implemented, so a caller who
+	// started talking again during generation got spoken over: no bot audio
+	// existed yet, so nothing registered as a barge-in, no interrupt fired,
+	// the pipeline context stayed live, and playback began on top of them.
+	//
+	// Abandon rather than queue. This response answers a turn the caller has
+	// already moved on from, and the utterance they are speaking now will
+	// produce its own.
+	ms.mu.Lock()
+	userTalking := ms.vadSpeaking
+	ms.mu.Unlock()
+	if userTalking {
+		ms.logger.Info("Discarding generated response: caller started speaking again before playback began",
+			"text_len", len(text))
+		ms.mu.Lock()
+		if ms.state == StateProcessing {
+			ms.state = StateListening
+		}
+		ms.mu.Unlock()
+		return
+	}
+
 	if ms.userProfile.HasBaseline() {
 		rate := ms.userProfile.GetSuggestedSpeechRate()
 		ms.orch.SetTTSRate(rate)
@@ -1642,6 +1707,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 
 			if ms.ttsFirstChunkTime.IsZero() {
 				ms.ttsFirstChunkTime = time.Now()
+				ms.logTurnLatency()
 			}
 
 			if isStreaming {
