@@ -191,6 +191,12 @@ type ManagedStream struct {
 	// until it accounts for itself.
 	confirmWaitMs int64
 	specAwaitMs   int64
+	// Checkpoints across the sttEnd -> llmStart span, so a large value points
+	// at a line rather than a region. Measured in ms from sttEndTime.
+	ckShadowMs int64 // through the noise checks and the Turno shadow block
+	ckGateMs   int64 // through the confirmation gate
+	ckBargeMs  int64 // through the echo check and barge-in resolution
+	ckCacheMs  int64 // through the response cache and RAG injection
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -782,6 +788,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	// instead of being a span nobody can attribute.
 	ms.mu.Lock()
 	confirmWait, specAwait := ms.confirmWaitMs, ms.specAwaitMs
+	ckShadow, ckGate, ckBarge, ckCache := ms.ckShadowMs, ms.ckGateMs, ms.ckBargeMs, ms.ckCacheMs
 	ms.mu.Unlock()
 	gateOther := gate
 	if gateOther > 0 {
@@ -809,6 +816,12 @@ func (ms *ManagedStream) logTurnLatency() {
 		"gate_confirm_ms", confirmWait,
 		"gate_spec_await_ms", specAwait,
 		"gate_other_ms", gateOther,
+		// Cumulative milliseconds from sttEnd to each checkpoint, so a slow
+		// span names the step it is stuck on rather than a region of code.
+		"ck_shadow_ms", ckShadow,
+		"ck_gate_ms", ckGate,
+		"ck_barge_ms", ckBarge,
+		"ck_cache_ms", ckCache,
 		"llm_ms", llm,
 		"llm_to_tts_ms", llmToTTS,
 		"tts_first_chunk_ms", ttsFirst,
@@ -1076,6 +1089,10 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.discardStart = time.Time{}
 	ms.confirmWaitMs = 0
 	ms.specAwaitMs = 0
+	ms.ckShadowMs = 0
+	ms.ckGateMs = 0
+	ms.ckBargeMs = 0
+	ms.ckCacheMs = 0
 	ms.mu.Unlock()
 	ms.emit(UserStopped, nil)
 
@@ -1327,6 +1344,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// anything here -- but which branch we take below is a free ground-truth
 	// label (user resumed = the turn really was incomplete), so every
 	// incomplete-looking turn in production scores both predictors at once.
+	ms.mu.Lock()
+	ms.ckShadowMs = time.Since(ms.sttEndTime).Milliseconds()
+	ms.mu.Unlock()
+
 	lexicalComplete := ms.turnComp == nil || ms.turnComp.IsLikelyComplete(transcript)
 	ms.mu.Lock()
 	turnoLabel, turnoFrames := ms.turnoLastTurnLabel, ms.turnoTurnStateFrames
@@ -1440,12 +1461,11 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.mu.Unlock()
 
 		gateEnteredAt := time.Now()
-		defer func() {
-			ms.mu.Lock()
-			ms.confirmWaitMs = time.Since(gateEnteredAt).Milliseconds()
-			ms.mu.Unlock()
-		}()
-
+		// Recorded immediately after the select below, NOT in a defer: defer
+		// runs at function exit, which is after speakText has already called
+		// logTurnLatency — so a deferred write is read as the reset zero every
+		// time, which is exactly how this field came to exonerate the
+		// confirmation gate without evidence.
 		select {
 		case <-gate:
 			// User resumed speaking before the window elapsed: a mid-thought
@@ -1482,6 +1502,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			if ms.confirmationGate == gate {
 				ms.confirmationGate = nil
 			}
+			ms.confirmWaitMs = time.Since(gateEnteredAt).Milliseconds()
 			ms.mu.Unlock()
 			// truly_incomplete=false: the lexical gate made us wait waitMs for
 			// a continuation that never came. If Turno said "complete" here,
@@ -1567,10 +1588,18 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			return
 		}
 	}
+	ms.mu.Lock()
+	ms.ckGateMs = time.Since(ms.sttEndTime).Milliseconds()
+	ms.mu.Unlock()
+
 	// Real, sufficient speech — commit to the interrupt now (cancels the old
 	// pipeline, truncates spoken-truth context, emits Interrupted). No-op if
 	// there was no pending barge-in for this generation.
 	ms.confirmBargeInIfPending()
+
+	ms.mu.Lock()
+	ms.ckBargeMs = time.Since(ms.sttEndTime).Milliseconds()
+	ms.mu.Unlock()
 
 	ms.lastUserText = transcript
 
@@ -1620,6 +1649,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// for the user's transcript and inject it into context before the LLM call
 	// (LiveKit pattern — avoids extra tool round-trips).
 	ms.injectRagContext(transcript)
+
+	ms.mu.Lock()
+	ms.ckCacheMs = time.Since(ms.sttEndTime).Milliseconds()
+	ms.mu.Unlock()
 
 	if !ms.trySpeculativeResponse(ctx, transcript) {
 		ms.runLLMAndTTS(ctx, transcript)
