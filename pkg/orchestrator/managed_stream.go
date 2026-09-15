@@ -183,6 +183,14 @@ type ManagedStream struct {
 	discardedMs int64
 	// discardStart marks when the work that is about to be discarded began.
 	discardStart time.Time
+	// Sub-stages of turn_gate_ms (sttEnd -> llmStart). That span measured 10-12
+	// SECONDS on two turns of a live call while every component in it is
+	// individually bounded — the confirmation gate at 350ms, the speculative
+	// await at 4s, RAG async, telemetry non-blocking. Guessing which one is
+	// lying is exactly what this log line exists to stop, so the span is split
+	// until it accounts for itself.
+	confirmWaitMs int64
+	specAwaitMs   int64
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -770,6 +778,19 @@ func (ms *ManagedStream) logTurnLatency() {
 		}
 	}
 
+	// turn_gate_ms split into its parts, so a large value names its own cause
+	// instead of being a span nobody can attribute.
+	ms.mu.Lock()
+	confirmWait, specAwait := ms.confirmWaitMs, ms.specAwaitMs
+	ms.mu.Unlock()
+	gateOther := gate
+	if gateOther > 0 {
+		gateOther -= confirmWait + specAwait
+		if gateOther < 0 {
+			gateOther = 0
+		}
+	}
+
 	ms.logger.Info("turn latency",
 		// The caller's clock: last voiced frame -> first audio out.
 		"e2e_ms", e2e,
@@ -783,6 +804,11 @@ func (ms *ManagedStream) logTurnLatency() {
 		// difference between true and false here is most of stt_ms.
 		"stt_speculative", ms.sttSpeculative,
 		"turn_gate_ms", gate,
+		// Where turn_gate_ms went: the mid-thought confirmation wait, the
+		// speculative-LLM await, and whatever is left over.
+		"gate_confirm_ms", confirmWait,
+		"gate_spec_await_ms", specAwait,
+		"gate_other_ms", gateOther,
 		"llm_ms", llm,
 		"llm_to_tts_ms", llmToTTS,
 		"tts_first_chunk_ms", ttsFirst,
@@ -1048,6 +1074,8 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.mu.Lock()
 	ms.discardedMs = 0
 	ms.discardStart = time.Time{}
+	ms.confirmWaitMs = 0
+	ms.specAwaitMs = 0
 	ms.mu.Unlock()
 	ms.emit(UserStopped, nil)
 
@@ -1410,6 +1438,13 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		gate := make(chan struct{})
 		ms.confirmationGate = gate
 		ms.mu.Unlock()
+
+		gateEnteredAt := time.Now()
+		defer func() {
+			ms.mu.Lock()
+			ms.confirmWaitMs = time.Since(gateEnteredAt).Milliseconds()
+			ms.mu.Unlock()
+		}()
 
 		select {
 		case <-gate:

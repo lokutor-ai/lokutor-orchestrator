@@ -337,14 +337,28 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	// Once the first chunk is out, later chunks flush on sentence boundaries
 	// for natural prosody. Safe because the first chunk's playback time covers
 	// the next chunk's synthesis, so audio stays gapless.
+	// Splitting the opening chunk is OFF by default.
+	//
+	// It used to cut the first chunk at a clause boundary, or failing that at
+	// whatever word fell before 32 characters. That buys a faster first byte
+	// and pays for it with the thing people actually notice: the agent said
+	// about five words, stopped dead, and resumed. Prosody is generated per
+	// synthesis call, so a sentence cut in half is spoken as two sentences —
+	// wrong intonation on both halves and a seam in the middle. A slightly
+	// later start that sounds like a person beats an immediate start that
+	// sounds broken.
+	//
+	// Set TTS_FIRST_CHUNK_MAX_CHARS to a positive value to bring the old
+	// behaviour back; the value is the hard cap on the opening chunk.
 	firstChunkDone := false
 	const firstChunkClauseMin = 12 // don't flush a clause shorter than this
-	firstChunkMaxChars := 32       // hard cap on the opening chunk's length
+	firstChunkMaxChars := 0        // 0 = never split the first chunk early
 	if v := os.Getenv("TTS_FIRST_CHUNK_MAX_CHARS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= firstChunkClauseMin {
 			firstChunkMaxChars = n
 		}
 	}
+	splitFirstChunk := firstChunkMaxChars > 0
 
 	flushSentence := func() {
 		s := strings.TrimSpace(pendingSentence.String())
@@ -400,16 +414,20 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			// sentence to synthesize.
 			flushEnd := -1 // exclusive byte index of the segment to flush
 			for i, c := range buf {
+				// Sentence-ending punctuation is the only boundary the
+				// synthesiser can be handed without changing how the line is
+				// spoken. Everything else splits a sentence across two
+				// synthesis calls, which is audible.
 				if c == '.' || c == '!' || c == '?' {
 					flushEnd = i + 1
 					break
 				}
-				if !firstChunkDone && (c == ',' || c == ';' || c == ':') && i >= firstChunkClauseMin {
+				if splitFirstChunk && !firstChunkDone && (c == ',' || c == ';' || c == ':') && i >= firstChunkClauseMin {
 					flushEnd = i + 1
 					break
 				}
 			}
-			if flushEnd < 0 && !firstChunkDone && len(buf) >= firstChunkMaxChars {
+			if splitFirstChunk && flushEnd < 0 && !firstChunkDone && len(buf) >= firstChunkMaxChars {
 				if sp := strings.LastIndexByte(strings.TrimRight(buf[:firstChunkMaxChars], " "), ' '); sp > firstChunkClauseMin {
 					flushEnd = sp + 1
 				}

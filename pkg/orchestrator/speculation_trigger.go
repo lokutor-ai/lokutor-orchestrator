@@ -119,8 +119,12 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	// but cap it so an unusually slow speculative run can never make a
 	// miss slower than just running the normal path would have been.
 	awaitCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	awaitStart := time.Now()
 	response, ok := ms.speculator.Await(awaitCtx, transcript)
 	cancel()
+	ms.mu.Lock()
+	ms.specAwaitMs = time.Since(awaitStart).Milliseconds()
+	ms.mu.Unlock()
 	// Always clean up: Await leaves the executor in SpecReady/SpecRunning,
 	// and ShouldSpeculate/ShouldSpeculateOnPause both require SpecIdle to
 	// start a new run — without this, one used-or-missed speculation would
