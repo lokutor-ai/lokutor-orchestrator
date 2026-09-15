@@ -154,6 +154,8 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	// it, this turn's ttfa_ms/tts_first_ms would be measured against
 	// whatever sentence last set ttsFirstChunkTime on a PRIOR turn.
 	ms.ttsFirstChunkTime = time.Time{}
+	// Same pairing as runLLMAndTTS: these are two ends of one measurement.
+	ms.ttsStartTime = time.Time{}
 
 	ms.mu.Lock()
 	ms.lastResponseText = response

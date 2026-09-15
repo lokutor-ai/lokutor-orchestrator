@@ -1721,6 +1721,9 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	// reported TTS latency by however long the earlier sentences took to
 	// finish playing, on every multi-sentence reply.
 	ms.ttsFirstChunkTime = time.Time{}
+	// Reset with it: they are two ends of the same measurement and must come
+	// from the same turn.
+	ms.ttsStartTime = time.Time{}
 
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
 		ms.runStreamingLLM(rCtx, sProvider, gen, transcript)
@@ -1862,7 +1865,17 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	ms.mu.Lock()
 	ms.ttsCancel = sCancel
 	ms.botSpeakStart = time.Now()
-	ms.ttsStartTime = ms.botSpeakStart
+	// Only the FIRST sentence of a turn sets ttsStartTime. speakText runs once
+	// per sentence and used to overwrite it every time, while ttsFirstChunkTime
+	// is captured once — so the two drifted apart within a turn and could even
+	// end up from different turns, producing a tts_first_chunk_ms larger than
+	// the whole e2e_ms it is supposedly part of (observed: 2029ms inside a
+	// 1686ms turn, and a negative unaccounted_ms as a result). Reset per turn
+	// alongside ttsFirstChunkTime, so this always means "start of synthesis for
+	// this turn's first sentence".
+	if ms.ttsStartTime.IsZero() {
+		ms.ttsStartTime = ms.botSpeakStart
+	}
 	ms.state = StateSpeaking
 	// Tracks whatever's actively coming out of the speaker right now — used
 	// to detect a barge-in that's actually an echo of the bot's own voice
