@@ -522,7 +522,16 @@ func DefaultConfig() Config {
 		// disable (e.g. if the model asset genuinely isn't present).
 		TurnoModelPath:                "assets/onnx/turno/model.onnx",
 		TurnoTurnModelPath:            "assets/onnx/turno/turn_v6.onnx",
-		TurnoHoldThreshold:            0.45,
+		// 0 = off. Was 0.45, which fired on essentially every turn: the
+		// hold triggers on p_incomplete + p_wait, and the v6 head reports
+		// p_incomplete of 0.67-0.72 even on plainly finished sentences, so
+		// the threshold was met constantly. Measured in production on
+		// 2026-09-15: all three turns of a live call logged "Turno hold" and
+		// paid the full 350ms, on transcripts like "Hello, how are you?" —
+		// a flat 350ms added to every turn by a head that is miscalibrated
+		// in one direction. The shadow logging beside it stays on, and this
+		// goes back above zero when it says the head has been fixed.
+		TurnoHoldThreshold:            0,
 		TurnoHoldMs:                   350,
 		TurnoHorizonAssistThreshold:   0.35,
 		TurnoHorizonAssistFactor:      0.25,

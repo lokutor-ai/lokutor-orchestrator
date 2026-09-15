@@ -140,6 +140,11 @@ func TestHorizonThresholdIsReachable(t *testing.T) {
 // because prosody says the speaker is still going would reintroduce the bug.
 func TestHoldAndHorizonAreMutuallyExclusive(t *testing.T) {
 	cfg := DefaultConfig()
+	// The hold ships disabled (see TestHoldShipsOffUntilTheHeadIsCalibrated),
+	// so configure a threshold explicitly: what is under test here is the
+	// mutual-exclusion logic, which must stay correct for whatever value an
+	// operator sets, not the shipped default.
+	cfg.TurnoHoldThreshold = 0.45
 	type turn struct {
 		lexicalComplete bool
 		pIncomplete, pWait, pEnd200 float32
@@ -166,12 +171,30 @@ func TestHoldAndHorizonAreMutuallyExclusive(t *testing.T) {
 	check("no signal", turn{true, 0.10, 0.05, 0.10}, false, false)
 }
 
+// The hold is off until the v6 head stops calling finished sentences
+// unfinished. It fires on p_incomplete + p_wait, and the head reports
+// p_incomplete of 0.67-0.72 on plainly complete utterances — so at the old
+// default of 0.45 it fired on essentially every turn. Measured in production
+// on 2026-09-15: all three turns of a live call logged "Turno hold" and paid
+// the full 350ms, on transcripts like "Hello, how are you?".
+//
+// Turning it back on is a deliberate act that should follow shadow evidence,
+// not an accident of editing DefaultConfig.
+func TestHoldShipsOffUntilTheHeadIsCalibrated(t *testing.T) {
+	if got := DefaultConfig().TurnoHoldThreshold; got != 0 {
+		t.Errorf("TurnoHoldThreshold = %.2f, want 0 — re-enabling costs %dms on every turn and needs shadow data first",
+			got, DefaultConfig().TurnoHoldMs)
+	}
+}
+
 // Holding must never cost more than the mid-thought wait it sits beside: the
 // text did look finished, so this is a grace window, not a full re-wait.
+// Checks TurnoHoldMs, which stays configured even while the hold is disabled,
+// so the duration is still sane whenever it is switched back on.
 func TestHoldIsShorterThanTheMidThoughtWait(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.TurnoHoldMs <= 0 {
-		t.Fatal("hold disabled by default")
+		t.Fatal("hold duration unset — it must stay sane for when the hold is re-enabled")
 	}
 	if cfg.TurnoHoldMs >= cfg.SilenceConfirmationMs && cfg.SilenceConfirmationMs > 0 {
 		t.Errorf("hold %dms is not shorter than the mid-thought wait %dms",

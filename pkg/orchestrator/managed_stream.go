@@ -603,7 +603,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		// Spend the VAD hangover transcribing rather than waiting. By the time
 		// the hangover starts counting, every speech sample is already in the
 		// buffer — see speculative_stt.go.
-		ms.maybeSpeculateSTT(ms.utteranceSeq)
+		ms.maybeSpeculateSTT()
 
 		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
 			speechDuration := time.Since(ms.userSpeakingSince)

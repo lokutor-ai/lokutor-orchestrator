@@ -119,7 +119,14 @@ type silenceFramesProvider interface {
 // entered the hangover window and nothing is in flight for this utterance.
 // Called from the audio loop on every chunk while speech is active; must stay
 // cheap on the overwhelming majority of calls where it does nothing.
-func (ms *ManagedStream) maybeSpeculateSTT(seq int) {
+// The seq is derived here rather than passed in, because getting it from the
+// caller is exactly what broke this the first time. utteranceSeq is incremented
+// in onVADEnd, so during the hangover it still holds the PREVIOUS utterance's
+// number while processUtterance will be handed utteranceSeq+1 — tagging a
+// speculation with the current value made awaitUsable compare N-1 against N and
+// discard its own result on every turn, silently, with the feature reporting
+// itself as enabled the whole time.
+func (ms *ManagedStream) maybeSpeculateSTT() {
 	if !specSTTEnabled() || ms.vad == nil || ms.orch == nil {
 		return
 	}
@@ -143,6 +150,8 @@ func (ms *ManagedStream) maybeSpeculateSTT(seq int) {
 	snapshot := make([]byte, len(ms.speechAudioBuf))
 	copy(snapshot, ms.speechAudioBuf)
 	lang := ms.session.GetCurrentLanguage()
+	// The number this in-flight utterance will carry once onVADEnd commits it.
+	seq := ms.utteranceSeq + 1
 	ms.mu.Unlock()
 
 	if len(snapshot) < defaultSpecSTTMinBytes {
