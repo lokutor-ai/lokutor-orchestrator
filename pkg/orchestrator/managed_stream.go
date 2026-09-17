@@ -2386,15 +2386,17 @@ func (ms *ManagedStream) RegenerateBackchannelClips(o *Orchestrator) {
 			lang = o.config.Language
 		}
 
-		phrases := backchannelPhrasesForLang(lang)
-		clips := make([][]byte, 0, len(phrases))
-
-		for _, phrase := range phrases {
-			audio, err := o.GenerateSilent(ms.ctx, phrase, voice, lang)
-			if err == nil && len(audio) > 100 {
-				clips = append(clips, audio)
+		clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
+			phrases := backchannelPhrasesForLang(lang)
+			out := make([][]byte, 0, len(phrases))
+			for _, phrase := range phrases {
+				audio, err := o.GenerateSilent(c, phrase, voice, lang)
+				if err == nil && len(audio) > 100 {
+					out = append(out, audio)
+				}
 			}
-		}
+			return out
+		})
 
 		if len(clips) > 0 {
 			ms.backch.SetClips(clips)
@@ -2402,24 +2404,29 @@ func (ms *ManagedStream) RegenerateBackchannelClips(o *Orchestrator) {
 	}()
 }
 
-// splitSentences splits text on sentence-ending punctuation (.!?)
-// while preserving the punctuation. Returns at least one sentence.
+// splitSentences splits text into segments to synthesise, one per sentence, preserving the
+// punctuation. Returns at least one segment.
+//
+// Only real sentence ends count: splitting at every '.' cut "a las 4 p.m." into three pieces and
+// "3.14" into two, each becoming its own synthesis call — an audible gap between them, and too
+// little text for the language token to condition, so a fragment came out English-sounding. A
+// segment shorter than minSpokenSegment is joined to the next for the same reason. See
+// sentence_boundary.go.
 func splitSentences(text string) []string {
 	var res []string
-	var cur strings.Builder
-	for _, c := range text {
-		cur.WriteRune(c)
-		if c == '.' || c == '!' || c == '?' {
-			s := strings.TrimSpace(cur.String())
-			if s != "" {
-				res = append(res, s)
-			}
-			cur.Reset()
+	rest := text
+	for len(rest) > 0 {
+		end := nextFlushPoint(rest, true, false, 0, minSpokenSegment)
+		if end < 0 || end >= len(rest) {
+			break
 		}
+		if s := strings.TrimSpace(rest[:end]); s != "" {
+			res = append(res, s)
+		}
+		rest = strings.TrimLeft(rest[end:], " \t\n\r")
 	}
-	remaining := strings.TrimSpace(cur.String())
-	if remaining != "" {
-		res = append(res, remaining)
+	if s := strings.TrimSpace(rest); s != "" {
+		res = append(res, s)
 	}
 	if len(res) == 0 {
 		res = []string{text}
@@ -2803,15 +2810,20 @@ func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 		lang = o.config.Language
 	}
 
-	phrases := backchannelPhrasesForLang(lang)
-	clips := make([][]byte, 0, len(phrases))
-
-	for _, phrase := range phrases {
-		audio, err := o.GenerateSilent(ms.ctx, phrase, voice, lang)
-		if err == nil && len(audio) > 100 {
-			clips = append(clips, audio)
+	// Once per process per (voice, language) — not once per session. See backchannel_cache.go:
+	// regenerating identical audio at every session start took a synthesis slot from the caller's
+	// first sentence and pushed it over real-time, which is heard as a gap.
+	clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
+		phrases := backchannelPhrasesForLang(lang)
+		out := make([][]byte, 0, len(phrases))
+		for _, phrase := range phrases {
+			audio, err := o.GenerateSilent(c, phrase, voice, lang)
+			if err == nil && len(audio) > 100 {
+				out = append(out, audio)
+			}
 		}
-	}
+		return out
+	})
 
 	if len(clips) > 0 && ms.backch != nil {
 		ms.backch.SetClips(clips)

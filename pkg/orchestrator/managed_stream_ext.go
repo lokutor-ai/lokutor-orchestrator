@@ -412,21 +412,17 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			// word boundary — so the opening chunk stays short and the bot
 			// starts speaking quickly instead of waiting for a whole long
 			// sentence to synthesize.
-			flushEnd := -1 // exclusive byte index of the segment to flush
-			for i, c := range buf {
-				// Sentence-ending punctuation is the only boundary the
-				// synthesiser can be handed without changing how the line is
-				// spoken. Everything else splits a sentence across two
-				// synthesis calls, which is audible.
-				if c == '.' || c == '!' || c == '?' {
-					flushEnd = i + 1
-					break
-				}
-				if splitFirstChunk && !firstChunkDone && (c == ',' || c == ';' || c == ':') && i >= firstChunkClauseMin {
-					flushEnd = i + 1
-					break
-				}
-			}
+			// Sentence-ending punctuation is the only boundary the synthesiser can be handed
+			// without changing how the line is spoken — but only when it really ends a sentence.
+			// Cutting at every '.' turned "a las 4 p.m." into three synthesis calls and "3.14"
+			// into two, each paying the engine's start-up cost again (an audible gap) and each
+			// too short for the language token to condition anything (an English-sounding
+			// fragment mid-sentence). See sentence_boundary.go.
+			flushEnd := nextFlushPoint(
+				buf, false,
+				splitFirstChunk && !firstChunkDone, firstChunkClauseMin,
+				minSpokenSegment,
+			)
 			if splitFirstChunk && flushEnd < 0 && !firstChunkDone && len(buf) >= firstChunkMaxChars {
 				if sp := strings.LastIndexByte(strings.TrimRight(buf[:firstChunkMaxChars], " "), ' '); sp > firstChunkClauseMin {
 					flushEnd = sp + 1
