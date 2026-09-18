@@ -134,3 +134,37 @@ func TestNextFlushPointStillTakesClauseBoundariesForTheOpeningChunk(t *testing.T
 		t.Errorf("flushed at a comma (%d) with clause boundaries disabled", got)
 	}
 }
+
+// A backchannel is one or two syllables, so an English one dropped into another language is
+// unmistakable — this is part of the "it switched to English" report. Catalan, Galician and Basque
+// had no case at all and fell through to the English default; French, Italian and Portuguese
+// carried a literal "uh-huh".
+func TestBackchannelPhrasesAreNotEnglishForOtherLanguages(t *testing.T) {
+	english := map[string]bool{"uh-huh": true, "yeah": true, "yep": true, "right": true, "ok": true}
+	for _, lang := range []Language{"es", "ca", "gl", "eu", "pt", "fr", "it", "de"} {
+		phrases := backchannelPhrasesForLang(lang)
+		if len(phrases) == 0 {
+			t.Errorf("%s: no backchannel phrases", lang)
+			continue
+		}
+		for _, p := range phrases {
+			if english[strings.ToLower(p)] {
+				t.Errorf("%s: backchannels with the English %q", lang, p)
+			}
+		}
+	}
+}
+
+// Every language the product offers needs its own list, not the English fallback.
+func TestEverySupportedLanguageHasItsOwnBackchannels(t *testing.T) {
+	fallback := strings.Join(backchannelPhrasesForLang("zz-not-a-language"), "|")
+	for _, lang := range []Language{"es", "ca", "gl", "eu", "pt", "fr", "it", "de"} {
+		if got := strings.Join(backchannelPhrasesForLang(lang), "|"); got == fallback {
+			t.Errorf("%s falls through to the English default (%s)", lang, fallback)
+		}
+	}
+	// English itself is expected to use it.
+	if got := strings.Join(backchannelPhrasesForLang("en"), "|"); got != fallback {
+		t.Errorf("en = %q, want the default %q", got, fallback)
+	}
+}

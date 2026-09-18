@@ -2731,14 +2731,25 @@ func backchannelPhrasesForLang(lang Language) []string {
 	switch lang {
 	case LanguageEs:
 		return []string{"mhm", "ahá", "sí"}
+	// Catalan, Galician and Basque had no case, so they fell through to the English default and the
+	// agent backchannelled "yeah" into a Catalan conversation. They are supported languages; they
+	// need their own.
+	case "ca":
+		return []string{"mhm", "ajà", "sí"}
+	case "gl":
+		return []string{"mhm", "aha", "si"}
+	case "eu":
+		return []string{"mhm", "aha", "bai"}
+	// "uh-huh" is an English interjection and was sitting in the French, Italian and Portuguese
+	// lists. A backchannel is short enough that an English one is unmistakable.
 	case LanguageFr:
-		return []string{"mhm", "uh-huh", "oui"}
+		return []string{"mhm", "hm-hm", "oui"}
 	case LanguageDe:
 		return []string{"mhm", "aha", "ja"}
 	case LanguageIt:
-		return []string{"mhm", "uh-huh", "sì"}
+		return []string{"mhm", "eh", "sì"}
 	case LanguagePt:
-		return []string{"mhm", "uh-huh", "sim"}
+		return []string{"mhm", "ahã", "sim"}
 	case LanguageJa:
 		return []string{"un", "hai", "ee"}
 	case LanguageKo:
