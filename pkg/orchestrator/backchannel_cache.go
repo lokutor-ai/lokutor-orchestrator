@@ -20,12 +20,17 @@ import (
 // speech; it takes a slot. The provider saw first audio 1.2-1.7s after requesting it while the
 // engine itself reported 250-400ms, the difference being time spent queueing behind these clips.
 //
-// Caching keyed on (voice, language) removes all of it after the first session, and the in-flight
-// guard means ten simultaneous sessions on a cold process generate one set rather than ten.
+// Caching keyed on the voice removes all of it after the first session, and the in-flight guard
+// means ten simultaneous sessions on a cold process generate one set rather than ten.
+//
+// The key dropped `language` when the phrases became language-agnostic. They are nasal hums
+// synthesised unmarked (see backchannelPhrases), so the audio for a given voice is now identical
+// whatever language the call is in — keeping language in the key would have meant synthesising the
+// same three clips again for every one of nine languages, which is exactly the warm-up cost this
+// cache exists to remove.
 
 type backchannelKey struct {
 	voice Voice
-	lang  Language
 }
 
 type backchannelEntry struct {
@@ -44,10 +49,10 @@ var (
 // to keep competing with whatever is making it slow.
 const backchannelGenTimeout = 20 * time.Second
 
-// cachedBackchannelClips returns the clips for (voice, lang), synthesising them once per process.
-// gen is only called on the first request for a key; concurrent callers wait for that one result.
-func cachedBackchannelClips(ctx context.Context, voice Voice, lang Language, gen func(context.Context) [][]byte) [][]byte {
-	key := backchannelKey{voice: voice, lang: lang}
+// cachedBackchannelClips returns the clips for a voice, synthesising them once per process. gen is
+// only called on the first request for a key; concurrent callers wait for that one result.
+func cachedBackchannelClips(ctx context.Context, voice Voice, gen func(context.Context) [][]byte) [][]byte {
+	key := backchannelKey{voice: voice}
 
 	backchannelMu.Lock()
 	e, ok := backchannelCache[key]

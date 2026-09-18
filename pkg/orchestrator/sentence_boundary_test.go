@@ -136,37 +136,55 @@ func TestNextFlushPointStillTakesClauseBoundariesForTheOpeningChunk(t *testing.T
 	}
 }
 
-// A backchannel is one or two syllables, so an English one dropped into another language is
-// unmistakable — this is part of the "it switched to English" report. Catalan, Galician and Basque
-// had no case at all and fell through to the English default; French, Italian and Portuguese
-// carried a literal "uh-huh".
-func TestBackchannelPhrasesAreNotEnglishForOtherLanguages(t *testing.T) {
-	english := map[string]bool{"uh-huh": true, "yeah": true, "yep": true, "right": true, "ok": true}
-	for _, lang := range []Language{"es", "ca", "gl", "eu", "pt", "fr", "it", "de"} {
-		phrases := backchannelPhrasesForLang(lang)
-		if len(phrases) == 0 {
-			t.Errorf("%s: no backchannel phrases", lang)
-			continue
+// Backchannels must carry no lexical content at all.
+//
+// The previous design gave each language its own list, and each list ended in a real word — "sí",
+// "oui", "ja", "sim", "bai", "yeah". A word is only right in one language, so every gap in that
+// 30-language table fell through to the English default and a Catalan call got "yeah". These tests
+// used to enforce "every language has its own row", which treated a wider table as the fix. The
+// actual fix was to stop saying words: a nasal hum means "go on" in essentially any language and
+// cannot be wrong in one.
+func TestBackchannelsAreNotWordsInAnyLanguage(t *testing.T) {
+	// Anything a speaker of some language would recognise as a WORD, not a noise.
+	lexical := map[string]bool{
+		"yeah": true, "yep": true, "right": true, "ok": true, "okay": true, "sure": true,
+		"uh-huh": true, "uhhuh": true, // English interjections: unmistakable in a Spanish call
+		"sí": true, "si": true, "oui": true, "ja": true, "sim": true, "bai": true, "da": true,
+		"tak": true, "ano": true, "evet": true, "hai": true, "ne": true, "naam": true, "niin": true,
+		"aha": true, "ahá": true, "ajà": true, "ahã": true, // reads as "I see", not "go on"
+	}
+	if len(backchannelPhrases) == 0 {
+		t.Fatal("no backchannel phrases at all")
+	}
+	for _, p := range backchannelPhrases {
+		if lexical[strings.ToLower(p)] {
+			t.Errorf("%q is a word (or reads as recognition rather than attention) — it can only "+
+				"be right in some languages", p)
 		}
-		for _, p := range phrases {
-			if english[strings.ToLower(p)] {
-				t.Errorf("%s: backchannels with the English %q", lang, p)
-			}
+		// A nasal hum is one or two syllables. Anything longer is almost certainly lexical.
+		if len([]rune(p)) > 4 {
+			t.Errorf("%q is too long to be a non-lexical backchannel", p)
 		}
 	}
 }
 
-// Every language the product offers needs its own list, not the English fallback.
-func TestEverySupportedLanguageHasItsOwnBackchannels(t *testing.T) {
-	fallback := strings.Join(backchannelPhrasesForLang("zz-not-a-language"), "|")
-	for _, lang := range []Language{"es", "ca", "gl", "eu", "pt", "fr", "it", "de"} {
-		if got := strings.Join(backchannelPhrasesForLang(lang), "|"); got == fallback {
-			t.Errorf("%s falls through to the English default (%s)", lang, fallback)
+// One list for every language is the design, not an oversight: adding a language must not require
+// remembering to add a row, because forgetting was silent and shipped "yeah" into Catalan.
+func TestBackchannelsDoNotVaryByLanguage(t *testing.T) {
+	want := strings.Join(backchannelPhrases, "|")
+	for _, lang := range []Language{"en", "es", "ca", "gl", "eu", "pt", "fr", "it", "de", "zz-unknown"} {
+		if got := strings.Join(backchannelPhrasesForLang(lang), "|"); got != want {
+			t.Errorf("%s returned %q, want the single shared list %q", lang, got, want)
 		}
 	}
-	// English itself is expected to use it.
-	if got := strings.Join(backchannelPhrasesForLang("en"), "|"); got != fallback {
-		t.Errorf("en = %q, want the default %q", got, fallback)
+}
+
+// They are synthesised unmarked. Prefixing [es] to a nasal hum asks the text encoder to apply a
+// language's pronunciation prior to something with no pronunciation in it; English is the model's
+// unmarked base case and takes no language token at all.
+func TestBackchannelsAreSynthesisedUnmarked(t *testing.T) {
+	if backchannelLang != LanguageEn {
+		t.Errorf("backchannelLang = %q, want %q (the model's unmarked case)", backchannelLang, LanguageEn)
 	}
 }
 

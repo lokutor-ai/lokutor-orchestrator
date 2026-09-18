@@ -2399,23 +2399,17 @@ func (ms *ManagedStream) RegenerateBackchannelClips(o *Orchestrator) {
 	}
 	go func() {
 		voice := VoiceF1
-		lang := LanguageEn
 		if ms.session != nil && ms.session.GetCurrentVoice() != "" {
 			voice = ms.session.GetCurrentVoice()
 		} else if o != nil && o.config.VoiceStyle != "" {
 			voice = o.config.VoiceStyle
 		}
-		if ms.session != nil && ms.session.CurrentLanguage != "" {
-			lang = ms.session.CurrentLanguage
-		} else if o != nil && o.config.Language != "" {
-			lang = o.config.Language
-		}
 
-		clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
-			phrases := backchannelPhrasesForLang(lang)
-			out := make([][]byte, 0, len(phrases))
-			for _, phrase := range phrases {
-				audio, err := o.GenerateSilent(c, phrase, voice, lang)
+		clips := cachedBackchannelClips(ms.ctx, voice, func(c context.Context) [][]byte {
+			out := make([][]byte, 0, len(backchannelPhrases))
+			for _, phrase := range backchannelPhrases {
+				// backchannelLang, not the caller's language — see backchannelPhrases.
+				audio, err := o.GenerateSilent(c, phrase, voice, backchannelLang)
 				if err == nil && len(audio) > 100 {
 					out = append(out, audio)
 				}
@@ -2752,108 +2746,50 @@ func (ms *ManagedStream) emitBackchannel(data []byte) {
 	}
 }
 
-func backchannelPhrasesForLang(lang Language) []string {
-	switch lang {
-	case LanguageEs:
-		return []string{"mhm", "ahá", "sí"}
-	// Catalan, Galician and Basque had no case, so they fell through to the English default and the
-	// agent backchannelled "yeah" into a Catalan conversation. They are supported languages; they
-	// need their own.
-	case "ca":
-		return []string{"mhm", "ajà", "sí"}
-	case "gl":
-		return []string{"mhm", "aha", "si"}
-	case "eu":
-		return []string{"mhm", "aha", "bai"}
-	// "uh-huh" is an English interjection and was sitting in the French, Italian and Portuguese
-	// lists. A backchannel is short enough that an English one is unmistakable.
-	case LanguageFr:
-		return []string{"mhm", "hm-hm", "oui"}
-	case LanguageDe:
-		return []string{"mhm", "aha", "ja"}
-	case LanguageIt:
-		return []string{"mhm", "eh", "sì"}
-	case LanguagePt:
-		return []string{"mhm", "ahã", "sim"}
-	case LanguageJa:
-		return []string{"un", "hai", "ee"}
-	case LanguageKo:
-		return []string{"eum", "eo", "ne"}
-	case LanguageZh:
-		return []string{"en", "a", "shi"}
-	case LanguageAr:
-		return []string{"hmm", "ah", "naam"}
-	case LanguageBg:
-		return []string{"mhm", "ahah", "da"}
-	case LanguageHr:
-		return []string{"mhm", "aha", "da"}
-	case LanguageCs:
-		return []string{"mhm", "aha", "ano"}
-	case LanguageDa:
-		return []string{"mhm", "naa", "ja"}
-	case LanguageNl:
-		return []string{"mhm", "uh-huh", "ja"}
-	case LanguageEt:
-		return []string{"mhm", "ahah", "jah"}
-	case LanguageFi:
-		return []string{"mhm", "ahaa", "niin"}
-	case LanguageEl:
-		return []string{"mmm", "aha", "ne"}
-	case LanguageHi:
-		return []string{"hmm", "haan", "accha"}
-	case LanguageHu:
-		return []string{"mhm", "aha", "igen"}
-	case LanguageId:
-		return []string{"mhm", "uh-huh", "ya"}
-	case LanguageLv:
-		return []string{"mhm", "aha", "jaa"}
-	case LanguageLt:
-		return []string{"mhm", "aha", "taip"}
-	case LanguagePl:
-		return []string{"mhm", "aha", "tak"}
-	case LanguageRo:
-		return []string{"mhm", "aha", "da"}
-	case LanguageRu:
-		return []string{"mhm", "aha", "da"}
-	case LanguageSk:
-		return []string{"mhm", "aha", "ano"}
-	case LanguageSl:
-		return []string{"mhm", "aha", "ja"}
-	case LanguageSv:
-		return []string{"mhm", "uh-huh", "ja"}
-	case LanguageTr:
-		return []string{"mhm", "hihi", "evet"}
-	case LanguageUk:
-		return []string{"mhm", "aha", "tak"}
-	case LanguageVi:
-		return []string{"um", "u", "vang"}
-	default:
-		return []string{"mhm", "uh-huh", "yeah"}
-	}
-}
+// backchannelPhrases are the little sounds the agent makes while the caller is still talking.
+//
+// One list, no language switch, and that is the point. This used to be a 30-language table where
+// each entry ended in a real word — "sí", "oui", "ja", "sim", "bai", "yeah" — and the trouble with
+// a word is that it is only right in one language. Any gap in the table fell through to the
+// English default, so a Catalan conversation got "yeah"; any language served by a near-miss got a
+// word a native speaker would notice. Adding a language meant remembering to add a row, and
+// forgetting was silent.
+//
+// These are not words in any language. A nasal hum and an open vowel are what listeners produce to
+// say "go on, I'm still here" across essentially every language, and none of them is lexical, so
+// none can be wrong in one. That removes the failure mode rather than widening the table.
+//
+// Deliberately excluded: "uh-huh" and "yeah" (English interjections, unmistakable in a Spanish
+// call) and "aha" (reads as recognition — "I see" — rather than mere attention, and in several
+// languages it lands as surprise).
+var backchannelPhrases = []string{"mhm", "mm", "hm"}
+
+// backchannelLang is the language these are synthesised in — English, which the model treats as its
+// unmarked base case and therefore prefixes with no language token.
+//
+// Passing the caller's language would prepend [es] or [ca] to a sound that is not a word in
+// Spanish or Catalan, which asks the text encoder to apply a language's pronunciation prior to
+// something that has no pronunciation in it. Unmarked is the honest description of a nasal hum.
+const backchannelLang = LanguageEn
+
+func backchannelPhrasesForLang(Language) []string { return backchannelPhrases }
 
 func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 	voice := VoiceF1
-	lang := LanguageEn
 	if ms.session != nil && ms.session.GetCurrentVoice() != "" {
 		voice = ms.session.GetCurrentVoice()
 	} else if o != nil && o.config.VoiceStyle != "" {
 		voice = o.config.VoiceStyle
 	}
-	if ms.session != nil && ms.session.CurrentLanguage != "" {
-		lang = ms.session.CurrentLanguage
-	} else if o != nil && o.config.Language != "" {
-		lang = o.config.Language
-	}
 
 	// Once per process per (voice, language) — not once per session. See backchannel_cache.go:
 	// regenerating identical audio at every session start took a synthesis slot from the caller's
 	// first sentence and pushed it over real-time, which is heard as a gap.
-	clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
-		phrases := backchannelPhrasesForLang(lang)
-		out := make([][]byte, 0, len(phrases))
-		for _, phrase := range phrases {
-			audio, err := o.GenerateSilent(c, phrase, voice, lang)
+	clips := cachedBackchannelClips(ms.ctx, voice, func(c context.Context) [][]byte {
+		out := make([][]byte, 0, len(backchannelPhrases))
+		for _, phrase := range backchannelPhrases {
+			// backchannelLang, not the caller's language — see backchannelPhrases.
+			audio, err := o.GenerateSilent(c, phrase, voice, backchannelLang)
 			if err == nil && len(audio) > 100 {
 				out = append(out, audio)
 			}
