@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"math"
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -113,12 +115,22 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 		return false
 	}
 
-	// Bounded wait for an in-flight run: if speculation started early, most
-	// of its generation time has already elapsed in parallel with the real
-	// STT round trip by the time we get here, so this rarely adds much —
-	// but cap it so an unusually slow speculative run can never make a
-	// miss slower than just running the normal path would have been.
-	awaitCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	// Bounded wait for an in-flight run. The bound has to be smaller than the
+	// thing it is an optimisation of, and at 4 seconds it was ten times larger.
+	//
+	// Measured on a live turn: e2e 1988ms, of which gate_spec_await_ms was
+	// 1437 — the single largest term by far, and none of it work. The
+	// speculation had not finished, so the turn sat waiting for a shortcut
+	// while the ordinary path would have answered in about 400ms. A good turn
+	// on the same pod: 610ms end to end.
+	//
+	// So the cap is now roughly what the real path costs. Past that point
+	// waiting cannot win: even if the speculative answer lands the moment
+	// after, we have already spent more than running it ourselves would have.
+	// Missing is cheap — the caller falls through to runLLMAndTTS and pays the
+	// normal price — so the only expensive outcome is waiting too long for a
+	// hit, which is exactly what this prevents.
+	awaitCtx, cancel := context.WithTimeout(ctx, speculativeAwaitBudget())
 	awaitStart := time.Now()
 	response, ok := ms.speculator.Await(awaitCtx, transcript)
 	cancel()
@@ -169,4 +181,24 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.logger.Info("Speculative LLM response used", "transcript", transcript)
 	ms.speakText(rCtx, response, gen)
 	return true
+}
+
+// speculativeAwaitBudget is how long a confirmed turn will wait for an in-flight speculative run
+// before giving up and generating the reply itself.
+//
+// It is a latency cap, not a correctness knob: waiting longer only ever produces the same answer
+// later. The right value is "about what the normal path costs", because beyond that a hit is no
+// longer a saving. Production turns land near 400ms end-to-end when speculation hits (hangover
+// ~230ms + TTS first chunk ~280ms, with STT and LLM already done), so 350ms leaves room for a run
+// that is genuinely about to finish while cutting off one that is not.
+//
+// Raising this is almost always the wrong instinct. A higher cap does not make hits more likely; it
+// makes misses more expensive, and a miss already costs the full normal pipeline on top.
+func speculativeAwaitBudget() time.Duration {
+	if v := os.Getenv("SPECULATIVE_AWAIT_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return time.Duration(n) * time.Millisecond
+		}
+	}
+	return 350 * time.Millisecond
 }

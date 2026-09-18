@@ -67,3 +67,36 @@ func TestSpeculation_FastPauseTriggersLLMBeforeHangoverConfirms(t *testing.T) {
 		t.Fatalf("expected exactly 1 total LLM call (speculative result reused, no redundant real call), got %d", got)
 	}
 }
+
+// The speculative await is an optimisation, and an optimisation whose worst case is larger than the
+// thing it optimises is a pessimisation. It was capped at 4 seconds against a normal path of about
+// 400ms. A live turn measured e2e 1988ms with gate_spec_await_ms 1437 — the largest single term in
+// the turn, spent waiting rather than working.
+func TestSpeculativeAwaitCannotCostMoreThanJustDoingTheWork(t *testing.T) {
+	t.Setenv("SPECULATIVE_AWAIT_MS", "")
+	got := speculativeAwaitBudget()
+	if got > 600*time.Millisecond {
+		t.Errorf("await budget %v exceeds what the normal path costs; a miss now costs more "+
+			"than never having speculated", got)
+	}
+	if got <= 0 {
+		t.Errorf("await budget %v would never collect an in-flight run", got)
+	}
+}
+
+func TestSpeculativeAwaitIsOverridable(t *testing.T) {
+	t.Setenv("SPECULATIVE_AWAIT_MS", "120")
+	if got := speculativeAwaitBudget(); got != 120*time.Millisecond {
+		t.Errorf("override ignored: %v", got)
+	}
+	// Zero is legitimate: it disables waiting without disabling speculation, so a run that already
+	// finished is still used and one that has not is never waited for.
+	t.Setenv("SPECULATIVE_AWAIT_MS", "0")
+	if got := speculativeAwaitBudget(); got != 0 {
+		t.Errorf("zero should mean do-not-wait, got %v", got)
+	}
+	t.Setenv("SPECULATIVE_AWAIT_MS", "nonsense")
+	if got := speculativeAwaitBudget(); got != 350*time.Millisecond {
+		t.Errorf("garbage should fall back to the default, got %v", got)
+	}
+}
