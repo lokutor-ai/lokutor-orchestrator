@@ -259,3 +259,42 @@ func maxInt(a, b int) int {
 	}
 	return b
 }
+
+// splitSentences existed, went through nextFlushPoint (so it inherited the length cap), and was
+// called by nobody. Meanwhile the paths that receive a COMPLETE reply — a speculative hit, a
+// non-streaming LLM, a cached answer — handed the whole thing to one synthesis call. Since a
+// speculative hit is the common case, the common case was the one still exposed to the gap.
+func TestSplitSentencesCapsEachSegment(t *testing.T) {
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "140")
+	long := "Le he reservado la cita para el martes a las cuatro y media de la tarde en la " +
+		"consulta del doctor Martínez que está en la avenida principal número ciento veinte " +
+		"y le enviaré un correo de confirmación con todos los detalles y la dirección exacta"
+	segs := splitSentences(long)
+	if len(segs) < 2 {
+		t.Fatalf("a %d-rune reply came back as %d segment(s) — one long synthesis call is the gap",
+			len([]rune(long)), len(segs))
+	}
+	for i, s := range segs {
+		if n := len([]rune(s)); n > 140 {
+			t.Errorf("segment %d is %d runes, over the cap: %q", i, n, lastRunes(s, 30))
+		}
+		if strings.TrimSpace(s) == "" {
+			t.Errorf("segment %d is empty", i)
+		}
+	}
+	// Nothing may be lost or reordered: the words must still read as the original.
+	joined := strings.Join(segs, " ")
+	norm := func(x string) string { return strings.Join(strings.Fields(x), " ") }
+	if norm(joined) != norm(long) {
+		t.Errorf("text changed when split:\n got %q\nwant %q", norm(joined), norm(long))
+	}
+}
+
+func TestSplitSentencesKeepsShortRepliesWhole(t *testing.T) {
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "140")
+	// One short sentence must stay one call — splitting it would add a seam for nothing.
+	segs := splitSentences("Abre a las nueve.")
+	if len(segs) != 1 {
+		t.Errorf("short reply split into %d segments: %q", len(segs), segs)
+	}
+}

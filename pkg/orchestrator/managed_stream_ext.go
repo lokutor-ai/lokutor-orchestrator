@@ -285,7 +285,7 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 		ms.session.AddMessage("assistant", text)
 		ms.emit(BotResponse, text)
 		ms.cacheResponse(userTranscript, text, nil)
-		ms.speakText(ctx, text, gen)
+		ms.speakResponse(ctx, text, gen)
 		return
 	}
 
@@ -660,7 +660,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 			ms.session.AddMessage("assistant", text)
 			ms.emit(BotResponse, text)
-			ms.speakText(rCtx, text, gen)
+			ms.speakResponse(rCtx, text, gen)
 		}()
 	}
 }

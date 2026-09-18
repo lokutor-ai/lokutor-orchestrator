@@ -179,7 +179,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.cacheResponse(transcript, response, nil)
 
 	ms.logger.Info("Speculative LLM response used", "transcript", transcript)
-	ms.speakText(rCtx, response, gen)
+	ms.speakResponse(rCtx, response, gen)
 	return true
 }
 

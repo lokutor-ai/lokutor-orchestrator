@@ -2916,3 +2916,29 @@ func (ms *ManagedStream) monitorInactivity() {
 		}
 	}
 }
+
+// speakResponse says a whole LLM reply, one synthesis call per segment.
+//
+// The streaming path already does this: it flushes to TTS at sentence boundaries as tokens arrive,
+// so no single call ever gets the whole reply. The paths that receive a COMPLETE response — a
+// speculative hit, a non-streaming LLM, a cached answer — handed the lot to speakText in one call,
+// and that is a different thing entirely.
+//
+// It matters because synthesis cost is superlinear in text length (no KV cache in the velocity
+// field, so every block re-runs over the whole prefix). One long call climbs past real time and the
+// caller hears the reply stop and restart — the gaps reported from live calls. The cap that
+// prevents it lives in nextFlushPoint, which the streaming path goes through and these did not. So
+// the common case, a speculative hit, was the one case still exposed to it.
+//
+// Splitting also arrives sooner: the first segment is shorter than the whole reply, so the first
+// block of audio is ready earlier. Prosody is unaffected because the cut is at a sentence end,
+// which is where a speaker pauses anyway — unlike cutting the opening chunk mid-sentence, which
+// was tried, sounded like the agent stopping dead after five words, and is deliberately off.
+func (ms *ManagedStream) speakResponse(ctx context.Context, text string, gen int) {
+	for _, seg := range splitSentences(text) {
+		if ctx.Err() != nil {
+			return // interrupted between sentences; speakText would refuse anyway
+		}
+		ms.speakText(ctx, seg, gen)
+	}
+}
