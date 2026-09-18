@@ -380,6 +380,16 @@ type Config struct {
 	// Speculative LLM: start LLM during speech based on partial audio
 	SpeculativeLLM bool
 
+	// SpeculativePrerender: also render the opening segment's AUDIO during the VAD hangover, not
+	// just the reply text. Speculation already takes stt_ms and llm_ms to zero on a hit; this takes
+	// tts_first_chunk_ms too, which measurement showed was the entire remaining budget besides the
+	// hangover itself (e2e 353ms = hangover 245 + tts_first 107). Requires SpeculativeLLM.
+	//
+	// The cost of a miss is one wasted synthesis of one segment. On a node with few stream slots
+	// that is not free, which is why it renders a single segment and cancels in flight when the
+	// speculation is superseded or the turn resolves without it.
+	SpeculativePrerender bool
+
 	// Interval (in milliseconds) between speculative STT calls during speech
 	SpeculativeIntervalMs int
 
@@ -517,6 +527,7 @@ func DefaultConfig() Config {
 		TokenLevelTTS:         true,
 		TTSMinTokenInterval:   4,
 		SpeculativeLLM:        true,
+		SpeculativePrerender:  true,
 		SpeculativeIntervalMs: 300,
 		AdaptivePacing:        true,
 		ResponseCaching:       true,
@@ -529,8 +540,8 @@ func DefaultConfig() Config {
 
 		// On by default — see TurnoModelPath's doc comment. Set to "" to
 		// disable (e.g. if the model asset genuinely isn't present).
-		TurnoModelPath:                "assets/onnx/turno/model.onnx",
-		TurnoTurnModelPath:            "assets/onnx/turno/turn_v6.onnx",
+		TurnoModelPath:     "assets/onnx/turno/model.onnx",
+		TurnoTurnModelPath: "assets/onnx/turno/turn_v6.onnx",
 		// 0 = off. Was 0.45, which fired on essentially every turn: the
 		// hold triggers on p_incomplete + p_wait, and the v6 head reports
 		// p_incomplete of 0.67-0.72 even on plainly finished sentences, so
@@ -547,7 +558,7 @@ func DefaultConfig() Config {
 		TurnoHorizonAssistMinMs:       120,
 		TurnoBargeinAssistThreshold:   0.8,
 		TurnoBargeinAssistWordsRelief: 1,
-		VoiceUXInstructions:              "",
+		VoiceUXInstructions:           "",
 	}
 }
 

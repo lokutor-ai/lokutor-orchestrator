@@ -144,6 +144,10 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.speculator.Cancel()
 
 	if !ok {
+		// Miss. Anything rendered for the guessed reply is wrong for this turn, and a render still
+		// in flight would hold a synthesiser slot the confirmed path is about to need — on a node
+		// with one stream slot that is the difference between answering and queueing.
+		ms.prerender.discard()
 		return false
 	}
 

@@ -43,6 +43,12 @@ type SpeculativeExecutor struct {
 	done       chan struct{} // closed when the current run finishes (any outcome)
 
 	onPartial func(transcript string)
+	// onResponse fires the moment a speculative run has a response, BEFORE Await is ever called.
+	// It exists so the caller can start rendering audio for a reply the caller has not committed
+	// to yet — the whole point being that end-of-turn has not happened, so this work runs inside
+	// the VAD hangover instead of after it. Nothing here commits to anything: a run whose
+	// transcript turns out not to match is discarded exactly as before.
+	onResponse func(response string)
 }
 
 func NewSpeculativeExecutor(intervalMs int) *SpeculativeExecutor {
@@ -68,6 +74,15 @@ func (se *SpeculativeExecutor) SetOnPartial(cb func(transcript string)) {
 	se.mu.Lock()
 	defer se.mu.Unlock()
 	se.onPartial = cb
+}
+
+// SetOnResponse registers a callback fired as soon as a speculative run produces a response.
+// Called on the speculation goroutine, so it must not block for long and must not touch anything
+// the confirmed path owns.
+func (se *SpeculativeExecutor) SetOnResponse(cb func(response string)) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	se.onResponse = cb
 }
 
 // ShouldSpeculate is the original continuous-speech trigger: re-speculate
@@ -130,6 +145,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 	done := make(chan struct{})
 	se.done = done
 	onPartial := se.onPartial
+	onResponse := se.onResponse
 	se.mu.Unlock()
 
 	finish := func(result *SpeculativeResult) {
@@ -188,6 +204,9 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 			return
 		}
 
+		if onResponse != nil {
+			onResponse(response)
+		}
 		finish(&SpeculativeResult{PartialTranscript: partial, Response: response})
 	}()
 }
@@ -232,6 +251,7 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 	done := make(chan struct{})
 	se.done = done
 	onPartial := se.onPartial
+	onResponse := se.onResponse
 	se.mu.Unlock()
 
 	finish := func(result *SpeculativeResult) {
@@ -268,6 +288,9 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 			// can tell speculation ran rather than never having been attempted.
 			finish(&SpeculativeResult{PartialTranscript: transcript})
 			return
+		}
+		if onResponse != nil {
+			onResponse(response)
 		}
 		finish(&SpeculativeResult{PartialTranscript: transcript, Response: response})
 	}()

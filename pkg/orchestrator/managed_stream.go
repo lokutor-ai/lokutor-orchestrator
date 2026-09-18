@@ -164,8 +164,8 @@ type ManagedStream struct {
 	eventsMu  sync.Mutex
 	closeOnce sync.Once
 
-	sttStartTime      time.Time
-	sttEndTime        time.Time
+	sttStartTime time.Time
+	sttEndTime   time.Time
 	// sttSpeculative records whether this turn's transcript came from the
 	// pass launched during the VAD hangover rather than a blocking call after
 	// it. Logged per turn so the win is visible and a regression in the accept
@@ -199,16 +199,18 @@ type ManagedStream struct {
 	ckCacheMs  int64 // through the response cache and RAG injection
 	// lastDropLogGen rate-limits the dropped-audio warning to one line per
 	// response rather than one per frame.
-	lastDropLogGen int
+	lastDropLogGen    int
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
 	ttsFirstChunkTime time.Time
-	ttsEndTime        time.Time
-	botSpeakStart     time.Time
-	lastAudioSentAt   time.Time
-	lastNoSpeechProb  float64
-	lastActivityAt    time.Time
+	// Audio for the opening segment, rendered during the hangover. See prerender.go.
+	prerender        prerendered
+	ttsEndTime       time.Time
+	botSpeakStart    time.Time
+	lastAudioSentAt  time.Time
+	lastNoSpeechProb float64
+	lastActivityAt   time.Time
 
 	// silenceNudgeSent gates monitorInactivity's silence-timeout reprompt to
 	// at most once per idle stretch — it used to have no such gate and would
@@ -397,6 +399,12 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		ms.speculator.SetOnPartial(func(partial string) {
 			ms.emit(TranscriptPartial, partial)
 		})
+		if cfg.SpeculativePrerender {
+			// Render the opening segment's audio as soon as the speculative reply exists, which is
+			// inside the VAD hangover — so on a hit there is nothing left to synthesise when the
+			// turn is confirmed. See prerender.go.
+			ms.speculator.SetOnResponse(ms.prerenderFirstSegment)
+		}
 	}
 
 	detector := NewBackchannelDetector(DefaultBackchannelConfig(), 44100, func(raw []byte) {
@@ -1929,45 +1937,62 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// Serialize TTS operations to prevent concurrent WS frame corruption.
 	// Only one StreamSynthesize call per session at a time.
 	ms.ttsMu.Lock()
-	err := ms.orch.SynthesizeStream(sCtx, text,
-		ms.session.GetCurrentVoice(),
-		ms.session.GetCurrentLanguage(),
-		func(chunk []byte) error {
-			ms.mu.Lock()
-			ms.lastAudioSentAt = time.Now()
-			ms.responseChunksSent++
-			// Once the first audio chunk is delivered, mark the spoken prefix as
-			// locked — the user has started hearing the response.
-			if ms.spokenTextLocked == false && ms.lastResponseText == text {
-				ms.spokenTextPrefix = text
-				ms.spokenTextLocked = true
-			}
-			ms.mu.Unlock()
+	voice, lang := ms.session.GetCurrentVoice(), ms.session.GetCurrentLanguage()
+	onChunk := func(chunk []byte) error {
+		ms.mu.Lock()
+		ms.lastAudioSentAt = time.Now()
+		ms.responseChunksSent++
+		// Once the first audio chunk is delivered, mark the spoken prefix as
+		// locked — the user has started hearing the response.
+		if ms.spokenTextLocked == false && ms.lastResponseText == text {
+			ms.spokenTextPrefix = text
+			ms.spokenTextLocked = true
+		}
+		ms.mu.Unlock()
 
-			if ms.ttsFirstChunkTime.IsZero() {
-				ms.ttsFirstChunkTime = time.Now()
-				ms.logTurnLatency()
-			}
+		if ms.ttsFirstChunkTime.IsZero() {
+			ms.ttsFirstChunkTime = time.Now()
+			ms.logTurnLatency()
+		}
 
-			if isStreaming {
-				ms.emitFrames(chunk, frameSize, gen)
-				return nil
-			}
-
-			if !started {
-				jitterBuf = append(jitterBuf, chunk...)
-				if len(jitterBuf) >= jitterTarget {
-					started = true
-					ms.emitFrames(jitterBuf, frameSize, gen)
-					jitterBuf = nil
-				}
-				return nil
-			}
-
+		if isStreaming {
 			ms.emitFrames(chunk, frameSize, gen)
 			return nil
-		},
-	)
+		}
+
+		if !started {
+			jitterBuf = append(jitterBuf, chunk...)
+			if len(jitterBuf) >= jitterTarget {
+				started = true
+				ms.emitFrames(jitterBuf, frameSize, gen)
+				jitterBuf = nil
+			}
+			return nil
+		}
+
+		ms.emitFrames(chunk, frameSize, gen)
+		return nil
+	}
+
+	// If this exact segment was already rendered during the hangover, play it instead of
+	// synthesising it again. Same bytes, same callback, same bookkeeping — the only difference is
+	// that the work happened before the turn was confirmed rather than after, which is the entire
+	// saving. See prerender.go.
+	var err error
+	if pre := ms.prerender.take(text, voice, lang); pre != nil {
+		ms.logger.Info("Speaking pre-rendered opening segment", "chunks", len(pre), "chars", len(text))
+		for _, c := range pre {
+			if sCtx.Err() != nil {
+				break
+			}
+			if e := onChunk(c); e != nil {
+				err = e
+				break
+			}
+		}
+	} else {
+		err = ms.orch.SynthesizeStream(sCtx, text, voice, lang, onChunk)
+	}
 	ms.ttsMu.Unlock()
 
 	if !started && len(jitterBuf) > 0 {
