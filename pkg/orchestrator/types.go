@@ -385,9 +385,15 @@ type Config struct {
 	// tts_first_chunk_ms too, which measurement showed was the entire remaining budget besides the
 	// hangover itself (e2e 353ms = hangover 245 + tts_first 107). Requires SpeculativeLLM.
 	//
-	// The cost of a miss is one wasted synthesis of one segment. On a node with few stream slots
-	// that is not free, which is why it renders a single segment and cancels in flight when the
-	// speculation is superseded or the turn resolves without it.
+	// OFF BY DEFAULT, and the reason is the whole trade. It needs a SPARE synthesiser slot. The
+	// production node carries exactly one concurrent stream, so the pre-render and the real
+	// synthesis are mutually exclusive: turned on there, the render held the only slot for ~1s,
+	// the confirmed path got "503 busy", and turns went from 353ms to 14.4 SECONDS. The feature
+	// is sound and the node is too small for it.
+	//
+	// Enable with SPECULATIVE_PRERENDER=1 only where the synthesiser has more than one stream —
+	// a c7a voice node carries four, so one spent on a guess still leaves three. Check the
+	// sidecar's calibration line ("now serving N concurrent stream(s)") before turning it on.
 	SpeculativePrerender bool
 
 	// Interval (in milliseconds) between speculative STT calls during speech
@@ -527,7 +533,7 @@ func DefaultConfig() Config {
 		TokenLevelTTS:         true,
 		TTSMinTokenInterval:   4,
 		SpeculativeLLM:        true,
-		SpeculativePrerender:  true,
+		SpeculativePrerender:  speculativePrerenderEnabled(),
 		SpeculativeIntervalMs: 300,
 		AdaptivePacing:        true,
 		ResponseCaching:       true,

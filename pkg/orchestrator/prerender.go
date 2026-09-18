@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -135,4 +136,13 @@ func (ms *ManagedStream) prerenderFirstSegment(response string) {
 	ms.prerender.mu.Unlock()
 	ms.logger.Info("Pre-rendered opening segment during hangover",
 		"chars", len(first), "chunks", len(chunks), "render_ms", time.Since(start).Milliseconds())
+}
+
+// speculativePrerenderEnabled reports whether pre-rendering is switched on.
+//
+// Default off. It trades a synthesiser slot for latency, and that trade is only available on a node
+// with a slot to spare — see the Config field's comment for what happened on a one-stream node.
+func speculativePrerenderEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("SPECULATIVE_PRERENDER"))
+	return v == "1" || strings.EqualFold(v, "true")
 }

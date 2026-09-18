@@ -101,3 +101,28 @@ func TestEmptyPrerenderIsSafe(t *testing.T) {
 	}
 	p.discard() // must not panic with no cancel registered
 }
+
+// Pre-rendering must stay off unless someone has decided the node can spare a synthesiser slot.
+// Enabled on a one-stream node it held the only slot for ~1s per turn, the confirmed path got
+// "503 busy", and turns went from 353ms to 14.4 SECONDS. Default-on is the dangerous direction.
+func TestPrerenderIsOffUnlessExplicitlyEnabled(t *testing.T) {
+	t.Setenv("SPECULATIVE_PRERENDER", "")
+	if speculativePrerenderEnabled() {
+		t.Error("default is ON; a one-stream node would starve its own confirmed path")
+	}
+	if DefaultConfig().SpeculativePrerender {
+		t.Error("DefaultConfig enables pre-render")
+	}
+	for _, on := range []string{"1", "true", "TRUE"} {
+		t.Setenv("SPECULATIVE_PRERENDER", on)
+		if !speculativePrerenderEnabled() {
+			t.Errorf("%q should enable it", on)
+		}
+	}
+	for _, off := range []string{"0", "false", "no", "yes", "2"} {
+		t.Setenv("SPECULATIVE_PRERENDER", off)
+		if speculativePrerenderEnabled() {
+			t.Errorf("%q should not enable it — only an explicit 1/true counts", off)
+		}
+	}
+}
