@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // Splitting at every '.' turned ordinary speech into a stream of fragments. Each one paid the
@@ -167,4 +168,94 @@ func TestEverySupportedLanguageHasItsOwnBackchannels(t *testing.T) {
 	if got := strings.Join(backchannelPhrasesForLang("en"), "|"); got != fallback {
 		t.Errorf("en = %q, want the default %q", got, fallback)
 	}
+}
+
+// A long sentence with no terminator used to go to the synthesiser whole, and the synthesiser's
+// cost is superlinear in length — so past a few hundred characters it stops keeping ahead of
+// playback and the caller hears the reply stop and restart. Measured at nfe 6: RTF 0.203 at 72
+// chars, 0.557 at 291, 1.055 at 583. The cap cuts before that point.
+func TestLongSentenceIsCutBeforeItOutrunsPlayback(t *testing.T) {
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "140")
+	long := "Le he reservado la cita para el martes a las cuatro y media de la tarde en la " +
+		"consulta del doctor Martínez que está en la avenida principal número ciento veinte " +
+		"y le enviaré un correo de confirmación con todos los detalles"
+	if len([]rune(long)) < 200 {
+		t.Fatalf("fixture too short to exercise the cap (%d runes)", len([]rune(long)))
+	}
+	end := nextFlushPoint(long, false, false, 40, minSpokenSegment)
+	if end <= 0 {
+		t.Fatal("no flush point: a long unterminated sentence would be synthesised whole and gap")
+	}
+	if n := len([]rune(long[:end])); n > 140 {
+		t.Errorf("segment is %d runes, over the 140 cap", n)
+	}
+	// It must cut where a speaker would pause, not mid-word. Cutting AT a space index leaves the
+	// segment ending on the last whole word with no trailing space, so the test is whether the
+	// remainder resumes cleanly — not whether the segment ends in one.
+	seg, rest := long[:end], long[end:]
+	endsClause := strings.HasSuffix(seg, ",") || strings.HasSuffix(seg, ";") || strings.HasSuffix(seg, ":")
+	resumesOnWord := strings.HasPrefix(rest, " ")
+	if !endsClause && !resumesOnWord {
+		t.Errorf("cut mid-word: segment ends %q, remainder starts %q",
+			lastRunes(seg, 12), firstRunes(rest, 12))
+	}
+	if !utf8.ValidString(seg) || !utf8.ValidString(rest) {
+		t.Error("cut landed inside a multi-byte character")
+	}
+}
+
+func lastRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[len(r)-n:])
+}
+
+func firstRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+func TestShortTextIsNotCutByTheCap(t *testing.T) {
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "140")
+	// Well under the cap and unterminated: the caller must keep buffering, not flush a fragment.
+	if got := nextFlushPoint("Le he reservado la cita", false, false, 40, minSpokenSegment); got != -1 {
+		t.Errorf("flushed a short unterminated buffer at %d", got)
+	}
+}
+
+func TestSentenceBoundaryStillWinsOverTheCap(t *testing.T) {
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "140")
+	s := "Le he reservado la cita para el martes. Y luego le enviaré un correo de confirmación."
+	end := nextFlushPoint(s, false, false, 40, minSpokenSegment)
+	if end <= 0 || s[end-1] != '.' {
+		t.Errorf("expected the cut at the full stop, got %d (%q)", end, s[:maxInt(0, end)])
+	}
+}
+
+func TestCapIsConfigurableAndFloored(t *testing.T) {
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "200")
+	if got := maxSpokenSegment(); got != 200 {
+		t.Errorf("override ignored: got %d", got)
+	}
+	// A cap below minSpokenSegment would make every segment unflushable.
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "5")
+	if got := maxSpokenSegment(); got < 40 {
+		t.Errorf("absurd cap accepted: %d", got)
+	}
+	t.Setenv("TTS_MAX_SEGMENT_CHARS", "")
+	if got := maxSpokenSegment(); got != 140 {
+		t.Errorf("default = %d, want 140", got)
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

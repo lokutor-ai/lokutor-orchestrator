@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"os"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -161,5 +163,72 @@ func nextFlushPoint(buf string, atEOF bool, clauseBoundaries bool, clauseMin int
 			}
 		}
 	}
+	// No sentence boundary, but the buffer has grown past what one synthesis call can keep ahead
+	// of playback. Cut it anyway — see maxSpokenSegment.
+	if n := len([]rune(buf)); n >= maxSpokenSegment() {
+		if cut := splitPointBefore(buf, maxSpokenSegment()); cut > 0 {
+			return cut
+		}
+	}
 	return -1
+}
+
+// maxSpokenSegment is the longest run of text handed to one synthesis call, in characters.
+//
+// It exists because the cost of a synthesis is SUPERLINEAR in the length of the text. The velocity
+// field has no KV cache, so every block re-runs over the whole prefix, and the real-time factor
+// climbs with the utterance rather than staying flat. Measured on one machine at nfe 6:
+//
+//	 72 chars   3.6s audio   RTF 0.203
+//	145 chars   7.4s audio   RTF 0.332
+//	291 chars  14.7s audio   RTF 0.557
+//	437 chars  21.7s audio   RTF 0.771
+//	583 chars  29.2s audio   RTF 1.055   <- generation now loses to playback
+//
+// Past RTF 1.0 the synthesiser cannot produce audio as fast as the caller consumes it, and what
+// they hear is the reply stopping and restarting — the "gaps between chunks" reported from live
+// calls. It is not a capacity problem and adding nodes does not help: one long sentence does it on
+// an idle machine.
+//
+// Splitting is not merely damage control, it is faster outright. Eight 72-char segments cover the
+// same ~29s of speech in about 5.9s of compute where one 583-char call takes 30.8s, because each
+// short call stays in the cheap part of the curve. The cost is prosodic continuity across the seam,
+// which is why the cut prefers a comma or a space — places a speaker would pause anyway.
+//
+// The right fix is a KV-cached export, after which this cap should rise or go. Until then the
+// default is deliberately conservative: production nodes are roughly 3x slower than the machine
+// above, which puts their RTF 1.0 crossover near 200 characters.
+func maxSpokenSegment() int {
+	if v := os.Getenv("TTS_MAX_SEGMENT_CHARS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 40 {
+			return n
+		}
+	}
+	return 140
+}
+
+// splitPointBefore returns a byte index at or before `limit` runes to cut the buffer, preferring a
+// clause boundary and falling back to a word boundary. Returns 0 when there is no decent seam,
+// because cutting mid-word is worse than the gap it avoids.
+func splitPointBefore(buf string, limit int) int {
+	lastClause, lastSpace, runes := 0, 0, 0
+	for i, r := range buf {
+		if runes >= limit {
+			break
+		}
+		runes++
+		switch r {
+		case ',', ';', ':':
+			lastClause = i + 1
+		case ' ':
+			lastSpace = i
+		}
+	}
+	if lastClause >= minSpokenSegment {
+		return lastClause
+	}
+	if lastSpace >= minSpokenSegment {
+		return lastSpace
+	}
+	return 0
 }
