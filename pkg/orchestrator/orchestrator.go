@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"regexp"
 	"strings"
 	"sync"
@@ -304,12 +305,12 @@ func (o *Orchestrator) NewSessionWithDefaults(userID string) *ConversationSessio
 // voice agents than a flat instruction block.
 func buildSystemPrompt(prompt string, langName string) string {
 	return fmt.Sprintf(`# Identity
-You are Lokutor's voice assistant. %s
+You are Lokutor's voice assistant, speaking %s.
 
 # Response Guidelines
 - Speak in 1-2 sentences max. Ask at most one question per turn.
 - Start immediately with the answer. Never say "Absolutely!", "Great question!", "Let me check", or "I'll look into that".
-- Use natural spoken English: contractions, casual words (yeah, okay, kind of, a bit).
+- Use natural spoken language: contractions, casual words, the way a person actually talks.
 - Write numbers as spoken words: "about a hundred" not 100, "half" not 1/2.
 - Never use markdown, lists, bullet points, asterisks, quotes, or emojis.
 - Never use acronyms — spell out full names.
@@ -324,14 +325,18 @@ You are Lokutor's voice assistant. %s
 - Answer first, then add details if needed. Do not start with background context.
 
 # Language
-Always respond in %s. Never switch to another language, even if the user speaks another language. The entire conversation must be in %s.
+Always respond in %s. The entire conversation must be in %s, including numbers, dates and place names.
+
+The user's speech reaches you as text from a recogniser that does not cover every language it is asked to listen to. When it hears a language it was not trained on it writes the words down in the closest language it does know — so a Catalan speaker can arrive as Spanish text, and a Galician or Basque speaker as Spanish or Portuguese. That transcript is a limitation of the recogniser, NOT the user choosing a language. It is never a reason to switch.
+
+So: if the transcript looks like it is in a different language from the one above, still reply in %s. Do not mirror the language of the transcript, do not apologise for it, and do not mention it.
 
 # Tools
 - When a tool returns a result, give the answer directly. Never mention the tool or the lookup.
 - Keep tool results conversational — summarize, don't recite raw data.
 
 # Conversation Context
-%s`, langName, langName, langName, prompt)
+%s`, langName, langName, langName, langName, prompt)
 }
 
 func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt string) {
@@ -386,6 +391,12 @@ func languageCodeToName(lang Language) string {
 		return "English"
 	case LanguageEs:
 		return "Spanish"
+	case LanguageCa:
+		return "Catalan"
+	case LanguageGl:
+		return "Galician"
+	case LanguageEu:
+		return "Basque"
 	case LanguageFr:
 		return "French"
 	case LanguageDe:
@@ -446,8 +457,20 @@ func languageCodeToName(lang Language) string {
 		return "Ukrainian"
 	case LanguageVi:
 		return "Vietnamese"
+	case "":
+		return "English"
 	default:
-		return string(lang)
+		// A code with no name here is a bug in this table, and the old fallback turned it into a
+		// bug in the prompt: returning the raw code produced "Always respond in ca", which is not
+		// a language name and which an LLM reading a Spanish-looking transcript quietly resolves
+		// to Spanish. That is exactly how Catalan agents ended up answering in Spanish.
+		//
+		// Naming the code rather than passing it bare keeps the instruction readable in the one
+		// case that matters: an unrecognised code still reads as a language to the model, and the
+		// log line says which entry to add.
+		log.Printf("[orchestrator] language %q has no display name — add it to languageCodeToName; "+
+			"the prompt will name it by code", lang)
+		return fmt.Sprintf("the language with ISO code %q", string(lang))
 	}
 }
 

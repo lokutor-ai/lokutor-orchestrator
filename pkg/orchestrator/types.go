@@ -137,6 +137,15 @@ type Language string
 const (
 	LanguageEn Language = "en"
 	LanguageEs Language = "es"
+	// Catalan, Galician and Basque: three of the nine languages Lokutor actually ships (see
+	// pkg/api/languages.go), and the three that were missing here. Their absence was not inert —
+	// languageCodeToName falls back to the raw code, so a Catalan agent instructed the model with
+	// "Always respond in ca", which is not a language name and reads as noise next to a transcript
+	// that looks Spanish. The model did the reasonable thing with an unreadable instruction and
+	// answered in Spanish.
+	LanguageCa Language = "ca"
+	LanguageGl Language = "gl"
+	LanguageEu Language = "eu"
 	LanguageFr Language = "fr"
 	LanguageDe Language = "de"
 	LanguageIt Language = "it"
