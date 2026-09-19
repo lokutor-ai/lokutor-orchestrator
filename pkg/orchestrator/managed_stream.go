@@ -2370,7 +2370,65 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 	if audioDuration < 300*time.Millisecond && len(clean) <= 1 {
 		return true
 	}
+	var lang Language
+	if ms.session != nil {
+		lang = ms.session.GetCurrentLanguage()
+	}
+	if isRecogniserFiller(clean, lang, audioDuration) {
+		return true
+	}
 	return false
+}
+
+// recogniserFillers are the short English phrases Parakeet emits when handed too
+// little signal to work with. They are not transcription errors in the ordinary
+// sense — nothing like them was said — they are what the model falls back to, and
+// the same handful recurs across the industry ("thank you" above all).
+//
+// Compared case-insensitively with surrounding punctuation stripped, so entries
+// here carry none of their own.
+var recogniserFillers = map[string]bool{
+	"thank you": true, "thanks": true, "you": true,
+	"bye": true, "okay": true, "ok": true,
+	"uh": true, "um": true, "hmm": true, "mm": true,
+	"thanks for watching": true, "thank you for watching": true,
+	"subtitles by the amara.org community": true,
+}
+
+// isRecogniserFiller reports whether a transcript is one of those fallbacks rather
+// than something the caller said.
+//
+// Measured on production: 440ms of a Spanish caller's opening word came back as
+// "Thank you.", which fired a complete turn — the agent answered "De nada.", began
+// speaking it, and the caller's actual continuing sentence then registered as a
+// barge-in on that reply. The caller heard nothing and had answered nothing. The
+// existing guards all passed it: energy was high (RMS 0.21, well over
+// PARAKEET_MIN_RMS), no_speech_prob was low, and at 10 characters it cleared the
+// short-transcript check.
+//
+// An English filler phrase in a non-English call is essentially always this, so it
+// is rejected outright. In an English call the phrase is genuinely sayable, so it
+// needs the corroborating signal of implausibly short audio — nobody says "thanks
+// for watching" in 400ms. The asymmetric cost justifies the asymmetric rule: a
+// wrongly rejected "thanks" costs one missed turn the caller can simply repeat,
+// while a wrongly accepted one spends a whole turn answering a phantom and then
+// talks over the caller's real sentence.
+func isRecogniserFiller(transcript string, lang Language, audioDuration time.Duration) bool {
+	norm := strings.ToLower(strings.TrimSpace(transcript))
+	norm = strings.TrimFunc(norm, func(r rune) bool {
+		return unicode.IsPunct(r) || unicode.IsSpace(r)
+	})
+	if norm == "" || !recogniserFillers[norm] {
+		return false
+	}
+	// An empty language is auto-detect, not "not English" — GetCurrentLanguage
+	// returns "" for "auto"/"na". The caller may well be speaking English, so it
+	// takes the same corroboration an English session does rather than the
+	// outright rejection a known non-English session gets.
+	if lang != LanguageEn && lang != "" {
+		return true
+	}
+	return audioDuration < 700*time.Millisecond
 }
 
 func countWords(s string) int {
