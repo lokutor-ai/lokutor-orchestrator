@@ -580,6 +580,19 @@ type ConversationSession struct {
 	Tools           []Tool
 	toolCallCounts  map[string]int // Track how many times each tool has been called
 	UserMemory      string         // Cross-call memory extracted from previous sessions
+
+	// basePrompt is the agent's own prompt, before buildSystemPrompt wraps it in the guidelines
+	// and the language section. Kept so that a language change can REBUILD the system prompt
+	// rather than patch it.
+	//
+	// Patching is what it used to do, and it produced a prompt that argued with itself. The
+	// language section names the language nine times; the patch was a regex for the one sentence
+	// "Always respond in X." So the usual startup order — SetSystemPrompt (session still on its
+	// LanguageEn default) then SetLanguage(agent's language) — left one line saying Spanish and
+	// eight still saying English, including the emphatic ones: "still reply in English", "every
+	// word you produce must be in English", "answer it in English". Faced with 8-to-1 the model
+	// drifted to English mid-call, on Spanish calls, which is exactly what callers reported.
+	basePrompt string
 }
 
 func NewConversationSession(userID string) *ConversationSession {

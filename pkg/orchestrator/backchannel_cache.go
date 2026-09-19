@@ -23,14 +23,23 @@ import (
 // Caching keyed on the voice removes all of it after the first session, and the in-flight guard
 // means ten simultaneous sessions on a cold process generate one set rather than ten.
 //
-// The key dropped `language` when the phrases became language-agnostic. They are nasal hums
-// synthesised unmarked (see backchannelPhrases), so the audio for a given voice is now identical
-// whatever language the call is in — keeping language in the key would have meant synthesising the
-// same three clips again for every one of nine languages, which is exactly the warm-up cost this
-// cache exists to remove.
+// The key dropped `language` once, on the reasoning that the phrases are nasal hums and so the
+// audio for a given voice is identical whatever language the call is in. That was wrong, and a
+// caller heard it: the clips came out in a different speaker's voice from the reply.
+//
+// The phrase text is language-agnostic; the SYNTHESIS is not. Versa's resolveVoice picks the
+// reference pack from the language — resolveVoice("F1", "es") is es_f1 and resolveVoice("F1",
+// "en") is en_f1, different speakers — and essentially every agent in the database still stores a
+// legacy F1-F5 / M1-M5 name, so essentially every call took that branch. Synthesising the clips
+// under a fixed language therefore picked a fixed pack while the reply followed the caller's,
+// which is a different human humming between the agent's own sentences.
+//
+// So language is back in the key, and it costs almost nothing: a call has one language, not nine,
+// so this is three clips per (voice, language) actually used, once per process.
 
 type backchannelKey struct {
 	voice Voice
+	lang  Language
 }
 
 type backchannelEntry struct {
@@ -49,10 +58,11 @@ var (
 // to keep competing with whatever is making it slow.
 const backchannelGenTimeout = 20 * time.Second
 
-// cachedBackchannelClips returns the clips for a voice, synthesising them once per process. gen is
-// only called on the first request for a key; concurrent callers wait for that one result.
-func cachedBackchannelClips(ctx context.Context, voice Voice, gen func(context.Context) [][]byte) [][]byte {
-	key := backchannelKey{voice: voice}
+// cachedBackchannelClips returns the clips for a (voice, language), synthesising them once per
+// process. gen is only called on the first request for a key; concurrent callers wait for that one
+// result.
+func cachedBackchannelClips(ctx context.Context, voice Voice, lang Language, gen func(context.Context) [][]byte) [][]byte {
+	key := backchannelKey{voice: voice, lang: lang}
 
 	backchannelMu.Lock()
 	e, ok := backchannelCache[key]

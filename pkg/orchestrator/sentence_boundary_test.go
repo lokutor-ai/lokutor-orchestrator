@@ -179,12 +179,39 @@ func TestBackchannelsDoNotVaryByLanguage(t *testing.T) {
 	}
 }
 
-// They are synthesised unmarked. Prefixing [es] to a nasal hum asks the text encoder to apply a
-// language's pronunciation prior to something with no pronunciation in it; English is the model's
-// unmarked base case and takes no language token at all.
-func TestBackchannelsAreSynthesisedUnmarked(t *testing.T) {
-	if backchannelLang != LanguageEn {
-		t.Errorf("backchannelLang = %q, want %q (the model's unmarked case)", backchannelLang, LanguageEn)
+// The phrase list is shared across languages, but the SYNTHESIS must follow the call.
+//
+// This asserted the opposite until a caller heard the bug: the clips were synthesised under a
+// fixed LanguageEn so that the text would carry no language token. The language argument does not
+// only pick a token — Versa's resolveVoice picks the reference PACK from it, and the legacy voice
+// ids that essentially every agent still stores resolve to en_f1 under "en" and es_f1 under "es".
+// Two packs are two different speakers, so the agent hummed in someone else's voice between its
+// own sentences on every non-English call.
+func TestBackchannelsFollowTheCallLanguage(t *testing.T) {
+	for _, lang := range []Language{"es", "ca", "gl", "eu", "pt", "fr", "it", "de", "en"} {
+		if got := backchannelLangFor(lang); got != lang {
+			t.Errorf("backchannelLangFor(%q) = %q — the clips would resolve to a different "+
+				"reference pack than the reply, i.e. a different speaker", lang, got)
+		}
+	}
+	// Auto-detect is not "English": the session has pinned no language, so the clips must take
+	// the same empty value the reply path takes rather than guessing at a pack.
+	if got := backchannelLangFor(""); got != "" {
+		t.Errorf("backchannelLangFor(\"\") = %q, want \"\" (auto-detect, same as the reply path)", got)
+	}
+}
+
+// Language is part of the cache key precisely because the audio differs by language. Dropping it
+// is what let one language's clips be served to another call.
+func TestBackchannelCacheKeyDistinguishesLanguage(t *testing.T) {
+	es := backchannelKey{voice: VoiceF1, lang: LanguageEs}
+	en := backchannelKey{voice: VoiceF1, lang: LanguageEn}
+	if es == en {
+		t.Fatal("backchannelKey ignores language — clips synthesised for one language would be " +
+			"served to a call in another, in the wrong speaker's voice")
+	}
+	if es != (backchannelKey{voice: VoiceF1, lang: LanguageEs}) {
+		t.Error("backchannelKey is not comparable by value; the cache would never hit")
 	}
 }
 

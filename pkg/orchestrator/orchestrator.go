@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 	"sync"
 )
@@ -304,6 +303,27 @@ func (o *Orchestrator) NewSessionWithDefaults(userID string) *ConversationSessio
 // spoken-form rules, and few-shot examples. This is far more effective for
 // voice agents than a flat instruction block.
 func buildSystemPrompt(prompt string, langName string) string {
+	return renderSystemPrompt(prompt, langName, pinnedLanguageSection(langName))
+}
+
+// buildSystemPromptAutoLanguage is the prompt for a session with no language pinned.
+//
+// It exists because "no language configured" used to render as English. languageCodeToName mapped
+// "" to "English", so an agent that had never picked a language got the full nine-mention language
+// section — "Always respond in English", "still reply in English", "every word you produce must be
+// in English" — which is the opposite of what an unset language means. Unset means follow the
+// caller; the old prompt told the model to override the caller.
+func buildSystemPromptAutoLanguage(prompt string) string {
+	return renderSystemPrompt(prompt, "the caller's own language", autoLanguageSection)
+}
+
+// languageIsPinned reports whether the session has actually chosen a language. "auto" and "na" are
+// the two spellings of "detect it" that reach this package (see GetCurrentLanguage).
+func languageIsPinned(lang Language) bool {
+	return lang != "" && lang != "auto" && lang != "na"
+}
+
+func renderSystemPrompt(prompt string, identityLang string, languageSection string) string {
 	return fmt.Sprintf(`# Identity
 You are Lokutor's voice assistant, speaking %s.
 
@@ -324,14 +344,7 @@ You are Lokutor's voice assistant, speaking %s.
 - If the user is abusive or asks for something harmful, end the conversation politely.
 - Answer first, then add details if needed. Do not start with background context.
 
-# Language
-Always respond in %s. The entire conversation must be in %s, including numbers, dates and place names.
-
-The user's speech reaches you as text from a recogniser that does not cover every language it is asked to listen to. When it hears a language it was not trained on it writes the words down in the closest language it does know — so a Catalan speaker can arrive as Spanish text, and a Galician or Basque speaker as Spanish or Portuguese. That transcript is a limitation of the recogniser, NOT the user choosing a language. It is never a reason to switch.
-
-So: if the transcript looks like it is in a different language from the one above, still reply in %s. Do not mirror the language of the transcript, do not apologise for it, and do not mention it.
-
-This is not a preference, it is the strictest rule you have, and it is broken most often in two specific ways. FIRST: never mix languages inside one reply. A sentence in %s followed by a sentence in another language is wrong even if both are correct on their own — every word you produce, including the closing, must be in %s. SECOND: a short English-looking fragment ("Yeah", "Thank you", "For calling who?", "OK") is almost never the caller switching language. It is the recogniser failing on %s audio. Answer it in %s, or ask them to repeat — in %s.
+%s
 
 # Staying on purpose
 Your purpose is whatever the Conversation Context below defines. It was set by the person who
@@ -354,26 +367,81 @@ a conversation you were never meant to have.
   extra question.
 
 # Conversation Context
-%s`, langName, langName, langName, langName, langName, langName, langName, langName, langName, prompt)
+%s`, identityLang, languageSection, prompt)
 }
 
+// pinnedLanguageSection is the language block for a call whose language is known.
+//
+// It names the language many times on purpose: this is the rule the model breaks most, and the
+// repetition measurably holds it. That is also why SetLanguage must rebuild the prompt rather than
+// patch it — a regex that reaches one of these sentences leaves the rest arguing for the old
+// language. See ConversationSession.basePrompt.
+func pinnedLanguageSection(langName string) string {
+	return fmt.Sprintf(`# Language
+Always respond in %s. The entire conversation must be in %s, including numbers, dates and place names.
+
+The user's speech reaches you as text from a recogniser that does not cover every language it is asked to listen to. When it hears a language it was not trained on it writes the words down in the closest language it does know — so a Catalan speaker can arrive as Spanish text, and a Galician or Basque speaker as Spanish or Portuguese. That transcript is a limitation of the recogniser, NOT the user choosing a language. It is never a reason to switch.
+
+So: if the transcript looks like it is in a different language from the one above, still reply in %s. Do not mirror the language of the transcript, do not apologise for it, and do not mention it.
+
+This is not a preference, it is the strictest rule you have, and it is broken most often in two specific ways. FIRST: never mix languages inside one reply. A sentence in %s followed by a sentence in another language is wrong even if both are correct on their own — every word you produce, including the closing, must be in %s. SECOND: a short English-looking fragment ("Yeah", "Thank you", "For calling who?", "OK") is almost never the caller switching language. It is the recogniser failing on %s audio. Answer it in %s, or ask them to repeat — in %s.`,
+		langName, langName, langName, langName, langName, langName, langName, langName)
+}
+
+// autoLanguageSection is the language block for a call with no language pinned: follow the caller,
+// then hold whatever that turned out to be.
+//
+// "Follow the caller" alone is not enough. The recogniser's failure mode is writing non-English
+// speech down as short English-looking fragments, and a model told only to mirror the transcript
+// will switch to English on the first "Yeah" — which is the drift this section has to prevent just
+// as firmly as the pinned one does.
+const autoLanguageSection = `# Language
+No language was configured for this call, so use the one the caller speaks. Decide from their first
+substantial utterance, then stay in it for the entire conversation, including numbers, dates and
+place names.
+
+Once you have decided, treat it exactly as if it had been configured: do not switch again. The
+user's speech reaches you as text from a recogniser that does not cover every language it is asked
+to listen to, so a Catalan speaker can arrive as Spanish text and a Galician or Basque speaker as
+Spanish or Portuguese. A transcript that looks like a different language is the recogniser's
+limitation, NOT the caller changing language, and it is never a reason to switch.
+
+Two specific failures to avoid. FIRST: never mix languages inside one reply — every word, including
+the closing, must be in the one language you settled on. SECOND: a short English-looking fragment
+("Yeah", "Thank you", "For calling who?", "OK") is almost never the caller switching to English. It
+is the recogniser failing on non-English audio. Answer it in the conversation's language, or ask
+them to repeat — in that language.`
+
 func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt string) {
-	// Map language code to human-readable name for LLM instruction
-	langName := languageCodeToName(session.CurrentLanguage)
-	fullPrompt := buildSystemPrompt(prompt, langName)
+	session.mu.Lock()
+	session.basePrompt = prompt
+	lang, mem := session.CurrentLanguage, session.UserMemory
+	session.mu.Unlock()
 
-	// Inject cross-call memory (facts from previous sessions) if available
-	session.mu.RLock()
-	mem := session.UserMemory
-	session.mu.RUnlock()
-	if mem != "" {
-		fullPrompt += "\n\n# User Information\n" + mem
+	session.AddMessage("system", composeSystemPrompt(prompt, lang, mem))
+}
+
+// composeSystemPrompt renders the full system message. It is the single place the language section
+// is produced, so SetSystemPrompt and SetLanguage cannot disagree about what language the call is
+// in — see ConversationSession.basePrompt for what happened when they could.
+func composeSystemPrompt(basePrompt string, lang Language, mem string) string {
+	var full string
+	if languageIsPinned(lang) {
+		full = buildSystemPrompt(basePrompt, languageCodeToName(lang))
+	} else {
+		full = buildSystemPromptAutoLanguage(basePrompt)
 	}
-
-	session.AddMessage("system", fullPrompt)
+	if mem != "" {
+		full += "\n\n# User Information\n" + mem
+	}
+	return full
 }
 
 func (o *Orchestrator) SetVoice(session *ConversationSession, voice Voice) {
+	// Under the mutex: GetCurrentVoice reads this under RLock, and one of its readers is the
+	// backchannel warm-up running on its own goroutine, so an unguarded write here is a live race.
+	session.mu.Lock()
+	defer session.mu.Unlock()
 	session.CurrentVoice = voice
 }
 
@@ -382,20 +450,22 @@ func (o *Orchestrator) SetLanguage(session *ConversationSession, lang Language) 
 	defer session.mu.Unlock()
 	session.CurrentLanguage = lang
 
-	// Map language code to human-readable name for LLM instruction
-	langName := languageCodeToName(lang)
-
-	// Replace the Language section in the system prompt (if present)
-	langSection := fmt.Sprintf("Always respond in %s.", langName)
+	// Rebuild the system message from the agent's own prompt rather than editing the rendered one.
+	// The language section names the language nine times and the old regex reached one of them, so
+	// the prompt ended up instructing two languages at once. See ConversationSession.basePrompt.
 	for i, msg := range session.Context {
 		if msg.Role == "system" {
-			// Find and replace the "Always respond in X." line
-			re := regexp.MustCompile(`Always respond in [^.]+\.`)
-			if re.MatchString(msg.Content) {
-				session.Context[i].Content = re.ReplaceAllString(msg.Content, langSection)
+			if session.basePrompt != "" {
+				session.Context[i].Content = composeSystemPrompt(session.basePrompt, lang, session.UserMemory)
+				log.Printf("[orchestrator] language set to %q — system prompt rebuilt", string(lang))
 			} else {
-				// Fallback: append language instruction
-				session.Context[i].Content = msg.Content + "\n\n# Language\nAlways respond in " + langName + ". Never switch to another language, even if the user speaks another language. The entire conversation must be in " + langName + "."
+				// No base prompt recorded — this system message was not built by
+				// SetSystemPrompt (a caller wrote it directly, or it predates basePrompt).
+				// Appending is all that is safe: rebuilding would discard their text.
+				langName := languageCodeToName(lang)
+				session.Context[i].Content = msg.Content + "\n\n# Language\nAlways respond in " +
+					langName + ". Never switch to another language, even if the user speaks another " +
+					"language. The entire conversation must be in " + langName + "."
 			}
 			break
 		}
@@ -475,7 +545,16 @@ func languageCodeToName(lang Language) string {
 		return "Ukrainian"
 	case LanguageVi:
 		return "Vietnamese"
-	case "":
+	case "", "auto", "na":
+		// An unpinned language is NOT English, and returning "English" here is how a caller ended
+		// up being answered in English on a Spanish call: the whole language section is rendered
+		// from this name, so "no language configured" became nine instructions to speak English.
+		//
+		// composeSystemPrompt now routes the unpinned case to buildSystemPromptAutoLanguage and
+		// never asks for a name, so this is only reached by a caller naming the language directly.
+		// English is still the least-surprising word to hand them, but it must not be silent.
+		log.Printf("[orchestrator] languageCodeToName(%q): no language pinned — callers building a "+
+			"prompt must use composeSystemPrompt, which handles auto-detect without a name", string(lang))
 		return "English"
 	default:
 		// A code with no name here is a bug in this table, and the old fallback turned it into a

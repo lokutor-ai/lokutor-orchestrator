@@ -224,7 +224,9 @@ type ManagedStream struct {
 	lastDropLogGen int
 	// One "channel full" line per generation, same rate-limiting rationale as
 	// lastDropLogGen above.
-	lastFullLogGen    int
+	lastFullLogGen int
+	// One "holding" line per generation, same rate-limiting as the two above.
+	lastHeldLogGen    int
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -2603,18 +2605,14 @@ func (ms *ManagedStream) RegenerateBackchannelClips(o *Orchestrator) {
 		return
 	}
 	go func() {
-		voice := VoiceF1
-		if ms.session != nil && ms.session.GetCurrentVoice() != "" {
-			voice = ms.session.GetCurrentVoice()
-		} else if o != nil && o.config.VoiceStyle != "" {
-			voice = o.config.VoiceStyle
-		}
+		voice, lang := ms.backchannelVoiceLang(o)
 
-		clips := cachedBackchannelClips(ms.ctx, voice, func(c context.Context) [][]byte {
+		clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
 			out := make([][]byte, 0, len(backchannelPhrases))
 			for _, phrase := range backchannelPhrases {
-				// backchannelLang, not the caller's language — see backchannelPhrases.
-				audio, err := o.GenerateSilent(c, phrase, voice, backchannelLang)
+				// The call's own voice AND language: the language selects the reference pack, so
+				// synthesising under a fixed one hums in a different speaker. See backchannelLangFor.
+				audio, err := o.GenerateSilent(c, phrase, voice, lang)
 				if err == nil && len(audio) > 100 {
 					out = append(out, audio)
 				}
@@ -3043,17 +3041,30 @@ func (ms *ManagedStream) emitBackchannel(data []byte) {
 // languages it lands as surprise).
 var backchannelPhrases = []string{"mhm", "mm", "hm"}
 
-// backchannelLang is the language these are synthesised in — English, which the model treats as its
-// unmarked base case and therefore prefixes with no language token.
+// The phrases are shared across languages; the SYNTHESIS follows the call. These are two separate
+// decisions and conflating them shipped a bug.
 //
-// Passing the caller's language would prepend [es] or [ca] to a sound that is not a word in
-// Spanish or Catalan, which asks the text encoder to apply a language's pronunciation prior to
-// something that has no pronunciation in it. Unmarked is the honest description of a nasal hum.
-const backchannelLang = LanguageEn
+// This used to synthesise under a fixed LanguageEn, on the argument that English is the model's
+// unmarked base case and that prefixing [es] to a nasal hum asks the text encoder for a
+// pronunciation prior on something with no pronunciation in it. That argument is about the
+// language TOKEN, and it overlooked what else the language argument does: Versa's resolveVoice
+// picks the reference pack from it, and a legacy voice id — which is what essentially every agent
+// in the database still stores — resolves to en_f1 under "en" and es_f1 under "es". Different
+// packs are different speakers. A caller on a Spanish call heard the agent hum in someone else's
+// voice between its own sentences, which is far more noticeable than any pronunciation prior on
+// "mhm".
+//
+// So the caller's language goes in, and the clips match the reply in voice, reference and
+// language. backchannelLangFor centralises that and keeps the auto-detect case honest: an empty
+// language means the session has not pinned one, and passing it through unchanged resolves to the
+// same unmarked default the reply path uses, rather than guessing at a pack the reply will not use.
+func backchannelLangFor(lang Language) Language { return lang }
 
 func backchannelPhrasesForLang(Language) []string { return backchannelPhrases }
 
-func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
+// backchannelVoiceLang picks the (voice, language) pair the clips must be synthesised under — the
+// same pair the reply path uses, so the hum is the same speaker as the sentence around it.
+func (ms *ManagedStream) backchannelVoiceLang(o *Orchestrator) (Voice, Language) {
 	voice := VoiceF1
 	if ms.session != nil && ms.session.GetCurrentVoice() != "" {
 		voice = ms.session.GetCurrentVoice()
@@ -3061,14 +3072,25 @@ func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
 		voice = o.config.VoiceStyle
 	}
 
+	var lang Language
+	if ms.session != nil {
+		lang = ms.session.GetCurrentLanguage()
+	}
+	return voice, backchannelLangFor(lang)
+}
+
+func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
+	voice, lang := ms.backchannelVoiceLang(o)
+
 	// Once per process per (voice, language) — not once per session. See backchannel_cache.go:
 	// regenerating identical audio at every session start took a synthesis slot from the caller's
 	// first sentence and pushed it over real-time, which is heard as a gap.
-	clips := cachedBackchannelClips(ms.ctx, voice, func(c context.Context) [][]byte {
+	clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
 		out := make([][]byte, 0, len(backchannelPhrases))
 		for _, phrase := range backchannelPhrases {
-			// backchannelLang, not the caller's language — see backchannelPhrases.
-			audio, err := o.GenerateSilent(c, phrase, voice, backchannelLang)
+			// The call's own voice AND language: the language selects the reference pack, so
+			// synthesising under a fixed one hums in a different speaker. See backchannelLangFor.
+			audio, err := o.GenerateSilent(c, phrase, voice, lang)
 			if err == nil && len(audio) > 100 {
 				out = append(out, audio)
 			}

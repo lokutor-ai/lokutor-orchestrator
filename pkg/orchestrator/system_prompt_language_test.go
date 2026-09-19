@@ -104,3 +104,115 @@ func TestSetSystemPromptUsesTheSessionLanguage(t *testing.T) {
 		}
 	}
 }
+
+// The startup order is SetSystemPrompt then SetLanguage, and the session starts on its LanguageEn
+// default — so the prompt is always BORN English and the language change has to correct it.
+//
+// It used to correct it with a regex for "Always respond in X.", which is one of the nine places
+// the language section names the language. The other eight kept saying English, including "still
+// reply in English" and "every word you produce must be in English". A Spanish call therefore ran
+// on a prompt arguing 8-to-1 for English, and the model drifted into English mid-call — reported
+// from real calls twice.
+// instructionsNaming returns the phrasings that actually command a language, as opposed to merely
+// mentioning it. "a short English-looking fragment" mentions English and is correct in a Spanish
+// prompt; "Answer it in English" commands it and is the bug.
+func instructionsNaming(name string) []string {
+	return []string{
+		"Always respond in " + name,
+		"must be in " + name,
+		"still reply in " + name,
+		"Answer it in " + name,
+		"repeat — in " + name,
+		"A sentence in " + name,
+		"failing on " + name + " audio",
+		"speaking " + name,
+	}
+}
+
+var englishInstructions = instructionsNaming("English")
+
+func TestSetLanguageLeavesNoTraceOfThePreviousLanguage(t *testing.T) {
+	o := &Orchestrator{config: Config{}}
+	for _, lang := range []Language{LanguageEs, LanguageCa, LanguageGl, LanguageEu, LanguageFr} {
+		s := NewConversationSession("s") // starts on LanguageEn, as production does
+		o.SetSystemPrompt(s, "You help people book appointments.")
+		o.SetLanguage(s, lang)
+
+		got := s.GetContextCopy()[0].Content
+		want := languageCodeToName(lang)
+
+		// The only acceptable number of English INSTRUCTIONS in a Spanish call is zero. The word
+		// itself is allowed to survive: "a short English-looking fragment" describes the
+		// recogniser's failure mode and is correct in every language.
+		for _, stale := range englishInstructions {
+			if strings.Contains(got, stale) {
+				t.Errorf("%s: prompt still says %q — the model sees two languages at once:\n%s",
+					lang, stale, got)
+			}
+		}
+		if n := strings.Count(got, want); n < 4 {
+			t.Errorf("%s: after SetLanguage the prompt names %q only %d times; the section that "+
+				"holds the model on one language was not rebuilt", lang, want, n)
+		}
+		if !strings.Contains(got, "still reply in "+want) {
+			t.Errorf("%s: the mistranscription rule still names the old language", lang)
+		}
+		if !strings.Contains(got, "You help people book appointments.") {
+			t.Errorf("%s: rebuilding the prompt dropped the agent's own text", lang)
+		}
+	}
+}
+
+// Switching language twice must not leave sediment from the first switch either.
+func TestSetLanguageIsIdempotentAcrossSwitches(t *testing.T) {
+	o := &Orchestrator{config: Config{}}
+	s := NewConversationSession("s")
+	o.SetSystemPrompt(s, "persona")
+	o.SetLanguage(s, LanguageEs)
+	o.SetLanguage(s, LanguageCa)
+	o.SetLanguage(s, LanguageGl)
+
+	got := s.GetContextCopy()[0].Content
+	for _, staleLang := range []string{"English", "Spanish", "Catalan"} {
+		for _, stale := range instructionsNaming(staleLang) {
+			if strings.Contains(got, stale) {
+				t.Errorf("prompt still says %q after switching to Galician:\n%s", stale, got)
+			}
+		}
+	}
+	if !strings.Contains(got, "Galician") {
+		t.Error("prompt does not name the current language")
+	}
+}
+
+// An unset language means "follow the caller", not "speak English". languageCodeToName mapped ""
+// to "English", so an agent with no language configured got the full nine-mention English section
+// — the strongest instruction in the prompt, telling it to override the caller it was supposed to
+// follow.
+func TestUnpinnedLanguageDoesNotInstructEnglish(t *testing.T) {
+	o := &Orchestrator{config: Config{}}
+	for _, lang := range []Language{"", "auto", "na"} {
+		if languageIsPinned(lang) {
+			t.Errorf("languageIsPinned(%q) = true; auto-detect would be treated as a real language", lang)
+		}
+		s := &ConversationSession{CurrentLanguage: lang, MaxMessages: 20}
+		o.SetSystemPrompt(s, "persona")
+		got := s.GetContextCopy()[0].Content
+
+		if strings.Contains(got, "Always respond in English") {
+			t.Errorf("%q: unconfigured language renders as an instruction to speak English:\n%s", lang, got)
+		}
+		if !strings.Contains(got, "use the one the caller speaks") {
+			t.Errorf("%q: prompt does not tell the model to follow the caller", lang)
+		}
+		// Following the caller is not enough on its own: the recogniser emits English-looking
+		// fragments, and a model told only to mirror them switches to English on the first "Yeah".
+		if !strings.Contains(got, "recogniser") || !strings.Contains(got, "stay in it") {
+			t.Errorf("%q: auto-detect prompt lacks the stay-put rule that stops fragment-driven "+
+				"drift:\n%s", lang, got)
+		}
+		if !strings.Contains(got, "persona") {
+			t.Errorf("%q: the agent's own prompt was dropped", lang)
+		}
+	}
+}
