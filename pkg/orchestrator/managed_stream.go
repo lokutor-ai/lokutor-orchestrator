@@ -1396,6 +1396,22 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.mu.Unlock()
 		if ctx.Err() == nil {
 			ms.emit(ErrorEvent, fmt.Sprintf("Transcription error: %v", err))
+			ms.logger.Warn("Utterance abandoned: transcription failed", "seq", seq, "error", err)
+		} else {
+			// The silent one, and the expensive one. A cancelled context here
+			// emits NOTHING and logged NOTHING, so a turn that entered
+			// processUtterance simply stopped existing: no reply, no error to the
+			// caller, no line in the log. Traced from production, a failing
+			// session read
+			//
+			//   processUtterance > Utterance discarded as noise > processUtterance > (nothing)
+			//
+			// against a healthy one ending in "turn latency", and there was no way
+			// to tell from the logs which had happened or why. A caller losing a
+			// turn must always leave evidence.
+			ms.logger.Warn("Utterance abandoned: pipeline cancelled mid-transcription — the caller gets no reply for this turn",
+				"seq", seq, "ctx_err", ctx.Err(), "stt_err", err,
+				"duration_ms", duration.Milliseconds())
 		}
 		return
 	}
