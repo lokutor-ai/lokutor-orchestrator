@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type SpeculativeState int
@@ -328,10 +329,51 @@ func (se *SpeculativeExecutor) Await(ctx context.Context, finalTranscript string
 	if result == nil || result.Response == "" {
 		return "", false
 	}
-	if !strings.EqualFold(strings.TrimSpace(result.PartialTranscript), strings.TrimSpace(finalTranscript)) {
+	if !sameUtterance(result.PartialTranscript, finalTranscript) {
 		return "", false
 	}
 	return result.Response, true
+}
+
+// sameUtterance reports whether two transcripts are the same thing said, for the purpose of
+// deciding whether an answer generated for one is still the right answer for the other.
+//
+// This used to be strings.EqualFold on the trimmed strings, and that exactness was quietly
+// expensive. The speculative transcript is produced from the hangover window and the final one from
+// the completed utterance, and the recogniser routinely renders the same words with different
+// punctuation or capitalisation — "abre la oficina mañana" against "Abre la oficina mañana." — so a
+// finished, correct answer was thrown away and the whole LLM call paid again. Measured in
+// production: speculation was SEEDED on 16 turns and USED on 1. That is the difference between the
+// VAD hangover being free and it being 239 ms of dead time on the critical path, because hiding the
+// LLM under the hangover is the entire point of speculating.
+//
+// What it deliberately does NOT do is match loosely. Case, punctuation and spacing carry nothing the
+// reply depends on; WORDS do. If the caller said something different, the speculative answer answers
+// the wrong question, and a wrong answer delivered fast is worse than a right one delivered late.
+// Accents are preserved for the same reason — in Spanish they distinguish real words.
+func sameUtterance(a, b string) bool {
+	na, nb := normalizeUtterance(a), normalizeUtterance(b)
+	return na != "" && na == nb
+}
+
+func normalizeUtterance(s string) string {
+	var out []rune
+	prevSpace := true // leading space is dropped
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		switch {
+		case unicode.IsSpace(r):
+			if !prevSpace {
+				out = append(out, ' ')
+				prevSpace = true
+			}
+		case unicode.IsPunct(r) || unicode.IsSymbol(r):
+			// dropped entirely, not replaced by a space: "¿sí?" and "si" must agree
+		default:
+			out = append(out, r)
+			prevSpace = false
+		}
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // Cancel aborts any in-flight speculative run and clears its result — used
