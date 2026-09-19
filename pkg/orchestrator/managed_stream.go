@@ -221,7 +221,10 @@ type ManagedStream struct {
 	ckCacheMs  int64 // through the response cache and RAG injection
 	// lastDropLogGen rate-limits the dropped-audio warning to one line per
 	// response rather than one per frame.
-	lastDropLogGen    int
+	lastDropLogGen int
+	// One "channel full" line per generation, same rate-limiting rationale as
+	// lastDropLogGen above.
+	lastFullLogGen    int
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -2870,9 +2873,46 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 	if ms.isClosed.Load() {
 		return
 	}
+
 	select {
 	case ms.events <- event:
+		return
 	default:
+	}
+
+	// The channel is full. This used to fall straight through to `default:` and
+	// discard the event without a word, which for an AudioChunk means the caller
+	// loses that slice of the reply — or, if it is the first chunk, the whole
+	// reply — with nothing anywhere to say so. The backchannel sender two
+	// functions down has always logged this case; the audio path never did, so
+	// the one that matters was the one that was invisible.
+	//
+	// A dropped chunk is also unrecoverable in a way a dropped status is not, so
+	// audio gets a short blocking retry first. 1024 events is ample for a reply
+	// (~60 chunks); a full channel means the consumer is stalled, almost always
+	// the websocket write applying backpressure from a slow reader. Waiting
+	// briefly lets a transient stall drain instead of punching a hole in the
+	// audio. The wait is deliberately short — past it the caller is better served
+	// by the stream moving on than by a chunk arriving far too late.
+	if eventType == AudioChunk {
+		t := time.NewTimer(250 * time.Millisecond)
+		defer t.Stop()
+		select {
+		case ms.events <- event:
+			return
+		case <-t.C:
+		case <-ms.ctx.Done():
+			return
+		}
+	}
+
+	// Rate-limited to one line per generation: the interesting fact is that a
+	// response lost audio, not how many chunks it lost.
+	if ms.lastFullLogGen != gen {
+		ms.lastFullLogGen = gen
+		ms.logger.Warn("event channel full — DROPPING events",
+			"type", eventType, "gen", gen, "cap", cap(ms.events),
+			"note", "consumer stalled; an AudioChunk lost here is silence the caller hears")
 	}
 }
 
