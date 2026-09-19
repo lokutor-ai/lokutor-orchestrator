@@ -119,6 +119,28 @@ type ManagedStream struct {
 	pendingBargeIn  bool
 	pendingBargeGen int
 
+	// Audio produced while a TENTATIVE barge-in is muting playback.
+	//
+	// The design above promises that a rejected barge-in can "resume delivering
+	// audio with no re-synthesis and no gap in generation". That was only ever
+	// true for audio not yet generated: emitWithGen dropped every frame that
+	// arrived while the stream sat in StateListening, so by the time the
+	// barge-in was rejected the frames were gone and resuming produced silence.
+	//
+	// The synthesiser runs far faster than playback (RTF ~0.4-0.7), so a short
+	// reply is generated almost entirely inside the tentative window — measured
+	// on production, a 1.88s reply was produced and discarded in full while a
+	// spurious VAD start held the gate shut. The caller got a turn with a
+	// transcript, a "speaking" status, a healthy [versa] synthesis line and no
+	// audio whatsoever.
+	//
+	// So a tentative mute now holds frames rather than dropping them. Rejecting
+	// the barge-in flushes them and playback really does resume; confirming it
+	// discards them, which is what a real interruption wants anyway.
+	heldAudio      [][]byte
+	heldAudioGen   int
+	heldAudioBytes int
+
 	userAudio []byte
 
 	userSpeakingSince time.Time
@@ -1018,14 +1040,15 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 // for the current response generation (e.g. it was already confirmed, or a
 // newer turn has since started).
 func (ms *ManagedStream) resolvePendingBargeIn() {
+	resumedGen := -1
 	ms.mu.Lock()
-	defer ms.mu.Unlock()
 	if !ms.pendingBargeIn {
 		// Nothing was tentatively muted (e.g. a short/noisy utterance that
 		// never opened a barge-in at all) — safe to normalize back to idle.
 		if ms.state != StateInterrupted {
 			ms.state = StateIdle
 		}
+		ms.mu.Unlock()
 		return
 	}
 	if ms.pendingBargeGen != ms.payloadGen {
@@ -1039,9 +1062,9 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 		// which makes emitWithGen's AudioChunk gate (state == StateSpeaking)
 		// silently drop that turn's real audio. Per the doc comment above,
 		// a stale call must be a true no-op: don't touch ms.state at all.
+		ms.mu.Unlock()
 		return
 	}
-	ms.pendingBargeIn = false
 
 	// Never resume playback into someone who is still talking.
 	//
@@ -1057,18 +1080,37 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 	// The utterance in flight will resolve this on its own — confirming a
 	// real barge-in once enough words arrive, or calling back here once the
 	// caller actually stops.
+	// The barge-in stays PENDING here on purpose. Clearing it before this early
+	// return is what made the callback this comment promises impossible: the next
+	// call would take the !pendingBargeIn branch and force StateIdle, ending the
+	// response it was supposed to resume, and frames arriving in the meantime
+	// would be dropped rather than held.
 	if ms.vadSpeaking {
 		ms.state = StateListening
+		ms.mu.Unlock()
 		return
 	}
+
+	ms.pendingBargeIn = false
 
 	switch {
 	case ms.ttsCancel != nil:
 		ms.state = StateSpeaking
+		resumedGen = ms.payloadGen
 	case ms.pipelineCancel != nil:
 		ms.state = StateProcessing
 	default:
 		ms.state = StateIdle
+		// Nothing is left to play into, so nothing should be kept.
+		ms.discardHeldAudioLocked()
+	}
+	ms.mu.Unlock()
+
+	// Emitted outside the lock: this re-enters emitWithGen, which takes ms.mu.
+	if resumedGen >= 0 {
+		for _, c := range ms.takeHeldAudio(resumedGen) {
+			ms.emitWithGen(AudioChunk, c, resumedGen)
+		}
 	}
 }
 
@@ -1079,11 +1121,56 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 // separate async re-signal from the transport layer (which is what produced
 // the double-cancellation race this replaces). No-ops if there's no pending
 // barge-in for the current generation.
+// heldAudioMaxSeconds bounds how much muted playback is kept for a possible resume.
+//
+// Two different costs sit on either side of this number. Too small and a legitimate
+// resume loses the tail of the sentence it was meant to restore. Too large and a
+// rejected barge-in dumps a wall of stale audio at a caller who has long since moved
+// on, and the memory is held per stream for the whole window. Four seconds is longer
+// than any single synthesised segment (maxSpokenSegment caps a segment at 140 chars,
+// roughly 7s of speech at worst, but the first frames are what matter for a resume)
+// and short enough that a resume still feels like the same sentence continuing.
+const heldAudioMaxSeconds = 4
+
+func (ms *ManagedStream) maxHeldAudioBytesLocked() int {
+	rate := ms.playbackRate
+	if rate <= 0 {
+		rate = 44100
+	}
+	return rate * 2 * heldAudioMaxSeconds
+}
+
+// takeHeldAudio removes and returns the frames held during a tentative barge-in.
+// Callers must NOT hold ms.mu: emitting the frames re-enters emitWithGen, which
+// takes it.
+func (ms *ManagedStream) takeHeldAudio(gen int) [][]byte {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	if ms.heldAudioGen != gen || len(ms.heldAudio) == 0 {
+		return nil
+	}
+	frames := ms.heldAudio
+	ms.heldAudio = nil
+	ms.heldAudioBytes = 0
+	return frames
+}
+
+// discardHeldAudio throws away held frames — the barge-in was real, so the
+// response they belong to is not wanted. Safe to call with ms.mu held.
+func (ms *ManagedStream) discardHeldAudioLocked() {
+	ms.heldAudio = nil
+	ms.heldAudioBytes = 0
+}
+
 func (ms *ManagedStream) confirmBargeInIfPending() {
 	ms.mu.Lock()
 	pending := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
 	if pending {
 		ms.pendingBargeIn = false
+		// The interrupt is real: the muted frames belong to a response the caller
+		// has talked over, and playing them now is precisely what a barge-in is
+		// meant to prevent.
+		ms.discardHeldAudioLocked()
 	}
 	ms.mu.Unlock()
 	if pending {
@@ -2062,6 +2149,9 @@ func (ms *ManagedStream) handleInterrupt() {
 	hadActiveTurn := ms.pipelineCtx != nil && ms.pipelineCtx.Err() == nil
 	ms.state = StateInterrupted
 	ms.interruptedAt = time.Now()
+	// An interrupt is final. Anything held for a possible resume belongs to the
+	// response being cut off, and must never surface on a later turn.
+	ms.discardHeldAudioLocked()
 	ms.mu.Unlock()
 
 	ms.cancelPipeline()
@@ -2657,11 +2747,40 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 	// path runs concurrently with the turn pipeline that mutates state.
 	logDrop := false
 	dropState := ms.state
-	if eventType == AudioChunk && !speaking && ms.lastDropLogGen != gen {
-		ms.lastDropLogGen = gen
-		logDrop = true
+	held := false
+	if eventType == AudioChunk && !speaking {
+		// A tentative barge-in is the one case where "not speaking" is provisional:
+		// nothing has been confirmed, and the gate may reopen a moment from now. Hold
+		// the frame so it can still be delivered if it does. Every other reason to be
+		// off StateSpeaking (a confirmed interrupt, idle, a superseded generation) is
+		// final, and those frames are dropped exactly as before.
+		if chunk, ok := data.([]byte); ok && ms.pendingBargeIn && ms.pendingBargeGen == gen {
+			if ms.heldAudioGen != gen {
+				ms.heldAudio = nil
+				ms.heldAudioBytes = 0
+				ms.heldAudioGen = gen
+			}
+			// Past the cap, stop holding. A barge-in this long is almost certainly
+			// real, and resuming several seconds late would be worse than not
+			// resuming at all — the caller has moved on.
+			if ms.heldAudioBytes+len(chunk) <= ms.maxHeldAudioBytesLocked() {
+				c := make([]byte, len(chunk))
+				copy(c, chunk)
+				ms.heldAudio = append(ms.heldAudio, c)
+				ms.heldAudioBytes += len(c)
+				held = true
+			}
+		}
+		if !held && ms.lastDropLogGen != gen {
+			ms.lastDropLogGen = gen
+			logDrop = true
+		}
 	}
 	ms.mu.Unlock()
+
+	if held {
+		return
+	}
 
 	if eventType == AudioChunk && !speaking {
 		// Every audio frame of a response can be dropped here — the stream is
