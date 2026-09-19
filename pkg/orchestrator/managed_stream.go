@@ -1445,6 +1445,30 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		transcript = restored
 	}
 	if transcript == "" {
+		// A short empty transcript is a cough, a door, a breath — silence is the
+		// right answer and saying anything would be worse.
+		//
+		// A LONG one is not. The caller said something real and the recogniser
+		// returned nothing, and answering that with silence is the single worst
+		// thing this system can do: from their side the product simply stopped
+		// working, with no way to tell whether to repeat themselves or hang up.
+		// Caught on a real call — 2459 ms of Spanish came back as "" and the agent
+		// said nothing, so the caller had to speak again to get any response at
+		// all.
+		//
+		// So past a second, ask. It costs one short sentence when the recogniser
+		// was right that there was nothing there, and it rescues the turn when it
+		// was wrong.
+		if duration >= time.Second {
+			ms.logger.Warn("Empty transcript for a long utterance — asking the caller to repeat",
+				"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
+			ms.mu.Lock()
+			ms.payloadGen++
+			gen := ms.payloadGen
+			ms.mu.Unlock()
+			ms.speakResponse(ctx, notHeardPrompt(ms.session.GetCurrentLanguage()), gen)
+			return
+		}
 		ms.logger.Info("Utterance discarded: empty transcript, resuming bot",
 			"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
 		ms.resolvePendingBargeIn()
@@ -3148,5 +3172,35 @@ func (ms *ManagedStream) speakResponse(ctx context.Context, text string, gen int
 			return // interrupted between sentences; speakText would refuse anyway
 		}
 		ms.speakText(ctx, seg, gen)
+	}
+}
+
+// notHeardPrompt is what the agent says when the recogniser returned nothing for an utterance long
+// enough to have been real speech.
+//
+// Spoken in the caller's own language, because this fires precisely when recognition is struggling
+// — and on a Spanish call the recogniser's own failure mode is to emit English, which is the last
+// thing to mirror back. Deliberately short and free of apology: the caller needs to know they were
+// not heard and should repeat, not to sit through a sentence about it.
+func notHeardPrompt(lang Language) string {
+	switch lang {
+	case "es":
+		return "Perdona, no te he oído bien. ¿Puedes repetirlo?"
+	case "ca":
+		return "Perdona, no t'he sentit bé. Ho pots repetir?"
+	case "gl":
+		return "Perdoa, non te oín ben. Podes repetilo?"
+	case "eu":
+		return "Barkatu, ez zaitut ondo entzun. Errepika dezakezu?"
+	case "pt":
+		return "Desculpa, não te ouvi bem. Podes repetir?"
+	case "it":
+		return "Scusa, non ho sentito bene. Puoi ripetere?"
+	case "fr":
+		return "Pardon, je n'ai pas bien entendu. Peux-tu répéter ?"
+	case "de":
+		return "Entschuldigung, das habe ich nicht verstanden. Nochmal?"
+	default:
+		return "Sorry, I didn't catch that. Could you say it again?"
 	}
 }
