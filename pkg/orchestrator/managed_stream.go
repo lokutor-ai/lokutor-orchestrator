@@ -2669,6 +2669,16 @@ func (ms *ManagedStream) Close() {
 		// session with this user can start with context (Retell/ElevenLabs pattern).
 		ms.extractUserMemory()
 
+		// Give the audio goroutine a moment to notice ms.cancel() and stop feeding
+		// Turno BEFORE the models are freed. This sleep used to come after the
+		// Destroy calls, which meant a chunk already inside handleAudio could
+		// reach turno.Step() on freed tensors and panic. Turno now refuses a Step
+		// after Destroy rather than panicking, so this ordering is belt-and-braces
+		// — but the right order is still this one, and depending on a guard to
+		// paper over a known-wrong sequence is how the guard eventually gets
+		// removed by someone who cannot see why it was there.
+		time.Sleep(10 * time.Millisecond)
+
 		// Clean up Turno models (gating instance + turn-completion shadow)
 		if ms.turno != nil {
 			ms.turno.Destroy()
@@ -2676,8 +2686,6 @@ func (ms *ManagedStream) Close() {
 		if ms.turnoTurn != nil {
 			ms.turnoTurn.Destroy()
 		}
-
-		time.Sleep(10 * time.Millisecond)
 
 		// Closing under eventsMu (the same lock emit/emitBackchannel/
 		// drainAudioChunks hold across their isClosed-recheck-and-send) makes

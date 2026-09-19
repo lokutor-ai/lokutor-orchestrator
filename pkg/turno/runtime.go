@@ -1,6 +1,7 @@
 package turno
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -66,6 +67,19 @@ func (d Decision) ShouldYieldFloor(threshold float32) bool {
 // sessions to clear internal state.
 type Runtime struct {
 	mu sync.Mutex
+
+	// closed is set by Destroy and checked by Step, because the two are ordered by nothing but
+	// luck. Both already take mu, so there is no data race — but Destroy frees the ONNX tensors,
+	// and a Step that acquires the lock afterwards found them freed and PANICKED:
+	//
+	//   panic: slice bounds out of range [:46] with capacity 0
+	//     turno.(*Runtime).Step -> featWindow.GetData() on a destroyed tensor
+	//
+	// That panic was recovered upstream, which made it far worse than a crash: it aborted
+	// handleAudio part-way, AFTER the VAD had computed its event but BEFORE that event was acted
+	// on. So the turn never closed and the caller sat waiting for a reply that could not come —
+	// "it stayed quiet as if I hadn't finished talking".
+	closed bool
 
 	session *ort.AdvancedSession
 
@@ -216,6 +230,11 @@ func (r *Runtime) Reset() {
 func (r *Runtime) Step(nearFrame, farFrame []float32) (Decision, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		// A destroyed runtime returns an error, which callers already handle by logging and
+		// moving on. Anything else here becomes a panic in the audio path.
+		return Decision{}, errors.New("turno: runtime is closed")
+	}
 
 	r.Stats.Frames++
 	if farFrame == nil {
@@ -352,6 +371,7 @@ func (r *Runtime) destroyTensors() {
 func (r *Runtime) Destroy() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.closed = true
 	if r.session != nil {
 		r.session.Destroy()
 		r.session = nil
