@@ -1649,6 +1649,20 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				map[string]interface{}{"truly_incomplete": false, "wait_ms": waitMs,
 					"horizon_assisted": horizonAssisted})
 		case <-ctx.Done():
+			// The last silent exit in this function, and the expensive one. The
+			// turn sits here waiting to see whether the caller is going to carry
+			// on, and anything that cancels the pipeline during that window used
+			// to return with no log, no event and no reply — the turn simply
+			// evaporated. From the outside that is indistinguishable from the
+			// service being down, and from the logs it is indistinguishable from
+			// nothing having happened at all: a session read
+			//
+			//   processUtterance: entered > Utterance discarded > processUtterance: entered
+			//
+			// and then stopped, with a correct transcript already in hand.
+			ms.logger.Warn("Utterance abandoned: cancelled while waiting to see if the caller continued — no reply for this turn",
+				"seq", seq, "transcript", transcript, "wait_ms", waitMs,
+				"ctx_err", ctx.Err())
 			return
 		}
 	}
