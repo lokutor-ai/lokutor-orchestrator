@@ -88,10 +88,12 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage usagePayload `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
+	recordUsage(ctx, result.Usage)
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no response from cerebras")
 	}
@@ -104,6 +106,8 @@ func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrato
 		"messages": messages,
 		"stream":   true,
 	}
+	// Streaming omits token counts unless asked; see requestStreamUsage in usage.go.
+	requestStreamUsage(payload)
 	l.applyReasoningEffort(payload)
 	if len(tools) > 0 {
 		payload["tools"] = tools
@@ -178,6 +182,10 @@ func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrato
 				} `json:"delta"`
 			} `json:"choices"`
 		}
+
+		// Before the choices check, not after: the chunk carrying `usage` has an EMPTY
+		// choices array, so the early return below is exactly what hid it.
+		recordUsageFromChunk(ctx, []byte(data))
 
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue

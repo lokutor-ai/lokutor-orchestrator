@@ -226,7 +226,11 @@ type ManagedStream struct {
 	// lastDropLogGen above.
 	lastFullLogGen int
 	// One "holding" line per generation, same rate-limiting as the two above.
-	lastHeldLogGen    int
+	lastHeldLogGen int
+	// Token counts for the turn in flight, accumulated across every provider call the turn makes
+	// (a tool chain is more than one). Read by the turn-latency logger; see token_usage.go for why
+	// this is a per-turn sink rather than a field on the provider.
+	turnTokens        *TokenUsage
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -827,7 +831,18 @@ func (ms *ManagedStream) logTurnLatency() {
 	ms.mu.Lock()
 	confirmWait, specAwait := ms.confirmWaitMs, ms.specAwaitMs
 	ckShadow, ckGate, ckBarge, ckCache := ms.ckShadowMs, ms.ckGateMs, ms.ckBargeMs, ms.ckCacheMs
+	turnTokens := ms.turnTokens
 	ms.mu.Unlock()
+
+	// Token counts for this turn. -1, not 0, when the provider reported nothing: language-model
+	// cost per call-minute is 42% of variable cost and was the one estimated figure in the
+	// unit-economics report, so these lines are what replaces the estimate with measurement. A
+	// genuine zero and "the provider did not tell us" would average very differently, and only one
+	// of them is a reason to go looking.
+	promptTok, completionTok, totalTok := -1, -1, -1
+	if p, c, t, ok := turnTokens.Snapshot(); ok {
+		promptTok, completionTok, totalTok = p, c, t
+	}
 	gateOther := gate
 	if gateOther > 0 {
 		gateOther -= confirmWait + specAwait
@@ -861,6 +876,10 @@ func (ms *ManagedStream) logTurnLatency() {
 		"ck_barge_ms", ckBarge,
 		"ck_cache_ms", ckCache,
 		"llm_ms", llm,
+		// What the language model actually charged us for this turn. -1 = not reported.
+		"llm_prompt_tokens", promptTok,
+		"llm_completion_tokens", completionTok,
+		"llm_total_tokens", totalTok,
 		"llm_to_tts_ms", llmToTTS,
 		"tts_first_chunk_ms", ttsFirst,
 		"discarded_ms", discarded,

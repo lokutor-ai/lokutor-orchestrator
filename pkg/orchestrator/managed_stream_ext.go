@@ -302,10 +302,17 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	// latched true on turn one's first audio chunk and then stayed true for
 	// the rest of the session, freezing spokenTextPrefix to that first turn's
 	// text).
+	// A fresh token sink per turn, installed on the context the provider will use. Tool chains
+	// make several provider calls inside one turn and TokenUsage accumulates across them, so what
+	// the turn-latency line reports is the whole turn's cost rather than the last call's.
+	turnTokens := &TokenUsage{}
+	ctx = WithTokenUsage(ctx, turnTokens)
+
 	ms.mu.Lock()
 	ms.spokenTextPrefix = ""
 	ms.spokenTextLocked = false
 	ms.responseChunksSent = 0
+	ms.turnTokens = turnTokens
 	ms.mu.Unlock()
 
 	var fullText strings.Builder
