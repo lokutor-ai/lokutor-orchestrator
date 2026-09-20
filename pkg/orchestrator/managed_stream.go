@@ -219,6 +219,13 @@ type ManagedStream struct {
 	ckGateMs   int64 // through the confirmation gate
 	ckBargeMs  int64 // through the echo check and barge-in resolution
 	ckCacheMs  int64 // through the response cache and RAG injection
+	// The last two checkpoints, added after a 25-SECOND turn on a live Catalan call whose
+	// turn_gate_ms was 25,264 with every existing checkpoint reading 0 and gate_other_ms carrying
+	// the whole span. Four checkpoints at zero and a twenty-five second gate means the stall lives
+	// AFTER the last of them, in the one stretch nothing measured — which is precisely the "large
+	// value points at a region rather than a line" failure the checkpoints above were added to end.
+	ckPreLLMMs int64 // sttEnd -> entering runLLMAndTTS (everything after the cache checkpoint)
+	ckLockMs   int64 // time spent waiting for ms.mu INSIDE runLLMAndTTS, which the emit path also holds
 	// lastDropLogGen rate-limits the dropped-audio warning to one line per
 	// response rather than one per frame.
 	lastDropLogGen int
@@ -831,6 +838,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	ms.mu.Lock()
 	confirmWait, specAwait := ms.confirmWaitMs, ms.specAwaitMs
 	ckShadow, ckGate, ckBarge, ckCache := ms.ckShadowMs, ms.ckGateMs, ms.ckBargeMs, ms.ckCacheMs
+	ckPreLLM, ckLock := ms.ckPreLLMMs, ms.ckLockMs
 	turnTokens := ms.turnTokens
 	ms.mu.Unlock()
 
@@ -875,6 +883,11 @@ func (ms *ManagedStream) logTurnLatency() {
 		"ck_gate_ms", ckGate,
 		"ck_barge_ms", ckBarge,
 		"ck_cache_ms", ckCache,
+		// sttEnd -> runLLMAndTTS entry, and the lock wait once inside it. A large ck_pre_llm_ms
+		// with a small ck_lock_ms is work in the gate; the reverse is contention with a turn that
+		// is still speaking.
+		"ck_pre_llm_ms", ckPreLLM,
+		"ck_lock_ms", ckLock,
 		"llm_ms", llm,
 		// What the language model actually charged us for this turn. -1 = not reported.
 		"llm_prompt_tokens", promptTok,
@@ -1212,6 +1225,8 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.confirmWaitMs = 0
 	ms.specAwaitMs = 0
 	ms.ckShadowMs = 0
+	ms.ckPreLLMMs = 0
+	ms.ckLockMs = 0
 	ms.ckGateMs = 0
 	ms.ckBargeMs = 0
 	ms.ckCacheMs = 0
@@ -1868,7 +1883,13 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	rCtx, rCancel := context.WithCancel(ctx)
 
+	// Two measurements, not one: how long it took to REACH here from the end of STT, and how long
+	// the lock itself took once here. They fail for different reasons — the first is work in the
+	// gate, the second is contention with a turn that is still speaking — and a single number
+	// cannot tell them apart.
+	enteredAt := time.Now()
 	ms.mu.Lock()
+	lockWait := time.Since(enteredAt)
 	if ms.pipelineCancel != nil {
 		ms.pipelineCancel()
 	}
@@ -1876,6 +1897,10 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.pipelineCtx = rCtx
 	ms.payloadGen++
 	gen := ms.payloadGen
+	if !ms.sttEndTime.IsZero() {
+		ms.ckPreLLMMs = enteredAt.Sub(ms.sttEndTime).Milliseconds()
+	}
+	ms.ckLockMs = lockWait.Milliseconds()
 	ms.mu.Unlock()
 
 	defer rCancel()
