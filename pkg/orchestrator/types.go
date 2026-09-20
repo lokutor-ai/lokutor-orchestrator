@@ -239,10 +239,15 @@ const (
 )
 
 type Config struct {
-	SampleRate               int
-	Channels                 int
-	BytesPerSamp             int
-	MaxContextMessages       int
+	SampleRate         int
+	Channels           int
+	BytesPerSamp       int
+	MaxContextMessages int
+	// MaxContextTokens caps conversation context by size. Zero takes DefaultMaxContextTokens; set
+	// it negative to disable the cap entirely. See context_budget.go for the measured reason this
+	// exists — prompt size is both ~84ms of first-token latency per 1,000 tokens and about 76% of
+	// variable cost per call-minute.
+	MaxContextTokens         int
 	VoiceStyle               Voice
 	MinWordsToInterrupt      int
 	Language                 Language
@@ -503,6 +508,7 @@ func DefaultConfig() Config {
 		Channels:                 1,
 		BytesPerSamp:             2,
 		MaxContextMessages:       100,
+		MaxContextTokens:         DefaultMaxContextTokens,
 		VoiceStyle:               VoiceF1,
 		MinWordsToInterrupt:      2,
 		Language:                 LanguageEn,
@@ -581,6 +587,11 @@ type ConversationSession struct {
 	toolCallCounts  map[string]int // Track how many times each tool has been called
 	UserMemory      string         // Cross-call memory extracted from previous sessions
 
+	// MaxContextTokens caps the conversation by SIZE, which is what actually costs anything.
+	// MaxMessages caps it by count, and count is a poor proxy: one long turn can carry more than
+	// twenty short ones. Zero disables the token cap and leaves the count cap alone.
+	MaxContextTokens int
+
 	// basePrompt is the agent's own prompt, before buildSystemPrompt wraps it in the guidelines
 	// and the language section. Kept so that a language change can REBUILD the system prompt
 	// rather than patch it.
@@ -597,12 +608,13 @@ type ConversationSession struct {
 
 func NewConversationSession(userID string) *ConversationSession {
 	return &ConversationSession{
-		ID:              userID,
-		Context:         []Message{},
-		MaxMessages:     20,
-		CurrentVoice:    VoiceF1,
-		CurrentLanguage: LanguageEn,
-		toolCallCounts:  make(map[string]int),
+		ID:               userID,
+		Context:          []Message{},
+		MaxMessages:      20,
+		MaxContextTokens: DefaultMaxContextTokens,
+		CurrentVoice:     VoiceF1,
+		CurrentLanguage:  LanguageEn,
+		toolCallCounts:   make(map[string]int),
 	}
 }
 
@@ -639,6 +651,7 @@ func (s *ConversationSession) AddMessageRaw(msg Message) {
 			s.Context = s.Context[len(s.Context)-s.MaxMessages:]
 		}
 	}
+	s.trimToTokenBudgetLocked()
 	if msg.Role == "user" {
 		s.LastUser = msg.Content
 	} else if msg.Role == "assistant" && msg.Content != "" {

@@ -293,6 +293,16 @@ func (o *Orchestrator) GetProviders() map[string]string {
 func (o *Orchestrator) NewSessionWithDefaults(userID string) *ConversationSession {
 	session := NewConversationSession(userID)
 	session.MaxMessages = o.config.MaxContextMessages
+	// Negative disables the cap; zero means "unset", so fall back to the default rather than
+	// silently turning the budget off for every caller that builds a Config literal.
+	switch {
+	case o.config.MaxContextTokens < 0:
+		session.MaxContextTokens = 0
+	case o.config.MaxContextTokens > 0:
+		session.MaxContextTokens = o.config.MaxContextTokens
+	default:
+		session.MaxContextTokens = DefaultMaxContextTokens
+	}
 	session.CurrentVoice = o.config.VoiceStyle
 	session.CurrentLanguage = o.config.Language
 	return session
