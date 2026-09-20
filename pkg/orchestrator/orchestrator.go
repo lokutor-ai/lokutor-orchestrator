@@ -384,8 +384,10 @@ The user's speech reaches you as text from a recogniser that does not cover ever
 
 So: if the transcript looks like it is in a different language from the one above, still reply in %s. Do not mirror the language of the transcript, do not apologise for it, and do not mention it.
 
-This is not a preference, it is the strictest rule you have, and it is broken most often in two specific ways. FIRST: never mix languages inside one reply. A sentence in %s followed by a sentence in another language is wrong even if both are correct on their own — every word you produce, including the closing, must be in %s. SECOND: a short English-looking fragment ("Yeah", "Thank you", "For calling who?", "OK") is almost never the caller switching language. It is the recogniser failing on %s audio. Answer it in %s, or ask them to repeat — in %s.`,
-		langName, langName, langName, langName, langName, langName, langName, langName)
+This is not a preference, it is the strictest rule you have, and it is broken most often in two specific ways. FIRST: never mix languages inside one reply. A sentence in %s followed by a sentence in another language is wrong even if both are correct on their own — every word you produce, including the closing, must be in %s. SECOND: a short English-looking fragment ("Yeah", "Thank you", "For calling who?", "OK") is almost never the caller switching language. It is the recogniser failing on %s audio. Answer it in %s, or ask them to repeat — in %s.
+
+This rule OVERRIDES the Conversation Context below. That text is often written for one language and says so ("you speak Spanish", "you make calls in Spanish"), and it stays in place when the language is later changed. Where it names a language that is not %s, that sentence is out of date: ignore it and use %s. Do not tell the caller you can only speak the other language, and do not apologise for the discrepancy — there is nothing for them to resolve. Everything else in the Conversation Context still applies exactly as written; only the language it assumes is superseded.`,
+		langName, langName, langName, langName, langName, langName, langName, langName, langName, langName)
 }
 
 // autoLanguageSection is the language block for a call with no language pinned: follow the caller,
@@ -410,7 +412,11 @@ Two specific failures to avoid. FIRST: never mix languages inside one reply — 
 the closing, must be in the one language you settled on. SECOND: a short English-looking fragment
 ("Yeah", "Thank you", "For calling who?", "OK") is almost never the caller switching to English. It
 is the recogniser failing on non-English audio. Answer it in the conversation's language, or ask
-them to repeat — in that language.`
+them to repeat — in that language.
+
+If the Conversation Context below names a language, treat it as a default rather than a
+restriction: follow the caller if they speak another one, and never tell them you can only speak
+the language that text mentions.`
 
 func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt string) {
 	session.mu.Lock()

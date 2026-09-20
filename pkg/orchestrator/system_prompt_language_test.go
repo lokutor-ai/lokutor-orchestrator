@@ -216,3 +216,40 @@ func TestUnpinnedLanguageDoesNotInstructEnglish(t *testing.T) {
 		}
 	}
 }
+
+// The agent's own prompt is appended LAST, under "# Conversation Context", and real prompts pin a
+// language in prose: the production agent's 8,114-character prompt says "Hablas español de España"
+// and "Haces llamadas telefónicas en español". Switching the configured language to Catalan left
+// those sentences in place, and because they come last the model followed them — it told the
+// caller it could only answer in Spanish, which is what was reported.
+//
+// The language section must therefore claim precedence over that text explicitly. Without this,
+// changing the language dropdown does nothing for any agent whose prompt mentions a language.
+func TestLanguageSectionOverridesTheAgentsOwnPrompt(t *testing.T) {
+	spanishPinningPrompt := "Eres Cristina. Hablas español de España, con acento natural. " +
+		"Haces llamadas telefónicas en español."
+	o := &Orchestrator{config: Config{}}
+	s := NewConversationSession("s")
+	o.SetSystemPrompt(s, spanishPinningPrompt)
+	o.SetLanguage(s, LanguageCa)
+
+	got := s.GetContextCopy()[0].Content
+	if !strings.Contains(got, "OVERRIDES the Conversation Context") {
+		t.Error("the language section does not claim precedence over the agent's prompt, so a " +
+			"prompt that names a language still wins and the dropdown is decorative")
+	}
+	if !strings.Contains(got, "Do not tell the caller you can only speak the other language") {
+		t.Error("nothing stops the model announcing the conflict to the caller, which is the " +
+			"exact symptom reported")
+	}
+	// The agent's own text must still be present — we override the language it assumes, not the
+	// instructions it carries.
+	if !strings.Contains(got, "Eres Cristina") {
+		t.Error("the agent's own prompt was dropped rather than superseded on language alone")
+	}
+	for _, stale := range instructionsNaming("Spanish") {
+		if strings.Contains(got, stale) {
+			t.Errorf("language section still instructs Spanish (%q) after switching to Catalan", stale)
+		}
+	}
+}
