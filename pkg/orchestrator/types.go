@@ -615,7 +615,29 @@ func (s *ConversationSession) AddMessageRaw(msg Message) {
 	defer s.mu.Unlock()
 	s.Context = append(s.Context, msg)
 	if len(s.Context) > s.MaxMessages {
-		s.Context = s.Context[len(s.Context)-s.MaxMessages:]
+		// Keep the leading system message. The trim used to be a plain tail slice, which drops
+		// index 0 — and index 0 is the system prompt, carrying the entire language section, the
+		// guardrails and the agent's own instructions. A call long enough to reach MaxMessages
+		// therefore lost every rule holding it to one language, silently, in the middle of a
+		// conversation. Nothing logged it and the model simply started behaving like a different
+		// agent.
+		//
+		// This is not hypothetical head-room: context on a real call was measured growing past
+		// 7,000 tokens with no ceiling in sight, because summarizeContextIfNeeded — the function
+		// meant to cap it — is never called from anywhere.
+		if len(s.Context) > 0 && s.Context[0].Role == "system" {
+			keep := s.MaxMessages - 1
+			if keep < 1 {
+				keep = 1
+			}
+			tail := s.Context[1:]
+			if len(tail) > keep {
+				tail = tail[len(tail)-keep:]
+			}
+			s.Context = append(s.Context[:1:1], tail...)
+		} else {
+			s.Context = s.Context[len(s.Context)-s.MaxMessages:]
+		}
 	}
 	if msg.Role == "user" {
 		s.LastUser = msg.Content
