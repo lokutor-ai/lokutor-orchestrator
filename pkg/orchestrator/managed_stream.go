@@ -1248,12 +1248,23 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 
 	ms.pendingBargeIn = false
 
+	// onVADStart already told the client "listening" the moment this barge-in
+	// looked tentatively real (see the emit(UserSpeaking, ...) above it) —
+	// before STT, MinWordsToInterrupt, or the echo check got a chance to say
+	// otherwise. If one of them now says false alarm, the client is sitting on
+	// a stale status and needs to be told what actually happened, or its UI
+	// (the sphere/visualizer included) shows the caller has the floor while
+	// the bot is audibly still talking. resumedStatus carries that correction;
+	// emitted below, once the real destination state is known.
+	resumedStatus := ""
 	switch {
 	case ms.ttsCancel != nil:
 		ms.state = StateSpeaking
 		resumedGen = ms.payloadGen
+		resumedStatus = "speaking"
 	case ms.pipelineCancel != nil:
 		ms.state = StateProcessing
+		resumedStatus = "thinking"
 	default:
 		ms.state = StateIdle
 		// Nothing is left to play into, so nothing should be kept.
@@ -1261,7 +1272,13 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 	}
 	ms.mu.Unlock()
 
-	// Emitted outside the lock: this re-enters emitWithGen, which takes ms.mu.
+	// Emitted outside the lock: these re-enter emitWithGen, which takes ms.mu.
+	// Status first, matching the order a fresh turn uses (BotSpeaking/BotThinking
+	// before any audio) — not that a client relies on the order, but there's no
+	// reason to invert it here.
+	if resumedStatus != "" {
+		ms.emit(BotResumed, resumedStatus)
+	}
 	if resumedGen >= 0 {
 		for _, c := range ms.takeHeldAudio(resumedGen) {
 			ms.emitWithGen(AudioChunk, c, resumedGen)
@@ -1602,8 +1619,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.logger.Info("Utterance discarded as noise, resuming bot",
 			"transcript", result.Text, "no_speech_prob", result.NoSpeechProb,
 			"audio_duration_ms", duration.Milliseconds())
+		// resolvePendingBargeIn emits BotResumed itself now, with the actual
+		// resulting status -- a second nil-payload emission here would just be
+		// a redundant, less-informative duplicate.
 		ms.resolvePendingBargeIn()
-		ms.emit(BotResumed, nil)
 		return
 	}
 

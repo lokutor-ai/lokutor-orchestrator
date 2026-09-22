@@ -96,7 +96,11 @@ const (
 	BotResponse       EventType = "BOT_RESPONSE"
 	BotSpeaking       EventType = "BOT_SPEAKING"
 	Interrupted       EventType = "INTERRUPTED"
-	BotResumed        EventType = "BOT_RESUMED"
+	// BotResumed corrects a status the client was already told ("listening",
+	// from the tentative barge-in's own onVADStart) once that barge-in
+	// resolves as a false alarm. Data is a string: "speaking" or "thinking" --
+	// whichever status the client should show now.
+	BotResumed EventType = "BOT_RESUMED"
 	AudioChunk        EventType = "AUDIO_CHUNK"
 	ToolCall          EventType = "TOOL_CALL"
 	ToolResult        EventType = "TOOL_RESULT"
