@@ -172,7 +172,11 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.mu.Unlock()
 	defer rCancel()
 
-	ms.emitWithGen(BotThinking, nil, gen)
+	// BotThinking is emitted from inside speakText (via speakResponse below), not here — see the
+	// comment on that emission for why: the client SDK stops currently-playing audio the instant
+	// it sees a higher generation number, so telling it before speakText's own "caller started
+	// talking again" check has run risks cutting off real audio for a generation that gets
+	// discarded moments later.
 	ms.llmStartTime = time.Now()
 	ms.llmEndTime = time.Now() // already generated ahead of time — no LLM wait on this turn
 	// Same per-turn reset as runLLMAndTTS — see the comment there. Without

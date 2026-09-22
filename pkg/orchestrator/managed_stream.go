@@ -280,6 +280,25 @@ type ManagedStream struct {
 	// (onVADStart), so a later genuine silence still gets its own one nudge.
 	silenceNudgeSent bool
 
+	// realUtteranceStarted is set the moment the caller's own audio produces a
+	// real utterance worth processing (onVADEnd, before the noise/empty-transcript
+	// checks) and never cleared. It exists because FirstSpeakerBot's own opening
+	// (types.go's resolveOpening/OpeningTrigger) runs on a goroutine of its own,
+	// independent of the normal onVADEnd -> processUtterance pipeline, with its
+	// own LLM call when no verbatim OpeningMessage is configured. A caller who
+	// starts talking before that goroutine's LLM call returns is not talking over
+	// nothing: the opening's own runLLMAndTTS call is still in flight, and it
+	// finishing later allocates its own generation and calls speakText same as
+	// any real turn -- speakText's existing discard check only catches "the user
+	// is talking RIGHT NOW", not "a real turn already superseded this one", so a
+	// generic, stale opening (or worse, its OpeningTrigger's own LLM answering a
+	// user-role message that was never a caller) could still play, sometimes
+	// finishing before the caller's real answer even started, making the bot
+	// sound like it answers, restarts, and answers again for one utterance. This
+	// flag lets the opening goroutine bail before ever calling speakText once a
+	// real utterance exists, whatever the caller said and whatever language.
+	realUtteranceStarted bool
+
 	// Spoken-truth context tracking: the last assistant response and how much
 	// of it was actually synthesized/played before an interruption. On interrupt,
 	// the context is truncated to only what the user heard (Pipecat/OpenAI pattern).
@@ -486,11 +505,33 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 				return
 			}
 
+			// See the realUtteranceStarted field comment: a caller who starts
+			// talking during the transport wait (or during the scripted opening's
+			// own LLM call below, for the no-verbatim-opening case) has already
+			// made the call's real first turn. Speaking a scripted or freshly
+			// LLM-generated opening on top of that is not a greeting any more,
+			// it is a second, unrelated reply racing the caller's own answer --
+			// checked immediately before every place this goroutine would
+			// otherwise call speakText or runLLMAndTTS, so the window a real
+			// turn can be missed in is the gap between the check and the call,
+			// not the (up to several second) wait or LLM round-trip before it.
+			realTurn := func() bool {
+				ms.mu.Lock()
+				defer ms.mu.Unlock()
+				return ms.realUtteranceStarted
+			}
+			if realTurn() {
+				return
+			}
+
 			// A configured opening is spoken verbatim, with no LLM call: the
 			// caller hears exactly what was set, and the call starts a full
 			// LLM round-trip sooner.
 			msg, instr := resolveOpening(o.config)
 			if msg != "" {
+				if realTurn() {
+					return
+				}
 				ms.mu.Lock()
 				ms.state = StateSpeaking
 				gen := ms.payloadGen
@@ -505,6 +546,9 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			// come first: the disclosure is only worth anything if it precedes
 			// the conversation it is disclosing.
 			if notice := strings.TrimSpace(o.config.RecordingNotice); notice != "" {
+				if realTurn() {
+					return
+				}
 				ms.mu.Lock()
 				ms.state = StateSpeaking
 				gen := ms.payloadGen
@@ -513,6 +557,9 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 				ms.speakText(ms.ctx, notice, gen)
 			}
 
+			if realTurn() {
+				return
+			}
 			ms.session.AddMessage("user", instr)
 			ms.runLLMAndTTS(ms.ctx, "")
 		}()
@@ -1380,6 +1427,24 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.utteranceSeq++
 	seq := ms.utteranceSeq
 	ms.state = StateProcessing
+	// See the realUtteranceStarted field comment: this is the earliest point a
+	// real utterance is known to exist, before FirstSpeakerBot's own opening
+	// goroutine (if still in flight) gets a chance to speak a stale reply over it.
+	// realTurn() in that goroutine covers the case where it hasn't called
+	// runLLMAndTTS yet; this covers the case where it already has and is mid
+	// LLM-call or mid-TTS -- cancelling its pipelineCtx right here, rather than
+	// waiting for some future runLLMAndTTS call to get around to it, matters
+	// because that wait is exactly what let a stale opening play in full: its
+	// own LLM call can finish and reach speakText before this real utterance's
+	// pipeline has even started (the STT+turn-gate work between here and this
+	// utterance's own runLLMAndTTS is not instant), so by the time that call
+	// would have cancelled the opening it is too late -- the opening already
+	// played. speakText's ctx.Err() check at the top is what actually turns
+	// this cancellation into silence for a not-yet-started opening sentence.
+	ms.realUtteranceStarted = true
+	if ms.pipelineCancel != nil {
+		ms.pipelineCancel()
+	}
 	ms.mu.Unlock()
 
 	go ms.processUtterance(audioData, duration, seq)
@@ -1965,7 +2030,10 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 
 	defer rCancel()
 
-	ms.emitWithGen(BotThinking, nil, gen)
+	// BotThinking is NOT emitted here even though gen is already known — see the comment on the
+	// emission inside speakText's discard check for why: this generation may still be thrown away
+	// below (caller resumed before playback started), and telling the client about it this early
+	// makes it stop real, currently-playing audio for a reply that might never arrive.
 	// Work from here is discardable: if the caller resumes before playback
 	// starts, everything after this point is thrown away.
 	ms.mu.Lock()
@@ -2121,6 +2189,24 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 			"text_len", len(text), "discarded_ms_total", discarded)
 		return
 	}
+
+	// BotThinking is emitted HERE, not at the top of runLLMAndTTS/trySpeculativeResponse/the
+	// tool-call continuation goroutine where the generation is actually allocated, and that gap
+	// is deliberate: the client SDK treats a "thinking" status as authoritative — on seeing a
+	// higher generation number it bumps its own currentGeneration AND stops whatever is currently
+	// playing immediately (handleBinaryMessage's own generation<currentGeneration check then
+	// discards any straggling audio from the OLD generation as "ghost audio" — the client has no
+	// way to un-ring that bell). Emitting this at generation-allocation time told the client to
+	// stop real, valid, still-playing audio for a generation that might be discarded moments
+	// later right here by the check above — the caller's own reply cut off mid-sentence, replaced
+	// by silence, then eventually a DIFFERENT reply starting fresh once a real utterance finally
+	// produces one. That is "the bot restarts itself" as heard from the browser, and it has
+	// nothing to do with acoustic echo. Only a sentence that has passed the discard check above
+	// is at all events going to play, so this is the earliest point the client can safely be told
+	// a new generation exists. Harmless to call once per sentence of a multi-sentence reply: gen
+	// only actually changes on the first one, so emitWithGen's own state==StateSpeaking dedupe
+	// (via the eventual audio chunks) makes every later call here a no-op signal.
+	ms.emitWithGen(BotThinking, nil, gen)
 
 	if ms.userProfile.HasBaseline() {
 		rate := ms.userProfile.GetSuggestedSpeechRate()

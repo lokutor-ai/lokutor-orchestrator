@@ -66,6 +66,66 @@ func TestSpeakTextProceedsWhenCallerSilent(t *testing.T) {
 	}
 }
 
+// The client SDK treats a "thinking" status message as authoritative: on seeing a higher
+// generation number it bumps its own currentGeneration AND stops whatever audio is currently
+// playing immediately, with no way to undo that if the generation it was just told about gets
+// discarded a moment later. BotThinking must therefore never reach the client for a response that
+// speakText goes on to discard here — see the comment on the emission itself for the full history
+// (this used to fire at generation-allocation time in runLLMAndTTS/trySpeculativeResponse/the
+// tool-call continuation goroutine, cutting off real, valid, still-playing audio for a generation
+// that then turned out to be abandoned, which is what showed up in production as the bot
+// restarting itself mid-sentence).
+func TestSpeakTextDoesNotEmitBotThinkingWhenDiscarded(t *testing.T) {
+	ms := &ManagedStream{
+		orch:   &Orchestrator{config: Config{}},
+		logger: noopSpeakLogger{},
+		state:  StateProcessing,
+		events: make(chan OrchestratorEvent, 8),
+	}
+	ms.vadSpeaking = true // the caller started talking again during generation
+
+	ms.speakText(context.Background(), "a response they have stopped waiting for", 1)
+
+	select {
+	case ev := <-ms.events:
+		t.Fatalf("discarded response must emit nothing the client could act on, got %v", ev.Type)
+	default:
+	}
+}
+
+// The other half of the same fix: a response that genuinely proceeds to playback must still tell
+// the client a new generation exists, or the UI never leaves its "thinking" state and the client's
+// own generation bookkeeping falls behind the server's. Runs the real pipeline (proper
+// constructor, mock providers) rather than calling speakText directly, since a live TTS call is
+// exactly what has to succeed here — a hand-cancelled context racing the guard would either miss
+// the assertion or reach a nil provider first.
+func TestManagedStream_EmitsBotThinkingWhenResponseProceeds(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "hello there"}
+	llm := &MockLLMProvider{completeResult: "hi, how can I help"}
+	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
+	vad := NewRMSVAD(0.05, 50*time.Millisecond)
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithVAD(stt, llm, tts, vad, cfg)
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("thinking-timing"))
+	defer stream.Close()
+
+	stream.processUtterance([]byte{0, 0, 0, 0}, 1*time.Second, 0)
+
+	sawThinking := false
+	deadline := time.After(1 * time.Second)
+	for !sawThinking {
+		select {
+		case ev := <-stream.Events():
+			if ev.Type == BotThinking {
+				sawThinking = true
+			}
+		case <-deadline:
+			t.Fatal("expected a BotThinking event for a response that was never discarded")
+		}
+	}
+}
+
 // stageMs must distinguish "not measured" from "instant". A zero would read as
 // a stage that took no time, which is exactly the wrong conclusion to draw
 // when optimising.

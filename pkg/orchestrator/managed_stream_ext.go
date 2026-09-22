@@ -599,7 +599,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			gen := ms.payloadGen
 			ms.mu.Unlock()
 
-			ms.emitWithGen(BotThinking, nil, gen)
+			// BotThinking is emitted from inside speakText (via speakResponse at the end of this
+			// goroutine), not here — see the comment on that emission for why.
 
 			// Pass tools so the LLM can make further tool calls (multi-step chains).
 			// Use streaming if available so we get real-time text + tool callbacks.
