@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 )
@@ -257,14 +258,39 @@ func TestManagedStream_EchoSuppression(t *testing.T) {
 	stream := orch.NewManagedStream(context.Background(), session)
 	defer stream.Close()
 
-	// Simulate a tentative barge-in fired while the bot is mid-sentence, and
-	// the mic picking up the bot's own audio (no AEC on the telephony path).
+	// Simulate a tentative barge-in fired while the bot is mid-sentence, and the mic picking up
+	// the bot's own audio through imperfect echo cancellation. The gate now decides this
+	// acoustically (echo_correlation.go), not from transcript text, so the fixture has to seed the
+	// far-end buffer with a signal and feed a delayed, attenuated copy of it as the near-end
+	// capture — a flat/silent signal (all zeros) correlates with nothing (pearson guards
+	// zero-variance denominators), so the tone below is what makes this test meaningful rather
+	// than passing by accident.
+	echoSignal := make([]byte, 4*echoFrameBytes) // 4 frames = 80ms of 16kHz PCM16
+	for i := 0; i < len(echoSignal)/2; i++ {
+		v := int16(8000 * math.Sin(float64(i)*0.3))
+		echoSignal[i*2] = byte(v)
+		echoSignal[i*2+1] = byte(v >> 8)
+	}
+	attenuated := make([]byte, len(echoSignal))
+	for i := 0; i < len(echoSignal)/2; i++ {
+		s := int16(echoSignal[i*2]) | int16(echoSignal[i*2+1])<<8
+		v := int16(float64(s) * 0.4) // echo is quieter than the original, not identical
+		attenuated[i*2] = byte(v)
+		attenuated[i*2+1] = byte(v >> 8)
+	}
+
 	stream.mu.Lock()
 	stream.state = StateSpeaking
 	stream.lastResponseText = "let me check that for you"
 	stream.pendingBargeIn = true
 	stream.pendingBargeGen = stream.payloadGen
+	gen := stream.payloadGen
 	stream.mu.Unlock()
+	stream.echoMu.Lock()
+	stream.echoFarEndBuf = echoSignal
+	stream.echoNearEndBuf = attenuated
+	stream.echoNearEndGen = gen
+	stream.echoMu.Unlock()
 
 	stream.processUtterance([]byte{0, 0, 0, 0}, 1*time.Second, 0)
 

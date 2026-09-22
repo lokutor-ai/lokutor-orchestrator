@@ -97,6 +97,19 @@ type ManagedStream struct {
 	farEndBuf            []byte // ring of the bot's own recent outgoing audio, resampled to 16kHz PCM16
 	farEndMu             sync.Mutex
 
+	// Acoustic-echo detection for the barge-in confirmation gate (echo_correlation.go). Separate
+	// from farEndBuf above: that one is a CONSUMABLE queue Turno drains frame-by-frame
+	// (takeFarEndFrame), and echo correlation needs to read the same trailing window repeatedly
+	// without racing that consumption, so it keeps its own non-destructive copy fed at the same
+	// call site. echoNearEndBuf accumulates near-end (caller mic) audio, 16kHz PCM16, ONLY while
+	// a barge-in is tentatively pending — mirrors pendingBargeIn/pendingBargeGen's own scope,
+	// reset the moment a new tentative barge-in opens so a stale window's audio can't leak into a
+	// newer decision.
+	echoFarEndBuf  []byte
+	echoNearEndBuf []byte
+	echoNearEndGen int
+	echoMu         sync.Mutex
+
 	cmdChan       chan []byte
 	interruptChan chan struct{}
 	state         StreamState
@@ -655,11 +668,20 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	isSpeaking := ms.vad.IsSpeaking()
 	ms.vadSpeaking = isSpeaking
 
+	// Echo correlation's near-end feed runs regardless of whether Turno is loaded, same reasoning
+	// as noteFarEndEcho in emitFrames — resample once, feed both.
+	audioChunk16k := chunk
+	if ms.inputSampleRate != 16000 {
+		audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
+	}
+	ms.mu.Lock()
+	pendingGenForEcho := ms.pendingBargeGen
+	pendingForEcho := ms.pendingBargeIn
+	ms.mu.Unlock()
+	if pendingForEcho {
+		ms.noteNearEndEcho(audioChunk16k, pendingGenForEcho)
+	}
 	if ms.turno != nil {
-		audioChunk16k := chunk
-		if ms.inputSampleRate != 16000 {
-			audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
-		}
 		ms.feedTurno(audioChunk16k)
 	}
 
@@ -1076,7 +1098,9 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 		ms.pendingBargeIn = true
 		ms.pendingBargeGen = ms.payloadGen
 		ms.turnoBargeinPeakScore = 0
+		gen := ms.payloadGen
 		ms.mu.Unlock()
+		ms.resetNearEndEcho(gen)
 		ms.emit(UserSpeaking, nil)
 		return
 	}
@@ -1752,9 +1776,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// turnoBargeinAssistThr during this pending window, relax the word-count
 	// requirement by turnoBargeinWordsRelief. This corroborates rather than
 	// replaces the STT check — it can only ever lower the bar, never skip
-	// it, and isLikelyEcho below still runs unmodified regardless.
+	// it, and the echo check below still runs unmodified regardless.
 	ms.mu.Lock()
 	pendingBarge := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
+	pendingGen := ms.pendingBargeGen
 	turnoPeak := ms.turnoBargeinPeakScore
 	ms.mu.Unlock()
 	if pendingBarge {
@@ -1785,20 +1810,40 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"transcript", transcript, "word_count", countWords(transcript),
 				"turno_bargein_peak", turnoPeak)
 		}
-		// Echo check: there's no acoustic echo cancellation between what the
-		// bot is currently speaking and what the mic picks up beyond
-		// whatever the client provides — real on browser (WebRTC AEC), but
-		// nonexistent for telephony (Telnyx/Twilio), where there's no
-		// client-side AEC at all. Without this, the bot's own voice bleeding
-		// into the mic gets transcribed, treated as a real barge-in, cuts
-		// itself off mid-sentence, and the next turn can trigger the same
-		// thing again — a self-interruption loop that looks like the bot
-		// restarting/repeating itself over and over.
+		// Echo check: client-side echo cancellation (browser WebRTC AEC, requested by the SDK's
+		// getUserMedia constraints) is best-effort, not a guarantee — it can still let the bot's
+		// own voice bleed back into the mic, especially over speaker playback rather than
+		// headphones. Confirming that bleed as a real barge-in cuts the bot off mid-sentence and
+		// starts a new turn on the echoed fragment, which is what shows up in production as the
+		// bot restarting or re-saying itself.
+		//
+		// This used to compare the STT transcript against ms.lastResponseText by word overlap.
+		// Production logs showed it inconsistent: in the same burst, the identical "Hola." echo
+		// of the opening greeting was caught for some simultaneous sessions and not for others —
+		// a short bot utterance leaves little room for the STT errors a bleed-through echo
+		// commonly carries (network/codec artifacts, a second STT pass on already-synthesized
+		// audio) before word overlap drops below the accept threshold. It also cannot fire until
+		// STT produces a transcript at all.
+		//
+		// isLikelyAcousticEcho (echo_correlation.go) makes a different, more direct claim: is the
+		// near-end audio captured during this pending window well-explained as a delayed,
+		// attenuated copy of audio the bot is known to have just played — amplitude-envelope
+		// correlation against the bot's own recent output, needing neither STT nor a trained
+		// model. The text check still runs, but only as a shadow comparison for tuning the new
+		// threshold against real traffic, the same way this codebase already shadow-logs Turno's
+		// VAD and turn-completion heads before trusting them.
 		ms.mu.Lock()
 		currentlySpeaking := ms.lastResponseText
 		ms.mu.Unlock()
-		if isLikelyEcho(transcript, currentlySpeaking) {
+		acousticEcho, acousticScore, acousticLagMs, acousticNearFrames := ms.isLikelyAcousticEcho(pendingGen)
+		textEcho := isLikelyEcho(transcript, currentlySpeaking)
+		ms.logger.Info("Echo check",
+			"acoustic_echo", acousticEcho, "acoustic_score", acousticScore,
+			"acoustic_lag_ms", acousticLagMs, "acoustic_near_frames", acousticNearFrames,
+			"text_echo_shadow", textEcho, "transcript", transcript, "bot_was_saying", currentlySpeaking)
+		if acousticEcho {
 			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
+				"method", "acoustic", "score", acousticScore, "lag_ms", acousticLagMs,
 				"transcript", transcript, "bot_was_saying", currentlySpeaking)
 			ms.resolvePendingBargeIn()
 			return
@@ -2224,11 +2269,15 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 }
 
 func (ms *ManagedStream) emitFrames(data []byte, frameSize, gen int) {
+	// Echo correlation runs regardless of whether Turno is loaded — it doesn't depend on that
+	// model at all — so the resample happens unconditionally; noteFarEndAudio below (Turno's own
+	// consumable copy) reuses the same resampled chunk rather than resampling twice.
+	farChunk16k := data
+	if ms.playbackRate != 16000 {
+		farChunk16k = resampleTo16k(data, ms.playbackRate)
+	}
+	ms.noteFarEndEcho(farChunk16k)
 	if ms.turno != nil {
-		farChunk16k := data
-		if ms.playbackRate != 16000 {
-			farChunk16k = resampleTo16k(data, ms.playbackRate)
-		}
 		ms.noteFarEndAudio(farChunk16k)
 	}
 	for i := 0; i < len(data); i += frameSize {
