@@ -237,6 +237,38 @@ func (o *Orchestrator) SetTTSRate(rate float64) {
 	}
 }
 
+// SetTTSNFE sets this agent's own Euler step count on the TTS provider, when the provider supports
+// per-call tuning (currently Versa 2.0 only — see Versa2Provider.SetNFE for what this trades off).
+// A no-op on any provider that doesn't implement it, same as SetTTSRate above.
+func (o *Orchestrator) SetTTSNFE(nfe int) {
+	type nfeSetter interface {
+		SetNFE(int)
+	}
+	if ns, ok := o.tts.(nfeSetter); ok {
+		ns.SetNFE(nfe)
+	}
+}
+
+// SetTTSCFG sets this agent's own style/speaker guidance scale on the TTS provider.
+func (o *Orchestrator) SetTTSCFG(cfg float64) {
+	type cfgSetter interface {
+		SetCFG(float64)
+	}
+	if cs, ok := o.tts.(cfgSetter); ok {
+		cs.SetCFG(cfg)
+	}
+}
+
+// SetTTSCFGText sets this agent's own text-guidance scale on the TTS provider.
+func (o *Orchestrator) SetTTSCFGText(cfgText float64) {
+	type cfgTextSetter interface {
+		SetCFGText(float64)
+	}
+	if cs, ok := o.tts.(cfgTextSetter); ok {
+		cs.SetCFGText(cfgText)
+	}
+}
+
 // SetOpeningMessage sets a verbatim first line for bot-first conversations.
 // Callers that build their Config before loading the agent record (the browser
 // path does) can apply it here instead. Must be called before the stream is
