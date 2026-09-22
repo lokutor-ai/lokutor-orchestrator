@@ -270,6 +270,12 @@ type ManagedStream struct {
 	lastAudioSentAt  time.Time
 	lastNoSpeechProb float64
 	lastActivityAt   time.Time
+	// turnAudioBytes accumulates PCM16 bytes sent across every speakText call of the CURRENT turn
+	// (reset alongside ttsFirstChunkTime/ttsStartTime — see those comments). It exists so
+	// lastActivityAt can be set to when the client will actually FINISH PLAYING what was just sent,
+	// not to the moment the server finished generating and sending it — see the comment on its use
+	// at the end of speakText for the incident this closes.
+	turnAudioBytes int64
 
 	// silenceNudgeSent gates monitorInactivity's silence-timeout reprompt to
 	// at most once per idle stretch — it used to have no such gate and would
@@ -2073,6 +2079,9 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	// Reset with it: they are two ends of the same measurement and must come
 	// from the same turn.
 	ms.ttsStartTime = time.Time{}
+	// Reset with them: turnAudioBytes accumulates across every sentence of THIS turn, same lifetime
+	// as ttsStartTime above — see its field comment.
+	ms.turnAudioBytes = 0
 
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
 		ms.runStreamingLLM(rCtx, sProvider, gen, transcript)
@@ -2291,6 +2300,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		ms.mu.Lock()
 		ms.lastAudioSentAt = time.Now()
 		ms.responseChunksSent++
+		ms.turnAudioBytes += int64(len(chunk))
 		// Once the first audio chunk is delivered, mark the spoken prefix as
 		// locked — the user has started hearing the response.
 		if ms.spokenTextLocked == false && ms.lastResponseText == text {
@@ -2358,12 +2368,33 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	}
 	ms.ttsCancel = nil
 	ms.ttsEndTime = time.Now()
-	// Inactivity is measured from when the caller can actually respond, not
-	// from stream creation or the start of a long bot response. Without this
-	// refresh, a response longer than SilenceTimeout leaves lastActivityAt
-	// stale; the monitor fires its "are you there" nudge immediately when
-	// playback ends, which looks like the bot restarted/paraphrased itself.
-	ms.lastActivityAt = time.Now()
+	// Inactivity is measured from when the caller can actually respond — which, for audio still
+	// queued or playing on the client, is not NOW. This used to be plain time.Now(), which is the
+	// moment the SERVER finished GENERATING and SENDING this turn's audio, not the moment the
+	// CLIENT finishes PLAYING it. Synthesis runs faster than real time (RTF < 1), and speakText is
+	// called once per sentence with no wait for client-side playback between calls, so on a long,
+	// multi-sentence reply the server can finish sending well before the client finishes playing it
+	// back. monitorInactivity's silence timeout was then measured from that too-early timestamp: on
+	// a response long enough, its full silence-timeout window could elapse while the caller was
+	// still mid-story, and the nudge fired its own "want more?" reply on top of audio that was
+	// still playing — reported repeatedly as the bot interrupting and restarting itself.
+	//
+	// turnAudioBytes (reset once per turn, accumulated across every sentence — see its field
+	// comment) times the playback rate approximates when the client will actually finish playing
+	// everything sent so far, counting from ttsStartTime (this turn's first byte). Only ever
+	// advances lastActivityAt, never regresses it — a short reply must not un-defer whatever a
+	// longer, still-in-flight one already pushed forward, and playbackRate <= 0 (misconfigured)
+	// degrades to the old now-only behaviour rather than dividing by zero.
+	estimatedPlayEnd := time.Now()
+	if ms.playbackRate > 0 {
+		playDur := time.Duration(ms.turnAudioBytes) * time.Second / time.Duration(int64(ms.playbackRate)*2)
+		if candidate := ms.ttsStartTime.Add(playDur); candidate.After(estimatedPlayEnd) {
+			estimatedPlayEnd = candidate
+		}
+	}
+	if estimatedPlayEnd.After(ms.lastActivityAt) {
+		ms.lastActivityAt = estimatedPlayEnd
+	}
 	ms.mu.Unlock()
 }
 

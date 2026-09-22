@@ -185,6 +185,8 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.ttsFirstChunkTime = time.Time{}
 	// Same pairing as runLLMAndTTS: these are two ends of one measurement.
 	ms.ttsStartTime = time.Time{}
+	// Same per-turn reset as runLLMAndTTS — see turnAudioBytes's field comment.
+	ms.turnAudioBytes = 0
 
 	ms.mu.Lock()
 	ms.lastResponseText = response

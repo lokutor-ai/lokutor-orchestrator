@@ -148,3 +148,55 @@ func TestStageMsReportsUnmeasuredAsNegative(t *testing.T) {
 		}
 	}
 }
+
+// TestSpeakTextDefersLastActivityToEstimatedPlaybackEnd is a regression test for a real production
+// bug: lastActivityAt used to be set to time.Now() the moment speakText finished GENERATING and
+// SENDING a turn's audio, not the moment the client would actually FINISH PLAYING it. Synthesis
+// runs faster than real time, so for a long response the server can finish sending well before the
+// client finishes playing it back — during that gap monitorInactivity's silence-timeout nudge saw
+// an "idle" stream that was, from the caller's side, still mid-sentence, and spoke its own "want
+// more?" reply on top of the real one. Reported repeatedly in production as the bot interrupting
+// and restarting itself, always on long, multi-sentence replies.
+//
+// This uses the real pipeline (NewWithVAD + NewManagedStream, a mock TTS provider) rather than a
+// bare struct literal, because the fix lives in how speakText derives lastActivityAt from actual
+// bytes sent through the real onChunk callback — a hand-set field would not exercise it.
+func TestSpeakTextDefersLastActivityToEstimatedPlaybackEnd(t *testing.T) {
+	const playbackRate = 44100
+	const audioSeconds = 10
+	audio := make([]byte, playbackRate*2*audioSeconds) // 16-bit PCM, mono, 10s of silence
+
+	stt := &MockSTTProvider{}
+	llm := &MockLLMProvider{}
+	tts := &MockTTSProvider{synthesizeResult: audio}
+	vad := NewRMSVAD(0.05, 50*time.Millisecond)
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithVAD(stt, llm, tts, vad, cfg)
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("playback-defer-test"))
+	defer stream.Close()
+
+	if stream.playbackRate != playbackRate {
+		t.Fatalf("test assumes playbackRate %d, got %d", playbackRate, stream.playbackRate)
+	}
+
+	before := time.Now()
+	stream.speakText(context.Background(), "a long response", 1)
+	after := time.Now()
+
+	stream.mu.Lock()
+	got := stream.lastActivityAt
+	stream.mu.Unlock()
+
+	minExpected := before.Add(audioSeconds * time.Second)
+	if got.Before(minExpected) {
+		t.Fatalf("lastActivityAt = %v, want at least %v (%ds after speakText started) — the silence "+
+			"timeout would fire while the client is still playing this response back",
+			got, minExpected, audioSeconds)
+	}
+	// A loose upper bound: it must not have been pushed absurdly far out either (e.g. by a units
+	// bug turning seconds into something much larger).
+	if maxExpected := after.Add(audioSeconds * time.Second); got.After(maxExpected) {
+		t.Fatalf("lastActivityAt = %v is implausibly far in the future (want at most ~%v)", got, maxExpected)
+	}
+}
