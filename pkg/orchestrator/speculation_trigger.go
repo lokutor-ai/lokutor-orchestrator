@@ -111,6 +111,16 @@ func (ms *ManagedStream) startSpeculation() {
 // attempted. Either way, the speculator is left Idle and ready for the
 // next utterance.
 func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript string) bool {
+	// See ckEnterSpecMs's field comment: this is the one remaining unmeasured stretch in a chain of
+	// checkpoints added to chase a 13-17 second ck_pre_llm_ms with everything else reading zero.
+	// Ordinary function-call overhead reads near-zero; if this doesn't, the stall is the goroutine
+	// not being scheduled, not anything this function's own body is doing.
+	ms.mu.Lock()
+	if !ms.sttEndTime.IsZero() {
+		ms.ckEnterSpecMs = time.Since(ms.sttEndTime).Milliseconds()
+	}
+	ms.mu.Unlock()
+
 	if ms.speculator == nil || ms.orch == nil || !ms.orch.config.SpeculativeLLM {
 		return false
 	}

@@ -247,6 +247,15 @@ type ManagedStream struct {
 	// be blamed for a stall nobody could otherwise place. This checkpoint exists to prove or clear it
 	// rather than guess.
 	specMissTailMs int64
+	// specMissTailMs cleared its own span (Cancel/discard) as the cause on live production turns
+	// that still read ck_pre_llm_ms in the 13-17 SECOND range with ckCacheMs, specAwaitMs and
+	// ckLockMs all reading zero — the same shape one layer deeper again. The one remaining
+	// unmeasured stretch is the call itself: everything between ckCacheMs being set and
+	// trySpeculativeResponse's own first line running, which is ordinary function-call overhead on
+	// a healthy scheduler and should read near-zero. If it doesn't, the stall is goroutine
+	// scheduling (GC pause, CPU throttling) rather than anything this package's own logic is doing
+	// — a different class of problem with a different fix.
+	ckEnterSpecMs int64
 	// lastDropLogGen rate-limits the dropped-audio warning to one line per
 	// response rather than one per frame.
 	lastDropLogGen int
@@ -923,6 +932,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	ckShadow, ckGate, ckBarge, ckCache := ms.ckShadowMs, ms.ckGateMs, ms.ckBargeMs, ms.ckCacheMs
 	ckPreLLM, ckLock := ms.ckPreLLMMs, ms.ckLockMs
 	specMissTail := ms.specMissTailMs
+	ckEnterSpec := ms.ckEnterSpecMs
 	turnTokens := ms.turnTokens
 	ms.mu.Unlock()
 
@@ -967,6 +977,10 @@ func (ms *ManagedStream) logTurnLatency() {
 		"ck_gate_ms", ckGate,
 		"ck_barge_ms", ckBarge,
 		"ck_cache_ms", ckCache,
+		// sttEnd -> trySpeculativeResponse's own first line. Ordinary function-call overhead;
+		// should read near-zero. If it doesn't while ck_pre_llm_ms is large, the goroutine was not
+		// scheduled for that long — GC pause or CPU throttling, not this package's own logic.
+		"ck_enter_spec_ms", ckEnterSpec,
 		// sttEnd -> runLLMAndTTS entry, and the lock wait once inside it. A large ck_pre_llm_ms
 		// with a small ck_lock_ms is work in the gate; the reverse is contention with a turn that
 		// is still speaking.
@@ -1335,6 +1349,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.ckBargeMs = 0
 	ms.ckCacheMs = 0
 	ms.specMissTailMs = 0
+	ms.ckEnterSpecMs = 0
 	ms.mu.Unlock()
 	ms.emit(UserStopped, nil)
 
