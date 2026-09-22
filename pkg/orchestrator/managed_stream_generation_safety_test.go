@@ -65,6 +65,55 @@ func TestManagedStream_StaleResolvePendingBargeInDoesNotClobberNewerTurn(t *test
 	}
 }
 
+// TestManagedStream_NoPendingBargeInResolveDoesNotClobberActiveProcessing is a
+// regression test for the sibling of the bug fixed just above, found while
+// tracing a live production report of a call answering, restarting, and
+// answering again for a single utterance.
+//
+// resolvePendingBargeIn's `!ms.pendingBargeIn` branch ("nothing was
+// tentatively muted... safe to normalize back to idle") only ever checked
+// against StateInterrupted before forcing ms.state = StateIdle. But
+// "this utterance never opened a barge-in" says nothing about whether some
+// OTHER, unrelated utterance's own turn is active right now: a real
+// utterance's own processUtterance can spend many seconds in its own pre-LLM
+// work (ms.state == StateProcessing) — one production turn measured over
+// sixteen seconds there — during which a brief, separate sound (a breath,
+// room noise, a stray click) gets its own onVADStart/onVADEnd cycle, is
+// classified as noise (isLikelyNoise) with no barge-in ever opened for it,
+// and calls this. Forcing StateIdle here told monitorInactivity's
+// silence-timeout nudge the stream was idle when a real turn was still very
+// much in flight — so the nudge fired its own quick LLM call and spoke a
+// "want more?" style reply, and the real turn's own (delayed) answer then
+// cut that off and replaced it once it finally arrived. Same bug class as
+// the pendingBargeGen mismatch above, just reached from the branch that
+// never checked for an active, unrelated turn at all.
+//
+// Fixed in managed_stream.go by also excluding StateProcessing and
+// StateSpeaking from the states this branch is allowed to normalize away.
+func TestManagedStream_NoPendingBargeInResolveDoesNotClobberActiveProcessing(t *testing.T) {
+	orch := New(&MockSTTProvider{}, &MockLLMProvider{}, &MockTTSProvider{}, DefaultConfig())
+	session := NewConversationSession("no-pending-bargein-test")
+	stream := orch.NewManagedStream(context.Background(), session)
+	defer stream.Close()
+
+	// A real utterance's own turn is mid pre-LLM work right now (the state
+	// onVADEnd sets before processUtterance's LLM call has even started).
+	stream.mu.Lock()
+	stream.pendingBargeIn = false
+	stream.state = StateProcessing
+	stream.mu.Unlock()
+
+	// A completely separate, brief sound gets classified as noise and
+	// resolves a barge-in it never actually opened.
+	stream.resolvePendingBargeIn()
+
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.state != StateProcessing {
+		t.Fatalf("a noise-classified utterance with no barge-in of its own clobbered an unrelated turn's active state: got %v, want StateProcessing — this is what let the silence-timeout nudge speak over a still-pending real answer", stream.state)
+	}
+}
+
 // leakTrackingSTT is a StreamingSTTProvider mock that records every audio
 // channel it hands back from StreamTranscribe, so a test can independently
 // verify whether ManagedStream closed a given session's channel instead of

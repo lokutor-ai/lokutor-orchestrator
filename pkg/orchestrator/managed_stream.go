@@ -1166,8 +1166,21 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 	ms.mu.Lock()
 	if !ms.pendingBargeIn {
 		// Nothing was tentatively muted (e.g. a short/noisy utterance that
-		// never opened a barge-in at all) — safe to normalize back to idle.
-		if ms.state != StateInterrupted {
+		// never opened a barge-in at all) — normally safe to normalize back to
+		// idle. But this utterance's own noise classification says nothing
+		// about whether some OTHER, unrelated turn is in flight right now: a
+		// real utterance's own processUtterance can be many seconds into its
+		// own pre-LLM work (state StateProcessing) when a brief, separate
+		// sound -- a breath, room noise, a stray click -- gets its own
+		// onVADStart/onVADEnd cycle, is classified as noise, and calls this.
+		// Forcing StateIdle here would tell monitorInactivity's silence-timeout
+		// nudge the stream is idle when it is not, and the nudge would then
+		// speak a "want more?" style reply on top of the real turn's own
+		// answer once THAT finally arrives -- the same class of bug as the
+		// pendingBargeGen mismatch below, just reached from the branch that
+		// never checked for it. StateProcessing and StateSpeaking both mean
+		// something else already owns this turn; leave them alone.
+		if ms.state != StateInterrupted && ms.state != StateProcessing && ms.state != StateSpeaking {
 			ms.state = StateIdle
 		}
 		ms.mu.Unlock()
