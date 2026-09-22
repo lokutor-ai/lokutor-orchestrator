@@ -141,6 +141,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	// and ShouldSpeculate/ShouldSpeculateOnPause both require SpecIdle to
 	// start a new run — without this, one used-or-missed speculation would
 	// permanently block every later attempt for the rest of the call.
+	tailStart := time.Now()
 	ms.speculator.Cancel()
 
 	if !ok {
@@ -148,6 +149,14 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 		// in flight would hold a synthesiser slot the confirmed path is about to need — on a node
 		// with one stream slot that is the difference between answering and queueing.
 		ms.prerender.discard()
+		// specAwaitMs proved bounded (~350ms) in production while ckPreLLMMs (sttEnd -> entering
+		// runLLMAndTTS, which a miss reaches right after this) still read 11-25 SECONDS on live
+		// turns — the same "large span, every named checkpoint at zero" shape a prior 25s Catalan
+		// incident left in ckPreLLMMs itself. Cancel() and prerender.discard() were the only
+		// unmeasured work between them, so this either names the stall or clears both for good.
+		ms.mu.Lock()
+		ms.specMissTailMs = time.Since(tailStart).Milliseconds()
+		ms.mu.Unlock()
 		return false
 	}
 

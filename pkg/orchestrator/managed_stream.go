@@ -226,6 +226,14 @@ type ManagedStream struct {
 	// value points at a region rather than a line" failure the checkpoints above were added to end.
 	ckPreLLMMs int64 // sttEnd -> entering runLLMAndTTS (everything after the cache checkpoint)
 	ckLockMs   int64 // time spent waiting for ms.mu INSIDE runLLMAndTTS, which the emit path also holds
+	// specAwaitMs was proven bounded (~350ms cap) by production data, yet ckPreLLMMs still read
+	// 11-25 SECONDS on turns that took the speculative-miss path — the exact same "large value, no
+	// individual checkpoint explains it" shape as the incident above, one layer deeper. Everything
+	// between Await returning and trySpeculativeResponse's `return false` (Cancel(), a nil-op
+	// prerender.discard() with SPECULATIVE_PRERENDER off) was unmeasured, so it was next in line to
+	// be blamed for a stall nobody could otherwise place. This checkpoint exists to prove or clear it
+	// rather than guess.
+	specMissTailMs int64
 	// lastDropLogGen rate-limits the dropped-audio warning to one line per
 	// response rather than one per frame.
 	lastDropLogGen int
@@ -839,6 +847,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	confirmWait, specAwait := ms.confirmWaitMs, ms.specAwaitMs
 	ckShadow, ckGate, ckBarge, ckCache := ms.ckShadowMs, ms.ckGateMs, ms.ckBargeMs, ms.ckCacheMs
 	ckPreLLM, ckLock := ms.ckPreLLMMs, ms.ckLockMs
+	specMissTail := ms.specMissTailMs
 	turnTokens := ms.turnTokens
 	ms.mu.Unlock()
 
@@ -888,6 +897,11 @@ func (ms *ManagedStream) logTurnLatency() {
 		// is still speaking.
 		"ck_pre_llm_ms", ckPreLLM,
 		"ck_lock_ms", ckLock,
+		// Cancel() + the (currently no-op, SPECULATIVE_PRERENDER off) prerender.discard() on a
+		// speculative miss — the one stretch inside trySpeculativeResponse specAwaitMs does not
+		// cover. Should read near-zero; if ckPreLLMMs is large while THIS is also large, the stall
+		// is here, not in the gate logic above it.
+		"spec_miss_tail_ms", specMissTail,
 		"llm_ms", llm,
 		// What the language model actually charged us for this turn. -1 = not reported.
 		"llm_prompt_tokens", promptTok,
@@ -1230,6 +1244,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.ckGateMs = 0
 	ms.ckBargeMs = 0
 	ms.ckCacheMs = 0
+	ms.specMissTailMs = 0
 	ms.mu.Unlock()
 	ms.emit(UserStopped, nil)
 
