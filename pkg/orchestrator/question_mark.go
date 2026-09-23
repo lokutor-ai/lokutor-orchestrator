@@ -35,14 +35,18 @@ var interrogativeOpeners = map[string][]string{
 		"have", "has", "had",
 		"any", "anyone", "anybody",
 	},
+	// Spanish marks a yes/no question by intonation alone, so a leading word only counts when it
+	// cannot open a statement: the accented interrogatives (unaccented "que", "como", "cuando" are
+	// relatives and conjunctions: "Que sí", "Como te decía"), and second-person asks. "Es", "está",
+	// "hay", "puede" and "tiene" open statements as often as questions ("Es para dos", "Está bien").
+	// "Me" and "por" are judged with the next word (spanishPairOpens): "Me escuchas" asks, "Me llamo
+	// Manolo" does not — that one was marked a question on a real call (2026-09-23), and "Por favor…"
+	// is not a question while "Por qué…" is.
 	"es": {
-		"qué", "que", "cómo", "como", "cuándo", "cuando", "dónde", "donde",
-		"quién", "quien", "quiénes", "cuál", "cual", "cuáles", "cuánto",
-		"cuanto", "cuánta", "cuántos", "cuántas", "por",
-		"puedes", "puede", "podrías", "podría", "podemos",
-		"tienes", "tiene", "tienen", "hay",
-		"eres", "es", "está", "estás", "están", "estoy",
-		"me", "sabes", "sabe", "quieres", "quiere", "necesitas",
+		"qué", "cómo", "cuándo", "dónde", "quién", "quiénes", "cuál", "cuáles",
+		"cuánto", "cuánta", "cuántos", "cuántas",
+		"puedes", "podrías", "podéis", "tienes", "tenéis", "eres", "estás",
+		"sabes", "sabéis", "quieres", "queréis", "necesitas",
 	},
 	"de": {
 		"was", "warum", "wann", "wo", "wer", "wen", "wem", "wessen", "welche",
@@ -113,6 +117,9 @@ func restoreQuestionMark(transcript string, lang Language) string {
 			break
 		}
 	}
+	if !found && normalizeLangKey(lang) == "es" {
+		found = spanishPairOpens(first, strings.ToLower(strings.Trim(fields[1], ".,;:¿¡\"'()")))
+	}
 	if !found {
 		return transcript
 	}
@@ -123,6 +130,19 @@ func restoreQuestionMark(transcript string, lang Language) string {
 		t = strings.TrimRight(t[:len(t)-1], " ")
 	}
 	return t + "?"
+}
+
+// spanishPairOpens reports whether a Spanish utterance opening with first, second is a question:
+// "por qué", or "me" before a second-person verb ("me escuchas", "me oyes", "me dices", "me podéis")
+// rather than a first- or third-person one ("me llamo", "me gustaría", "me interesa").
+func spanishPairOpens(first, second string) bool {
+	switch first {
+	case "por":
+		return second == "qué"
+	case "me":
+		return strings.HasSuffix(second, "s")
+	}
+	return false
 }
 
 // normalizeLangKey maps a Language to the two-letter key used above. Anything

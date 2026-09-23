@@ -607,6 +607,9 @@ type ConversationSession struct {
 	// MaxMessages caps it by count, and count is a poor proxy: one long turn can carry more than
 	// twenty short ones. Zero disables the token cap and leaves the count cap alone.
 	MaxContextTokens int
+	// trimmedMessages counts the conversation messages the token budget has dropped this call,
+	// so a caller being "forgotten" shows in the turn log (TrimmedMessages).
+	trimmedMessages int
 
 	// basePrompt is the agent's own prompt, before buildSystemPrompt wraps it in the guidelines
 	// and the language section. Kept so that a language change can REBUILD the system prompt
@@ -673,6 +676,39 @@ func (s *ConversationSession) AddMessageRaw(msg Message) {
 	} else if msg.Role == "assistant" && msg.Content != "" {
 		s.LastAssistant = msg.Content
 	}
+}
+
+// knowledgeContextPrefix opens the knowledge-base message injectRagContext adds.
+const knowledgeContextPrefix = "[Knowledge base context for this question."
+
+// SetKnowledgeContext makes content the conversation's one knowledge-base message, replacing the
+// previous retrieval rather than adding to it.
+//
+// Every turn's retrieval used to be appended and kept. A retrieval answers the question it was made
+// for and nothing after it, but each one stayed at full size — 160 to 330 tokens on a real call —
+// and the token budget trims oldest-first, so the budget spent itself on stale passages and dropped
+// the conversation instead. On 2026-09-23 a hotel agent was told the caller's name on turn two and
+// asked for it again on turn seven, while the model's prompt sat at the 2,500-token cap from the
+// first turn.
+func (s *ConversationSession) SetKnowledgeContext(content string) {
+	s.mu.Lock()
+	kept := make([]Message, 0, len(s.Context)+1)
+	for i, m := range s.Context {
+		if i > 0 && m.Role == "system" && strings.HasPrefix(m.Content, knowledgeContextPrefix) {
+			continue
+		}
+		kept = append(kept, m)
+	}
+	s.Context = kept
+	s.mu.Unlock()
+	s.AddMessageRaw(Message{Role: "system", Content: content})
+}
+
+// TrimmedMessages is how many conversation messages the token budget has dropped this call.
+func (s *ConversationSession) TrimmedMessages() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.trimmedMessages
 }
 
 func (s *ConversationSession) UpdateLastUserMessage(content string) {

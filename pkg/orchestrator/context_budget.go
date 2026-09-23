@@ -71,6 +71,7 @@ func (s *ConversationSession) trimToTokenBudgetLocked() {
 		keepFrom = len(s.Context) - minKeep
 	}
 
+	s.trimmedMessages += keepFrom - start
 	trimmed := make([]Message, 0, 1+len(s.Context)-keepFrom)
 	if start == 1 {
 		trimmed = append(trimmed, s.Context[0])

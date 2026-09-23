@@ -907,6 +907,13 @@ const turnoEarlyEndMinMs = 150
 // A log line rather than a metric on purpose: it survives pod restarts in the
 // log aggregator, carries the full breakdown rather than one number, and needs
 // no scrape target to be useful.
+func trimmedHistory(s *ConversationSession) int {
+	if s == nil {
+		return -1
+	}
+	return s.TrimmedMessages()
+}
+
 func (ms *ManagedStream) logTurnLatency() {
 	end := ms.userSpeechEnd
 	first := ms.ttsFirstChunkTime
@@ -1028,6 +1035,9 @@ func (ms *ManagedStream) logTurnLatency() {
 		"llm_prompt_tokens", promptTok,
 		"llm_completion_tokens", completionTok,
 		"llm_total_tokens", totalTok,
+		// Conversation messages the token budget has dropped so far this call: history the model
+		// can no longer see.
+		"context_trimmed_msgs", trimmedHistory(ms.session),
 		"llm_to_tts_ms", llmToTTS,
 		"tts_first_chunk_ms", ttsFirst,
 		"discarded_ms", discarded,
@@ -2755,10 +2765,7 @@ func (ms *ManagedStream) injectRagContext(ctx context.Context, transcript string
 	}
 	// A system message, not a user one: this is reference material the model
 	// may use, not something the caller said.
-	ms.session.AddMessageRaw(Message{
-		Role:    "system",
-		Content: "[Knowledge base context for this question. Use it if relevant; do not mention that you looked it up.]\n" + contextText,
-	})
+	ms.session.SetKnowledgeContext(knowledgeContextPrefix + " Use it if relevant; do not mention that you looked it up.]\n" + contextText)
 	ms.logger.Info("RAG context injected",
 		"query_len", len(transcript), "context_len", len(contextText), "elapsed_ms", elapsed)
 }
