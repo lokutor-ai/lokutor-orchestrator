@@ -283,7 +283,7 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 			text = "Got it."
 		}
 		ms.session.AddMessage("assistant", text)
-		ms.emit(BotResponse, text)
+		ms.emitBotResponse(text)
 		ms.cacheResponse(userTranscript, text, nil)
 		ms.speakResponse(ctx, text, gen)
 		return
@@ -514,34 +514,13 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	response := strings.TrimSpace(fullText.String())
 
 	if !hasToolCalls {
-		if ctx.Err() != nil {
-			// The turn was interrupted before StreamComplete unblocked (e.g.
-			// the interrupt landed in the gap between two sentences of a
-			// multi-sentence reply — see speakText's own ctx check, which is
-			// what actually stops any not-yet-spoken sentence from playing).
-			// fullText can still contain text streamed in after the
-			// interrupt, since the provider callback isn't itself
-			// ctx-aware, so don't record the full response as if it were
-			// delivered. handleInterrupt's truncateSpokenContext runs
-			// synchronously with the interrupt and can race ahead of this
-			// point — landing before this turn has added anything to
-			// context yet — so record only what speakText actually
-			// confirmed spoken (the same source of truth
-			// truncateSpokenContext itself reads) instead.
-			ms.mu.Lock()
-			spoken := ms.spokenTextPrefix
-			locked := ms.spokenTextLocked
-			ms.mu.Unlock()
-			if locked {
-				if trimmed := strings.TrimSpace(spoken); trimmed != "" {
-					ms.session.AddMessage("assistant", trimmed)
-				}
-			}
-		} else if response != "" {
-			ms.session.AddMessage("assistant", response)
-			ms.emit(BotResponse, response)
-			ms.cacheResponse(userTranscript, response, nil)
-		}
+		// If the turn was interrupted before StreamComplete unblocked (e.g. in the gap between two
+		// sentences of a multi-sentence reply), fullText can still hold text streamed in after the
+		// interrupt, since the provider callback isn't itself ctx-aware — so the full response must
+		// not be recorded as delivered. handleInterrupt records what the caller actually heard
+		// (spoken_truth.go) and can race ahead of this point; commitStreamedReply is ordered against
+		// it so exactly one of them writes the reply.
+		ms.commitStreamedReply(ctx, gen, response, userTranscript)
 	}
 
 	if hasToolCalls {
@@ -667,7 +646,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			}
 
 			ms.session.AddMessage("assistant", text)
-			ms.emit(BotResponse, text)
+			ms.emitBotResponse(text)
 			ms.speakResponse(rCtx, text, gen)
 		}()
 	}

@@ -101,6 +101,13 @@ const (
 	// resolves as a false alarm. Data is a string: "speaking" or "thinking" --
 	// whichever status the client should show now.
 	BotResumed EventType = "BOT_RESUMED"
+	// BotResponseTruncated: the caller cut the agent off. Data is a TruncatedResponse — what they
+	// actually heard. A reply is committed (and sent as a BotResponse) once it is synthesized, which
+	// is long before it has played, so without this every transcript records the whole reply.
+	BotResponseTruncated EventType = "BOT_RESPONSE_TRUNCATED"
+	// TranscriptRevised: the caller's previous turn and what they said next were one utterance,
+	// transcribed together. Data is a RevisedTranscript. Emitted instead of a TranscriptFinal.
+	TranscriptRevised EventType = "TRANSCRIPT_REVISED"
 	AudioChunk        EventType = "AUDIO_CHUNK"
 	ToolCall          EventType = "TOOL_CALL"
 	ToolResult        EventType = "TOOL_RESULT"

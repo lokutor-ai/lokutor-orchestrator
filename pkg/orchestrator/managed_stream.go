@@ -322,6 +322,26 @@ type ManagedStream struct {
 	spokenTextLocked   bool
 	responseChunksSent int
 
+	// Spoken truth (spoken_truth.go). playout is the caller's playout clock for the current reply,
+	// fed where audio actually leaves for the transport (emitWithGen); curSeg is the speakText call
+	// whose audio is going out; onset is what the caller had heard when they last started speaking
+	// over a reply; lastReply is the text last sent as a BotResponse and for which generation.
+	// mergeOnConfirm tells handleInterrupt the caller's words are being merged into their previous
+	// turn, so the cut-off reply is dropped rather than truncated. truthAppliedGen is the generation
+	// whose heard text has been written to context; replyCommitMu orders that write against the
+	// streaming path's own commit of the reply. lastUtt / carry are the utterances a continuation is
+	// transcribed together with (see processUtterance).
+	playout         playoutTimeline
+	curSeg          segmentRef
+	segSeq          int
+	onset           heardSnapshot
+	lastReply       replyRecord
+	mergeOnConfirm  bool
+	truthAppliedGen int
+	replyCommitMu   sync.Mutex
+	lastUtt         *committedUtterance
+	carry           *committedUtterance
+
 	// Post-interrupt backoff: block bot output for a short window after a
 	// barge-in so it doesn't talk over the user (Vapi backoffSeconds pattern).
 	interruptedAt time.Time
@@ -416,6 +436,8 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 	ms := &ManagedStream{
 		orch:            o,
 		session:         session,
+		lastReply:       replyRecord{gen: -1},
+		truthAppliedGen: -1,
 		ctx:             mCtx,
 		cancel:          mCancel,
 		events:          make(chan OrchestratorEvent, 1024),
@@ -1151,6 +1173,10 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	}
 	ms.mu.Unlock()
 
+	if prevState != StateSpeaking && prevState != StateProcessing {
+		ms.noteSpeechOverPlayout(time.Now())
+	}
+
 	if prevState == StateSpeaking || prevState == StateProcessing {
 		// Tentative barge-in only: ms.state was already set to StateListening
 		// above, which makes emitWithGen's AudioChunk gate suppress outbound
@@ -1166,6 +1192,9 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 		ms.pendingBargeGen = ms.payloadGen
 		ms.turnoBargeinPeakScore = 0
 		gen := ms.payloadGen
+		// What the caller had heard of the reply when they started speaking over it: the transport
+		// flushes its playback queue now, so this is what they got, whatever happens next.
+		ms.snapshotHeardAtOnsetLocked(time.Now())
 		ms.mu.Unlock()
 		ms.resetNearEndEcho(gen)
 		ms.emit(UserSpeaking, nil)
@@ -1503,6 +1532,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 
 func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Duration, seq int) {
 	ms.logger.Info("processUtterance: entered", "seq", seq, "duration_ms", duration.Milliseconds(), "audioBytes", len(audioData))
+	uttEndedAt := time.Now()
 	defer func() {
 		if r := recover(); r != nil {
 			ms.logger.Error("processUtterance: recovered panic", "panic", r)
@@ -1666,6 +1696,47 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
 		ms.resolvePendingBargeIn()
 		return
+	}
+
+	// Continuation (spoken_truth.go): if this utterance carries on the previous one — which either
+	// waited below and was abandoned when the caller resumed, or was answered by a reply the caller
+	// started speaking over before hearing more than a word or two — the two halves are one turn.
+	// Transcribed apart, the second half loses the first as context ("Grillo" without "Pito") and
+	// both show as separate turns. So transcribe them together. The barge-in checks further down
+	// still judge the continuation on its own words: they decide whether the NEW speech is real.
+	ownTranscript := transcript
+	uttAudio := audioData
+	var revisedFrom *committedUtterance
+	ms.mu.Lock()
+	pendingBargeNow := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
+	contBase, contIsBarge := ms.continuationBaseLocked(time.Now(), seq, pendingBargeNow)
+	ms.mu.Unlock()
+	if contBase != nil && contIsBarge {
+		ms.session.mu.Lock()
+		_, tailOK := mergeableTail(ms.session.Context)
+		ms.session.mu.Unlock()
+		if !tailOK {
+			contBase = nil
+		}
+	}
+	if contBase != nil {
+		joined := joinUtteranceAudio(contBase.audio, audioData, int(ms.inputSampleRate))
+		res, jerr := ms.orch.Transcribe(ctx, joined, ms.session.GetCurrentLanguage())
+		merged := strings.TrimSpace(res.Text)
+		if jerr == nil && merged != "" {
+			merged = restoreQuestionMark(merged, ms.session.GetCurrentLanguage())
+			ms.logger.Info("Continuation: transcribed together with the previous utterance",
+				"previous", contBase.transcript, "continuation", ownTranscript, "merged", merged,
+				"over_reply", contIsBarge, "joined_ms", len(joined)*1000/(int(ms.inputSampleRate)*2))
+			transcript = merged
+			uttAudio = joined
+			if contIsBarge {
+				revisedFrom = contBase
+			}
+		} else {
+			ms.logger.Warn("Continuation: joint transcription failed, keeping the two halves separate",
+				"previous", contBase.transcript, "continuation", ownTranscript, "error", jerr)
+		}
 	}
 
 	// Mid-thought pause guard: VAD's silence-based end-of-turn has no way to
@@ -1838,6 +1909,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			if ms.confirmationGate == gate {
 				ms.confirmationGate = nil
 			}
+			// Not dropped: the caller's next utterance is transcribed together with this one.
+			ms.carry = &committedUtterance{audio: uttAudio, transcript: transcript, endedAt: uttEndedAt, gen: ms.payloadGen}
 			ms.mu.Unlock()
 			ms.resolvePendingBargeIn()
 			return
@@ -1910,22 +1983,22 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				effectiveMinWords = 0
 			}
 		}
-		if effectiveMinWords > 0 && countWords(transcript) < effectiveMinWords {
+		if effectiveMinWords > 0 && countWords(ownTranscript) < effectiveMinWords {
 			// Keep the two-word guard for short noise/backchannels, but do
 			// not make a sustained one-word command impossible to use. With
 			// the current VAD hangover, a real "yes", "no", or "stop" turn
 			// remains active long enough to qualify here; brief noise still
 			// resolves as a false barge-in.
-			if !acceptsSustainedSingleWordBargeIn(transcript, duration) {
+			if !acceptsSustainedSingleWordBargeIn(ownTranscript, duration) {
 				ms.logger.Info("Barge-in below MinWordsToInterrupt, resuming bot",
-					"transcript", transcript, "word_count", countWords(transcript),
+					"transcript", ownTranscript, "word_count", countWords(ownTranscript),
 					"audio_duration_ms", duration.Milliseconds())
 				ms.resolvePendingBargeIn()
 				return
 			}
-		} else if turnoAssisted && countWords(transcript) < minWords {
+		} else if turnoAssisted && countWords(ownTranscript) < minWords {
 			ms.logger.Info("Turno assist relaxed MinWordsToInterrupt",
-				"transcript", transcript, "word_count", countWords(transcript),
+				"transcript", ownTranscript, "word_count", countWords(ownTranscript),
 				"turno_bargein_peak", turnoPeak)
 		}
 		// Echo check: client-side echo cancellation (browser WebRTC AEC, requested by the SDK's
@@ -1954,15 +2027,15 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		currentlySpeaking := ms.lastResponseText
 		ms.mu.Unlock()
 		acousticEcho, acousticScore, acousticLagMs, acousticNearFrames := ms.isLikelyAcousticEcho(pendingGen)
-		textEcho := isLikelyEcho(transcript, currentlySpeaking)
+		textEcho := isLikelyEcho(ownTranscript, currentlySpeaking)
 		ms.logger.Info("Echo check",
 			"acoustic_echo", acousticEcho, "acoustic_score", acousticScore,
 			"acoustic_lag_ms", acousticLagMs, "acoustic_near_frames", acousticNearFrames,
-			"text_echo_shadow", textEcho, "transcript", transcript, "bot_was_saying", currentlySpeaking)
+			"text_echo_shadow", textEcho, "transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
 		if acousticEcho {
 			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
 				"method", "acoustic", "score", acousticScore, "lag_ms", acousticLagMs,
-				"transcript", transcript, "bot_was_saying", currentlySpeaking)
+				"transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
 			ms.resolvePendingBargeIn()
 			return
 		}
@@ -1971,10 +2044,29 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.ckGateMs = time.Since(ms.sttEndTime).Milliseconds()
 	ms.mu.Unlock()
 
+	// A merge over a reply needs that reply still pending to be cut: if the barge-in was resolved
+	// some other way in the meantime, the halves stay separate.
+	if revisedFrom != nil && !pendingBarge {
+		revisedFrom = nil
+		transcript = ownTranscript
+		uttAudio = audioData
+	}
+
 	// Real, sufficient speech — commit to the interrupt now (cancels the old
-	// pipeline, truncates spoken-truth context, emits Interrupted). No-op if
-	// there was no pending barge-in for this generation.
+	// pipeline, records what the caller actually heard, emits Interrupted). No-op if
+	// there was no pending barge-in for this generation. When merging, the reply the
+	// caller barely heard is dropped rather than truncated.
+	if revisedFrom != nil {
+		ms.mu.Lock()
+		ms.mergeOnConfirm = true
+		ms.mu.Unlock()
+	}
 	ms.confirmBargeInIfPending()
+	if revisedFrom != nil {
+		ms.mu.Lock()
+		ms.mergeOnConfirm = false
+		ms.mu.Unlock()
+	}
 
 	ms.mu.Lock()
 	ms.ckBargeMs = time.Since(ms.sttEndTime).Milliseconds()
@@ -1987,8 +2079,19 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.userProfile.RecordUtterance(wc, int(duration.Milliseconds()), 0)
 	}
 
-	ms.emit(TranscriptFinal, transcript)
-	ms.session.AddMessage("user", transcript)
+	if revisedFrom != nil && ms.session.reviseLastUserTurn(transcript) {
+		ms.emit(TranscriptRevised, RevisedTranscript{Previous: revisedFrom.transcript, Text: transcript})
+	} else {
+		if revisedFrom != nil {
+			ms.logger.Warn("Continuation: context changed before the merge could be applied; recording it as a new turn",
+				"previous", revisedFrom.transcript, "merged", transcript)
+		}
+		ms.emit(TranscriptFinal, transcript)
+		ms.session.AddMessage("user", transcript)
+	}
+	ms.mu.Lock()
+	ms.lastUtt = &committedUtterance{audio: uttAudio, transcript: transcript, endedAt: uttEndedAt, gen: ms.payloadGen}
+	ms.mu.Unlock()
 
 	// If a newer utterance already arrived, skip LLM — the newest
 	// utterance's pipeline will see all accumulated context.
@@ -2013,7 +2116,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.llmStartTime = now
 		ms.llmEndTime = now
 		ms.ttsStartTime = now
-		ms.emit(BotResponse, response)
+		ms.emitBotResponse(response)
 		if audio != nil {
 			frameSize := int(float64(ms.playbackRate)*0.06) * 2
 			if frameSize <= 0 {
@@ -2163,7 +2266,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	// reflects only the response about to be spoken.
 	ms.responseChunksSent = 0
 	ms.session.AddMessage("assistant", response)
-	ms.emit(BotResponse, response)
+	ms.emitBotResponse(response)
 	ms.cacheResponse(transcript, response, nil)
 
 	// Full-response TTS (single pass, no sentence pipelining — avoids residual audio on interrupt)
@@ -2293,6 +2396,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// the current sentence, not the full multi-sentence response, since
 	// that's what's actually audible at any given moment.
 	ms.lastResponseText = text
+	ms.beginSegmentLocked(gen, text)
 	ms.mu.Unlock()
 
 	ms.emitWithGen(BotSpeaking, nil, gen)
@@ -2483,64 +2587,38 @@ func (ms *ManagedStream) handleInterrupt() {
 	// An interrupt is final. Anything held for a possible resume belongs to the
 	// response being cut off, and must never surface on a later turn.
 	ms.discardHeldAudioLocked()
+	// Spoken truth: what the caller actually heard of the reply being cut off (spoken_truth.go).
+	// Read before cancelling, so the streaming path sees it once its context is done.
+	truthGen := ms.payloadGen
+	now := time.Now()
+	truth, hasTruth := ms.spokenTruthLocked(now)
+	if ms.truthAppliedGen == truthGen {
+		// Already recorded when the caller started speaking over the reply (noteSpeechOverPlayout).
+		hasTruth = false
+	}
+	// Synthesis finishes long before playback does, so "no turn in flight" does not mean "nothing
+	// playing": audio still on the caller's playout clock is being cut off too.
+	playingOut := ms.playout.gen == truthGen && ms.playout.end.After(now)
 	ms.mu.Unlock()
 
 	ms.cancelPipeline()
 
-	// Spoken-truth context: if the bot was interrupted mid-response, truncate
-	// the last assistant message to only the text that was actually spoken.
-	// This prevents the model from "remembering" things it never said.
-	ms.truncateSpokenContext()
+	// The model must remember only what the caller heard. A reply is committed to context once it
+	// is synthesized — long before it has played — so without this it "remembers" having said all
+	// of it.
+	if hasTruth {
+		ms.applySpokenTruthToContext(truthGen, truth)
+	}
 
-	if oldState == StateSpeaking || oldState == StateProcessing || hadActiveTurn {
+	if oldState == StateSpeaking || oldState == StateProcessing || hadActiveTurn || playingOut {
 		ms.drainAudioChunks()
 		ms.mu.Lock()
 		gen := ms.payloadGen
 		ms.mu.Unlock()
 		ms.emitWithGen(Interrupted, nil, gen)
-	}
-}
-
-// truncateSpokenContext replaces the last assistant message in the session
-// context with the portion of the response that was actually spoken, if any.
-// This keeps the LLM's understanding aligned with what the user actually heard.
-func (ms *ManagedStream) truncateSpokenContext() {
-	ms.mu.Lock()
-	prefix := ms.spokenTextPrefix
-	locked := ms.spokenTextLocked
-	chunksSent := ms.responseChunksSent
-	ms.mu.Unlock()
-
-	// If no audio chunks were delivered for the current response, the bot was
-	// interrupted before speaking anything — remove the assistant message from
-	// context so the model doesn't "remember" a response it never gave.
-	if chunksSent == 0 {
-		ms.removeLastAssistantMessage()
-		return
-	}
-
-	if prefix == "" || !locked {
-		return
-	}
-
-	trimmed := strings.TrimSpace(prefix)
-	if trimmed == "" {
-		ms.removeLastAssistantMessage()
-		return
-	}
-
-	// Update the last assistant message in context
-	ms.session.mu.Lock()
-	defer ms.session.mu.Unlock()
-	for i := len(ms.session.Context) - 1; i >= 0; i-- {
-		msg := &ms.session.Context[i]
-		if msg.Role == "assistant" && msg.Content == ms.lastResponseText {
-			// Keep only what was actually spoken
-			msg.Content = trimmed
-			ms.session.LastAssistant = trimmed
-			ms.logger.Info("Spoken-truth context truncated",
-				"full_len", len(ms.lastResponseText), "spoken_len", len(trimmed))
-			break
+		if hasTruth {
+			// Every transcript got the whole reply as a BotResponse; this corrects it.
+			ms.emitWithGen(BotResponseTruncated, truth, gen)
 		}
 	}
 }
@@ -2586,21 +2664,6 @@ func (ms *ManagedStream) injectRagContext(ctx context.Context, transcript string
 	})
 	ms.logger.Info("RAG context injected",
 		"query_len", len(transcript), "context_len", len(contextText), "elapsed_ms", elapsed)
-}
-
-// removeLastAssistantMessage removes the most recent assistant message from
-// context (used when the bot was interrupted before speaking anything).
-func (ms *ManagedStream) removeLastAssistantMessage() {
-	ms.session.mu.Lock()
-	defer ms.session.mu.Unlock()
-	for i := len(ms.session.Context) - 1; i >= 0; i-- {
-		if ms.session.Context[i].Role == "assistant" {
-			ms.session.Context = append(ms.session.Context[:i], ms.session.Context[i+1:]...)
-			ms.session.LastAssistant = ""
-			ms.logger.Info("Removed unspoken assistant message from context")
-			return
-		}
-	}
 }
 
 func (ms *ManagedStream) cancelPipeline() {
@@ -3167,6 +3230,13 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		if !held && ms.lastDropLogGen != gen {
 			ms.lastDropLogGen = gen
 			logDrop = true
+		}
+	}
+	if eventType == AudioChunk && speaking {
+		// This chunk is going to the transport, which plays it in real time: it goes on the
+		// caller's playout clock (spoken_truth.go).
+		if chunk, ok := data.([]byte); ok {
+			ms.scheduleAudioLocked(gen, len(chunk), time.Now())
 		}
 	}
 	ms.mu.Unlock()
