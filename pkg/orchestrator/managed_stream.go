@@ -335,15 +335,18 @@ type ManagedStream struct {
 	// pausesOnBargeIn: the transport pauses its playback queue when the caller starts speaking
 	// and resumes it on BotResumed, rather than discarding it (SetTransportPausesOnBargeIn).
 	pausesOnBargeIn bool
-	curSeg          segmentRef
-	segSeq          int
-	onset           heardSnapshot
-	lastReply       replyRecord
-	mergeOnConfirm  bool
-	truthAppliedGen int
-	replyCommitMu   sync.Mutex
-	lastUtt         *committedUtterance
-	carry           *committedUtterance
+	// inflightUtterances counts processUtterance calls running (incremented in onVADEnd, before the
+	// goroutine starts). A rejected utterance uses it to tell whether StateProcessing is its own.
+	inflightUtterances int
+	curSeg             segmentRef
+	segSeq             int
+	onset              heardSnapshot
+	lastReply          replyRecord
+	mergeOnConfirm     bool
+	truthAppliedGen    int
+	replyCommitMu      sync.Mutex
+	lastUtt            *committedUtterance
+	carry              *committedUtterance
 
 	// Post-interrupt backoff: block bot output for a short window after a
 	// barge-in so it doesn't talk over the user (Vapi backoffSeconds pattern).
@@ -1236,9 +1239,22 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 // falls back to the normal idle reset. No-ops if there is no pending barge-in
 // for the current response generation (e.g. it was already confirmed, or a
 // newer turn has since started).
-func (ms *ManagedStream) resolvePendingBargeIn() {
+func (ms *ManagedStream) resolvePendingBargeIn() { ms.resolvePendingBargeInFor(false) }
+
+// resolvePendingBargeInFor is resolvePendingBargeIn called by a processUtterance that rejected its
+// own utterance (fromUtterance): onVADEnd put the stream in StateProcessing for it, and if no other
+// utterance is in flight and no reply is being generated, that state is its own to undo. Leaving it
+// made the caller's NEXT utterance a "barge-in" on a reply that did not exist, held to the barge-in
+// word count — so after any rejected noise, a one-word answer ("Sí.") was dropped.
+func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 	resumedGen := -1
 	ms.mu.Lock()
+	if !ms.pendingBargeIn && fromUtterance && ms.state == StateProcessing && ms.inflightUtterances <= 1 &&
+		(ms.pipelineCtx == nil || ms.pipelineCtx.Err() != nil) {
+		ms.state = StateIdle
+		ms.mu.Unlock()
+		return
+	}
 	if !ms.pendingBargeIn {
 		// Nothing was tentatively muted (e.g. a short/noisy utterance that
 		// never opened a barge-in at all) — normally safe to normalize back to
@@ -1567,12 +1583,20 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	}
 	ms.mu.Unlock()
 
+	ms.mu.Lock()
+	ms.inflightUtterances++
+	ms.mu.Unlock()
 	go ms.processUtterance(audioData, duration, seq)
 }
 
 func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Duration, seq int) {
 	ms.logger.Info("processUtterance: entered", "seq", seq, "duration_ms", duration.Milliseconds(), "audioBytes", len(audioData))
 	uttEndedAt := time.Now()
+	defer func() {
+		ms.mu.Lock()
+		ms.inflightUtterances--
+		ms.mu.Unlock()
+	}()
 	defer func() {
 		if r := recover(); r != nil {
 			ms.logger.Error("processUtterance: recovered panic", "panic", r)
@@ -1692,7 +1716,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// resolvePendingBargeIn emits BotResumed itself now, with the actual
 		// resulting status -- a second nil-payload emission here would just be
 		// a redundant, less-informative duplicate.
-		ms.resolvePendingBargeIn()
+		ms.resolvePendingBargeInFor(true)
 		return
 	}
 
@@ -1734,7 +1758,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		}
 		ms.logger.Info("Utterance discarded: empty transcript, resuming bot",
 			"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
-		ms.resolvePendingBargeIn()
+		ms.resolvePendingBargeInFor(true)
 		return
 	}
 
@@ -1935,7 +1959,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// Not dropped: the caller's next utterance is transcribed together with this one.
 			ms.carry = &committedUtterance{audio: uttAudio, transcript: transcript, endedAt: uttEndedAt, gen: ms.payloadGen}
 			ms.mu.Unlock()
-			ms.resolvePendingBargeIn()
+			ms.resolvePendingBargeInFor(true)
 			return
 		case <-time.After(time.Duration(waitMs) * time.Millisecond):
 			ms.mu.Lock()
@@ -2016,7 +2040,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				ms.logger.Info("Barge-in below MinWordsToInterrupt, resuming bot",
 					"transcript", ownTranscript, "word_count", countWords(ownTranscript),
 					"audio_duration_ms", duration.Milliseconds())
-				ms.resolvePendingBargeIn()
+				ms.resolvePendingBargeInFor(true)
 				return
 			}
 		} else if turnoAssisted && countWords(ownTranscript) < minWords {
@@ -2059,7 +2083,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
 				"method", "acoustic", "score", acousticScore, "lag_ms", acousticLagMs,
 				"transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
-			ms.resolvePendingBargeIn()
+			ms.resolvePendingBargeInFor(true)
 			return
 		}
 	}

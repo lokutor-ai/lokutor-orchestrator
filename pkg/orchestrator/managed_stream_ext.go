@@ -388,7 +388,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			return
 		case <-time.After(3 * time.Second):
 			if fillerSpoken.CompareAndSwap(false, true) {
-				ms.speakText(ctx, "Hmm, let me think about that for a second.", gen)
+				// In the call's language: this was English on every call, so a Spanish caller
+				// waiting on a slow model heard "Hmm, let me think about that for a second."
+				ms.speakText(ctx, thinkingFillerForLang(ms.session.GetCurrentLanguage()), gen)
 			}
 		case <-ctx.Done():
 			return
@@ -762,6 +764,31 @@ func (ms *ManagedStream) SetClientVAD(enabled bool) {
 
 // toolFillerForLang returns a short, deterministic verbal acknowledgment to speak
 // while a tool is executing. This avoids dead air without an LLM round-trip.
+// thinkingFillerForLang is what the agent says when the model has produced nothing after three
+// seconds, so the caller does not sit in silence.
+func thinkingFillerForLang(lang Language) string {
+	switch lang {
+	case LanguageEs:
+		return "Mmm, déjame pensarlo un momento."
+	case LanguageCa:
+		return "Mmm, deixa'm pensar-ho un moment."
+	case LanguageGl:
+		return "Mmm, déixame pensalo un momento."
+	case LanguageEu:
+		return "Mmm, utzi pentsatzen une batez."
+	case LanguageFr:
+		return "Hmm, laissez-moi réfléchir un instant."
+	case LanguageDe:
+		return "Hmm, lassen Sie mich kurz nachdenken."
+	case LanguageIt:
+		return "Mmm, fammi pensare un attimo."
+	case LanguagePt:
+		return "Hmm, deixa-me pensar um momento."
+	default:
+		return "Hmm, let me think about that for a second."
+	}
+}
+
 func toolFillerForLang(lang Language) string {
 	switch lang {
 	case LanguageEs:

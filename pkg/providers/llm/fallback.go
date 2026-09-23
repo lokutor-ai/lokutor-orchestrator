@@ -2,7 +2,13 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
 	orchestrator "github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
@@ -68,7 +74,38 @@ func (c *ChainLLM) Complete(ctx context.Context, messages []orchestrator.Message
 	return "", lastErr
 }
 
+// llmHedgeDelay is how long the first provider has to produce its first token before the next one
+// is started alongside it. A voice turn waits on the first token, and it is the tail that hurts:
+// on 2026-09-23 the model's first token was 265 ms at the median and 703 ms at p90, but 1.6 s,
+// 1.85 s and twice more than 3 s on individual turns — the last two long enough to trigger the
+// "let me think" filler. Racing the second provider past p90 turns those into ~p90 turns, and
+// costs a second request on only the slowest tenth of turns. LLM_HEDGE_MS overrides; 0 disables.
+func llmHedgeDelay() time.Duration {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("LLM_HEDGE_MS"))); err == nil && v >= 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return 800 * time.Millisecond
+}
+
+// errHedgeLost stops the stream of an attempt that another attempt beat to its first output.
+var errHedgeLost = errors.New("llm hedge: another provider answered first")
+
 func (c *ChainLLM) StreamComplete(
+	ctx context.Context,
+	messages []orchestrator.Message,
+	tools []orchestrator.Tool,
+	onChunk func(string) error,
+	onToolCall func(orchestrator.ToolCallEventData) error,
+) (string, error) {
+	if hedge := llmHedgeDelay(); hedge > 0 && len(c.providers) >= 2 {
+		if _, ok := c.providers[1].(orchestrator.StreamingLLMProvider); ok {
+			return c.streamHedged(ctx, messages, tools, onChunk, onToolCall, hedge)
+		}
+	}
+	return c.streamSequential(ctx, messages, tools, onChunk, onToolCall)
+}
+
+func (c *ChainLLM) streamSequential(
 	ctx context.Context,
 	messages []orchestrator.Message,
 	tools []orchestrator.Tool,
@@ -104,4 +141,137 @@ func (c *ChainLLM) StreamComplete(
 		lastErr = fmt.Errorf("no LLM providers configured in chain %q", c.name)
 	}
 	return "", lastErr
+}
+
+// streamHedged runs providers[0], starts providers[1] alongside it if no output has arrived after
+// hedge, and streams whichever produces output first; the other is cancelled. An attempt that fails
+// before producing anything falls through to the next provider, as the sequential chain does.
+func (c *ChainLLM) streamHedged(
+	ctx context.Context,
+	messages []orchestrator.Message,
+	tools []orchestrator.Tool,
+	onChunk func(string) error,
+	onToolCall func(orchestrator.ToolCallEventData) error,
+	hedge time.Duration,
+) (string, error) {
+	type result struct {
+		idx  int
+		text string
+		err  error
+	}
+	var (
+		mu      sync.Mutex
+		winner  = -1
+		cancels = make([]context.CancelFunc, len(c.providers))
+	)
+	results := make(chan result, len(c.providers))
+	running := 0
+
+	// claim makes attempt i the winner if nobody has produced output yet, cancelling the rest.
+	claim := func(i int) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if winner == -1 {
+			winner = i
+			for j, cancel := range cancels {
+				if j != i && cancel != nil {
+					cancel()
+				}
+			}
+		}
+		return winner == i
+	}
+	start := func(i int) {
+		actx, cancel := context.WithCancel(ctx)
+		mu.Lock()
+		cancels[i] = cancel
+		mu.Unlock()
+		running++
+		p := c.providers[i]
+		go func() {
+			chunk := func(s string) error {
+				if !claim(i) {
+					return errHedgeLost
+				}
+				return onChunk(s)
+			}
+			toolCall := func(tc orchestrator.ToolCallEventData) error {
+				if !claim(i) {
+					return errHedgeLost
+				}
+				return onToolCall(tc)
+			}
+			var text string
+			var err error
+			if streamer, ok := p.(orchestrator.StreamingLLMProvider); ok {
+				text, err = streamer.StreamComplete(actx, messages, tools, chunk, toolCall)
+			} else {
+				text, err = p.Complete(actx, messages, tools)
+			}
+			results <- result{i, text, err}
+		}()
+	}
+	defer func() {
+		mu.Lock()
+		for _, cancel := range cancels {
+			if cancel != nil {
+				cancel()
+			}
+		}
+		mu.Unlock()
+	}()
+
+	start(0)
+	next := 1
+	timer := time.NewTimer(hedge)
+	defer timer.Stop()
+	var lastErr error
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timer.C:
+			mu.Lock()
+			none := winner == -1
+			mu.Unlock()
+			if none && next < 2 {
+				start(next)
+				next++
+			}
+		case r := <-results:
+			running--
+			mu.Lock()
+			w := winner
+			mu.Unlock()
+			switch {
+			case w == r.idx:
+				// The winner finished, cleanly or not: its outcome is the turn's.
+				return r.text, r.err
+			case w != -1:
+				// A loser wound down after being cancelled; keep waiting for the winner.
+				continue
+			case r.err == nil:
+				// Finished without streaming anything (an empty reply, or a non-streaming
+				// provider): that is still the answer.
+				if claim(r.idx) {
+					return r.text, nil
+				}
+				continue
+			}
+			// Failed before producing anything.
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			lastErr = r.err
+			if running > 0 {
+				continue // the other attempt may still answer
+			}
+			if next < len(c.providers) && shouldFailover(r.err) {
+				start(next)
+				next++
+				continue
+			}
+			return "", lastErr
+		}
+	}
 }

@@ -388,3 +388,39 @@ func TestManagedStream_SpeechOverPlayoutIsTentativeOnPausingTransport(t *testing
 		t.Fatalf("BotResumed data = %v", ev.Data)
 	}
 }
+
+// A rejected noise utterance must not leave the stream in the StateProcessing its own onVADEnd set:
+// the next utterance would be taken for a barge-in on a reply that does not exist, and a one-word
+// answer dropped under the barge-in word count.
+func TestRejectedNoiseRestoresIdleOnlyWhenItOwnsProcessing(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		inflight int
+		want     StreamState
+	}{
+		{"alone", 1, StateIdle},
+		{"another utterance in flight", 2, StateProcessing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SilenceTimeout = 0
+			orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "Thank you."}, &sequencedLLM{}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+			session := NewConversationSession("noise-state")
+			session.CurrentLanguage = LanguageEs
+			stream := orch.NewManagedStream(context.Background(), session)
+			defer stream.Close()
+			stream.mu.Lock()
+			stream.state = StateProcessing
+			stream.utteranceSeq = 1
+			stream.inflightUtterances = tc.inflight
+			stream.mu.Unlock()
+			stream.processUtterance(make([]byte, 16000), 400*time.Millisecond, 1)
+			stream.mu.Lock()
+			got := stream.state
+			stream.mu.Unlock()
+			if got != tc.want {
+				t.Fatalf("state = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
