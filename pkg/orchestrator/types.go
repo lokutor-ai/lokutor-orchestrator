@@ -113,11 +113,11 @@ const (
 	// stop playback now and discard what is queued. Interrupted may still follow if the barge-in is
 	// confirmed; transports that pause or stop at the onset can ignore it.
 	StopPlayback EventType = "STOP_PLAYBACK"
-	AudioChunk        EventType = "AUDIO_CHUNK"
-	ToolCall          EventType = "TOOL_CALL"
-	ToolResult        EventType = "TOOL_RESULT"
-	CacheHit          EventType = "CACHE_HIT"
-	ErrorEvent        EventType = "ERROR"
+	AudioChunk   EventType = "AUDIO_CHUNK"
+	ToolCall     EventType = "TOOL_CALL"
+	ToolResult   EventType = "TOOL_RESULT"
+	CacheHit     EventType = "CACHE_HIT"
+	ErrorEvent   EventType = "ERROR"
 )
 
 type ToolCallEventData struct {
