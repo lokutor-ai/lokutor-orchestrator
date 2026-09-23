@@ -68,10 +68,10 @@ func TestPlayoutTimeline_CutAtDropsFlushedAudio(t *testing.T) {
 func TestWithInterruptionMark(t *testing.T) {
 	for in, want := range map[string]string{
 		"¿Cuándo le gustaría": "¿Cuándo le gustaría…",
-		"Perfecto.":            "Perfecto…",
-		"Hola, soy":            "Hola, soy…",
-		"   ":                  "",
-		"¡":                    "",
+		"Perfecto.":           "Perfecto…",
+		"Hola, soy":           "Hola, soy…",
+		"   ":                 "",
+		"¡":                   "",
 	} {
 		if got := withInterruptionMark(in); got != want {
 			t.Errorf("withInterruptionMark(%q) = %q, want %q", in, got, want)
