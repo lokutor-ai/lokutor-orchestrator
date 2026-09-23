@@ -331,7 +331,7 @@ type ManagedStream struct {
 	// whose heard text has been written to context; replyCommitMu orders that write against the
 	// streaming path's own commit of the reply. lastUtt / carry are the utterances a continuation is
 	// transcribed together with (see processUtterance).
-	playout         playoutTimeline
+	playout playoutTimeline
 	// pausesOnBargeIn: the transport pauses its playback queue when the caller starts speaking
 	// and resumes it on BotResumed, rather than discarding it (SetTransportPausesOnBargeIn).
 	pausesOnBargeIn bool
