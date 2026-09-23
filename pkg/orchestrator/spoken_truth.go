@@ -131,6 +131,32 @@ func (p *playoutTimeline) cutAt(at time.Time) {
 	}
 }
 
+// shiftFrom delays everything scheduled after at by d: the transport paused its queue at at and
+// resumed it d later. An interval spanning at is split.
+func (p *playoutTimeline) shiftFrom(at time.Time, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if p.end.After(at) {
+		p.end = p.end.Add(d)
+	}
+	for i := range p.segs {
+		seg := &p.segs[i]
+		var out []playoutInterval
+		for _, iv := range seg.intervals {
+			switch {
+			case !iv.start.Before(at):
+				out = append(out, playoutInterval{iv.start.Add(d), iv.end.Add(d)})
+			case iv.end.After(at):
+				out = append(out, playoutInterval{iv.start, at}, playoutInterval{at.Add(d), iv.end.Add(d)})
+			default:
+				out = append(out, iv)
+			}
+		}
+		seg.intervals = out
+	}
+}
+
 // heard is what the caller had heard of this generation at time at: every segment whose audio had
 // fully played, then the words of the segment playing at that moment in proportion to how much of its
 // audio had played (rounded down: a word half-heard is not claimed). heardDur is the audio played.
@@ -319,9 +345,23 @@ func (ms *ManagedStream) snapshotHeardAtOnsetLocked(now time.Time) {
 	s := heardSnapshot{gen: gen, seq: ms.utteranceSeq + 1, at: now}
 	if ms.playout.gen == gen {
 		s.text, s.dur, s.complete = ms.playout.heard(now)
-		ms.playout.cutAt(now)
+		if !ms.pausesOnBargeIn {
+			// The transport discards its queue: nothing scheduled after now will ever play.
+			ms.playout.cutAt(now)
+		}
 	}
 	ms.onset = s
+}
+
+// SetTransportPausesOnBargeIn declares that the transport pauses its playback queue when the caller
+// starts speaking (UserSpeaking), resumes it on BotResumed and discards it only on Interrupted. The
+// phone transport does; a browser that stops playback outright does not. With it, speech over a
+// reply that has finished synthesizing but is still playing is a tentative barge-in that a false
+// alarm resumes, instead of a cut the caller can never get back.
+func (ms *ManagedStream) SetTransportPausesOnBargeIn(v bool) {
+	ms.mu.Lock()
+	ms.pausesOnBargeIn = v
+	ms.mu.Unlock()
 }
 
 // emitBotResponse sends a reply's text as a BotResponse, remembering it so an interruption can say
@@ -492,28 +532,69 @@ func (s *ConversationSession) reviseLastUserTurn(merged string) bool {
 //
 // isBarge reports the second case, which needs the transcript and context revised after the fact.
 func (ms *ManagedStream) continuationBaseLocked(now time.Time, seq int, pendingBarge bool) (base *committedUtterance, isBarge bool) {
-	if c := ms.carry; c != nil {
-		ms.carry = nil
-		if now.Sub(c.endedAt) <= continuationMergeWindow {
-			return c, false
-		}
+	if c := ms.takeCarryLocked(now); c != nil {
+		return c, false
 	}
+	if b := ms.bargeBaseLocked(now, seq, pendingBarge); b != nil {
+		return b, true
+	}
+	return nil, false
+}
+
+// takeCarryLocked consumes the fragment the mid-thought wait abandoned, if it is recent.
+func (ms *ManagedStream) takeCarryLocked(now time.Time) *committedUtterance {
+	c := ms.carry
+	ms.carry = nil
+	if c != nil && now.Sub(c.endedAt) <= continuationMergeWindow {
+		return c
+	}
+	return nil
+}
+
+// bargeBaseLocked is the previous utterance, if the one being processed was spoken over its reply
+// before the caller heard more than continuationMergeMaxHeard of it.
+func (ms *ManagedStream) bargeBaseLocked(now time.Time, seq int, pendingBarge bool) *committedUtterance {
 	// Over a reply: either a tentative barge-in on a reply still being generated, or the caller
 	// starting to speak while a finished reply was still playing (this utterance's onset).
 	gen := ms.payloadGen
 	overReply := pendingBarge || (ms.onset.gen == gen && ms.onset.seq == seq && !ms.onset.at.IsZero())
 	u := ms.lastUtt
 	if !overReply || u == nil || now.Sub(u.endedAt) > continuationMergeWindow {
-		return nil, false
+		return nil
 	}
 	// The reply being interrupted must be the answer to u: allocated after u was committed.
 	if gen <= u.gen {
-		return nil, false
+		return nil
 	}
 	if ms.onset.gen != gen || ms.onset.at.IsZero() || ms.onset.dur > continuationMergeMaxHeard() {
-		return nil, false
+		return nil
 	}
-	return u, true
+	return u
+}
+
+// acceptMerged reports whether a joint transcription of two halves is plausibly better than the
+// continuation alone. A recogniser handed a noisy first half can return less than it did for the
+// second half by itself ("Gracias." + "Gracias." came back as "Oh"); that is not a merge.
+func acceptMerged(merged, continuation string) bool {
+	// Both halves are in it, so it must say more than the second half alone.
+	return merged != "" && countWords(merged) > countWords(continuation)
+}
+
+// transcribeJoined transcribes base and this utterance's audio as one.
+func (ms *ManagedStream) transcribeJoined(ctx context.Context, base *committedUtterance, audio []byte, own string, overReply bool) (merged string, joined []byte, ok bool) {
+	joined = joinUtteranceAudio(base.audio, audio, int(ms.inputSampleRate))
+	res, err := ms.orch.Transcribe(ctx, joined, ms.session.GetCurrentLanguage())
+	merged = strings.TrimSpace(res.Text)
+	if err != nil || !acceptMerged(merged, own) {
+		ms.logger.Info("Continuation: joint transcription not used, keeping the two halves separate",
+			"previous", base.transcript, "continuation", own, "merged", merged, "error", err)
+		return "", nil, false
+	}
+	merged = restoreQuestionMark(merged, ms.session.GetCurrentLanguage())
+	ms.logger.Info("Continuation: transcribed together with the previous utterance",
+		"previous", base.transcript, "continuation", own, "merged", merged,
+		"over_reply", overReply, "joined_ms", len(joined)*1000/(int(ms.inputSampleRate)*2))
+	return merged, joined, true
 }
 
 // noteSpeechOverPlayout handles the caller starting to speak while a reply whose synthesis has

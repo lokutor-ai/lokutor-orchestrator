@@ -320,3 +320,71 @@ func TestManagedStream_InterruptRecordsWhatWasHeard(t *testing.T) {
 		t.Fatalf("context must hold what was heard, got %+v", last)
 	}
 }
+
+func TestPlayoutTimeline_ShiftFromIsAPause(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	var p playoutTimeline
+	p.schedule(1, 1, "uno dos tres cuatro", t0, time.Second)
+	// Paused at 0.5 s for 2 s: the second half plays from 2.5 s to 3 s.
+	p.shiftFrom(t0.Add(500*time.Millisecond), 2*time.Second)
+	if text, dur, _ := p.heard(t0.Add(2 * time.Second)); text != "uno dos" || dur != 500*time.Millisecond {
+		t.Fatalf("during the pause: %q %v", text, dur)
+	}
+	if text, _, complete := p.heard(t0.Add(3 * time.Second)); !complete || text != "uno dos tres cuatro" {
+		t.Fatalf("after the pause: %q complete=%v", text, complete)
+	}
+	if !p.end.Equal(t0.Add(3 * time.Second)) {
+		t.Fatalf("end not shifted: %v", p.end.Sub(t0))
+	}
+}
+
+func TestAcceptMerged(t *testing.T) {
+	if acceptMerged("Oh", "Gracias.") {
+		t.Fatalf("a merge shorter than the continuation alone is worse, not better")
+	}
+	if !acceptMerged("Bueno, esto no ha parado, espérate. Hola, sí.", "I see.") {
+		t.Fatalf("a longer joint transcription is the merge")
+	}
+	if acceptMerged("", "x") {
+		t.Fatalf("empty")
+	}
+}
+
+// On a transport that pauses its queue, speaking over a reply that has finished synthesizing but
+// is still playing is a tentative barge-in, and a false alarm resumes it (BotResumed "speaking")
+// rather than leaving the rest of the reply silent.
+func TestManagedStream_SpeechOverPlayoutIsTentativeOnPausingTransport(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "hi"}, &sequencedLLM{responses: []string{"Uno dos tres cuatro."}}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("pause"))
+	defer stream.Close()
+	stream.SetPlaybackRate(16000)
+	stream.SetTransportPausesOnBargeIn(true)
+
+	stream.runLLMAndTTS(context.Background(), "cuenta") // synthesis done; one second still to play
+	time.Sleep(300 * time.Millisecond)
+	stream.mu.Lock()
+	idle := stream.state == StateIdle
+	stream.mu.Unlock()
+	if !idle {
+		t.Fatalf("expected Idle after synthesis")
+	}
+	stream.onVADStart(StateIdle)
+	stream.mu.Lock()
+	pending := stream.pendingBargeIn && stream.pendingBargeGen == stream.payloadGen
+	heard := stream.onset.dur
+	stream.vadSpeaking = false
+	stream.mu.Unlock()
+	if !pending {
+		t.Fatalf("speech over playout must open a tentative barge-in on a pausing transport")
+	}
+	if heard < 200*time.Millisecond || heard > 500*time.Millisecond {
+		t.Fatalf("heard at onset = %v, want ~300ms", heard)
+	}
+	stream.resolvePendingBargeIn()
+	ev := waitForEventType(t, stream, BotResumed, 2*time.Second)
+	if s, _ := ev.Data.(string); s != "speaking" {
+		t.Fatalf("BotResumed data = %v", ev.Data)
+	}
+}

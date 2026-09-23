@@ -54,7 +54,11 @@ func TestResolvePendingBargeInEmitsBotResumedWithCorrectStatus(t *testing.T) {
 				stream.ttsCancel = func() {}
 			}
 			if tc.pipeAlive {
-				stream.pipelineCancel = func() {}
+				// A live turn: runLLMAndTTS always sets the context and its cancel together.
+				pctx, pcancel := context.WithCancel(context.Background())
+				defer pcancel()
+				stream.pipelineCtx = pctx
+				stream.pipelineCancel = pcancel
 			}
 			stream.mu.Unlock()
 

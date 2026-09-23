@@ -332,6 +332,9 @@ type ManagedStream struct {
 	// streaming path's own commit of the reply. lastUtt / carry are the utterances a continuation is
 	// transcribed together with (see processUtterance).
 	playout         playoutTimeline
+	// pausesOnBargeIn: the transport pauses its playback queue when the caller starts speaking
+	// and resumes it on BotResumed, rather than discarding it (SetTransportPausesOnBargeIn).
+	pausesOnBargeIn bool
 	curSeg          segmentRef
 	segSeq          int
 	onset           heardSnapshot
@@ -1174,7 +1177,30 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	ms.mu.Unlock()
 
 	if prevState != StateSpeaking && prevState != StateProcessing {
-		ms.noteSpeechOverPlayout(time.Now())
+		// Synthesis finishes long before playback does, so the stream can be Idle while the caller
+		// is still hearing the reply. A transport that pauses its queue can resume it, so this is a
+		// tentative barge-in like any other — held to the same word-count and echo checks, and
+		// resumed on a false alarm. One that discards its queue cannot, so what was heard is
+		// settled now.
+		now := time.Now()
+		ms.mu.Lock()
+		overPlayout := ms.playout.gen == ms.payloadGen && ms.playout.end.After(now)
+		pauses := ms.pausesOnBargeIn
+		if overPlayout && pauses {
+			ms.pendingBargeIn = true
+			ms.pendingBargeGen = ms.payloadGen
+			ms.turnoBargeinPeakScore = 0
+			gen := ms.payloadGen
+			ms.snapshotHeardAtOnsetLocked(now)
+			ms.mu.Unlock()
+			ms.resetNearEndEcho(gen)
+			ms.emit(UserSpeaking, nil)
+			return
+		}
+		ms.mu.Unlock()
+		if overPlayout {
+			ms.noteSpeechOverPlayout(now)
+		}
 	}
 
 	if prevState == StateSpeaking || prevState == StateProcessing {
@@ -1276,6 +1302,13 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 	}
 
 	ms.pendingBargeIn = false
+	// A transport that paused its queue at the onset resumes it now: everything scheduled after
+	// the onset plays that much later (spoken_truth.go).
+	resumePlayout := false
+	if ms.pausesOnBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.at.IsZero() {
+		ms.playout.shiftFrom(ms.onset.at, time.Since(ms.onset.at))
+		resumePlayout = !ms.onset.complete
+	}
 
 	// onVADStart already told the client "listening" the moment this barge-in
 	// looked tentatively real (see the emit(UserSpeaking, ...) above it) —
@@ -1291,13 +1324,20 @@ func (ms *ManagedStream) resolvePendingBargeIn() {
 		ms.state = StateSpeaking
 		resumedGen = ms.payloadGen
 		resumedStatus = "speaking"
-	case ms.pipelineCancel != nil:
+	case ms.pipelineCancel != nil && ms.pipelineCtx != nil && ms.pipelineCtx.Err() == nil:
+		// A turn still in flight (the reply is being generated). pipelineCancel alone is not
+		// that: it stays set after a turn finishes, so a false alarm over a finished reply used to
+		// land here and leave the stream in Processing with nothing running.
 		ms.state = StateProcessing
 		resumedStatus = "thinking"
 	default:
 		ms.state = StateIdle
 		// Nothing is left to play into, so nothing should be kept.
 		ms.discardHeldAudioLocked()
+		if resumePlayout {
+			// Synthesis had finished, but the paused transport still holds the rest of the reply.
+			resumedStatus = "speaking"
+		}
 	}
 	ms.mu.Unlock()
 
@@ -1704,38 +1744,21 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// Transcribed apart, the second half loses the first as context ("Grillo" without "Pito") and
 	// both show as separate turns. So transcribe them together. The barge-in checks further down
 	// still judge the continuation on its own words: they decide whether the NEW speech is real.
+	//
+	// The fragment the mid-thought wait abandoned is joined here, before that wait runs again, so
+	// the wait judges the whole sentence. A merge over a reply is joined later, only once the
+	// barge-in checks have accepted the continuation as real speech: joining noise wastes a
+	// transcription and makes the result worse.
 	ownTranscript := transcript
 	uttAudio := audioData
 	var revisedFrom *committedUtterance
 	ms.mu.Lock()
-	pendingBargeNow := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
-	contBase, contIsBarge := ms.continuationBaseLocked(time.Now(), seq, pendingBargeNow)
+	carryBase := ms.takeCarryLocked(time.Now())
 	ms.mu.Unlock()
-	if contBase != nil && contIsBarge {
-		ms.session.mu.Lock()
-		_, tailOK := mergeableTail(ms.session.Context)
-		ms.session.mu.Unlock()
-		if !tailOK {
-			contBase = nil
-		}
-	}
-	if contBase != nil {
-		joined := joinUtteranceAudio(contBase.audio, audioData, int(ms.inputSampleRate))
-		res, jerr := ms.orch.Transcribe(ctx, joined, ms.session.GetCurrentLanguage())
-		merged := strings.TrimSpace(res.Text)
-		if jerr == nil && merged != "" {
-			merged = restoreQuestionMark(merged, ms.session.GetCurrentLanguage())
-			ms.logger.Info("Continuation: transcribed together with the previous utterance",
-				"previous", contBase.transcript, "continuation", ownTranscript, "merged", merged,
-				"over_reply", contIsBarge, "joined_ms", len(joined)*1000/(int(ms.inputSampleRate)*2))
+	if carryBase != nil {
+		if merged, joined, ok := ms.transcribeJoined(ctx, carryBase, audioData, ownTranscript, false); ok {
 			transcript = merged
 			uttAudio = joined
-			if contIsBarge {
-				revisedFrom = contBase
-			}
-		} else {
-			ms.logger.Warn("Continuation: joint transcription failed, keeping the two halves separate",
-				"previous", contBase.transcript, "continuation", ownTranscript, "error", jerr)
 		}
 	}
 
@@ -2044,12 +2067,24 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.ckGateMs = time.Since(ms.sttEndTime).Milliseconds()
 	ms.mu.Unlock()
 
-	// A merge over a reply needs that reply still pending to be cut: if the barge-in was resolved
-	// some other way in the meantime, the halves stay separate.
-	if revisedFrom != nil && !pendingBarge {
-		revisedFrom = nil
-		transcript = ownTranscript
-		uttAudio = audioData
+	// The barge-in checks accepted this as real speech. If the caller had heard next to nothing of
+	// the reply they spoke over, this utterance continues their previous one: join them.
+	if carryBase == nil {
+		ms.mu.Lock()
+		bargeBase := ms.bargeBaseLocked(time.Now(), seq, pendingBarge)
+		ms.mu.Unlock()
+		if bargeBase != nil {
+			ms.session.mu.Lock()
+			_, tailOK := mergeableTail(ms.session.Context)
+			ms.session.mu.Unlock()
+			if tailOK {
+				if merged, joined, ok := ms.transcribeJoined(ctx, bargeBase, audioData, ownTranscript, true); ok {
+					transcript = merged
+					uttAudio = joined
+					revisedFrom = bargeBase
+				}
+			}
+		}
 	}
 
 	// Real, sufficient speech — commit to the interrupt now (cancels the old
@@ -2787,6 +2822,10 @@ var recogniserFillers = map[string]bool{
 	"uh": true, "um": true, "hmm": true, "mm": true,
 	"thanks for watching": true, "thank you for watching": true,
 	"subtitles by the amara.org community": true,
+	// Added 2026-09-23 from a Spanish phone call: 280–700 ms fragments came back as each of
+	// these, and "Yeah." was answered as a turn. Deliberately not "no" or "sí": both are words.
+	"yeah": true, "yep": true, "i see": true, "i guess": true, "so i know": true,
+	"i know": true, "oh": true, "so": true, "right": true, "alright": true, "all right": true,
 }
 
 // isRecogniserFiller reports whether a transcript is one of those fallbacks rather
