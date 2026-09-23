@@ -424,3 +424,120 @@ func TestRejectedNoiseRestoresIdleOnlyWhenItOwnsProcessing(t *testing.T) {
 		})
 	}
 }
+
+// drainUntil collects events for d and reports which types arrived.
+func drainUntil(stream *ManagedStream, d time.Duration) map[EventType]OrchestratorEvent {
+	seen := map[EventType]OrchestratorEvent{}
+	deadline := time.After(d)
+	for {
+		select {
+		case ev := <-stream.Events():
+			seen[ev.Type] = ev
+		case <-deadline:
+			return seen
+		}
+	}
+}
+
+func playThroughStream(t *testing.T) *ManagedStream {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "hi"}, &sequencedLLM{responses: []string{"Uno dos tres cuatro."}}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("playthrough"))
+	t.Cleanup(stream.Close)
+	stream.SetPlaybackRate(16000)
+	stream.SetTransportPlaysThroughBargeIn(true)
+	stream.runLLMAndTTS(context.Background(), "cuenta") // synthesis done; one second still to play
+	time.Sleep(300 * time.Millisecond)
+	drainUntil(stream, 50*time.Millisecond)
+	return stream
+}
+
+// 2026-09-23, web: a 217 ms blip 1 s into the greeting, transcribed as nothing, cut the greeting for
+// good because the browser was told to stop at the onset. On a play-through transport the blip is a
+// tentative barge-in: nothing is stopped, the reply is not cut, and the false alarm is only a status.
+func TestManagedStream_PlayThrough_BlipNeverCutsTheReply(t *testing.T) {
+	stream := playThroughStream(t)
+	stream.onVADStart(StateIdle)
+	stream.mu.Lock()
+	pending := stream.pendingBargeIn && stream.pendingBargeGen == stream.payloadGen
+	stillPlaying := stream.playout.end.After(time.Now())
+	stream.vadSpeaking = false
+	stream.mu.Unlock()
+	if !pending {
+		t.Fatalf("speech over playout must be a tentative barge-in on a play-through transport")
+	}
+	if !stillPlaying {
+		t.Fatalf("the onset cut the playout timeline; the transport is still playing")
+	}
+	stream.stopPlayThroughIfDue(time.Now()) // 0 ms of speech: not due
+	stream.resolvePendingBargeIn()
+	seen := drainUntil(stream, 300*time.Millisecond)
+	for _, bad := range []EventType{StopPlayback, Interrupted, BotResponseTruncated} {
+		if _, ok := seen[bad]; ok {
+			t.Fatalf("a false alarm emitted %v", bad)
+		}
+	}
+	if ev, ok := seen[BotResumed]; !ok || ev.Data != "speaking" {
+		t.Fatalf("BotResumed = %+v (seen %v)", ev, ok)
+	}
+}
+
+// A caller who keeps talking over the reply stops it once they pass the window, and what they heard
+// is settled at that moment — not at the onset, since the transport kept playing until told.
+func TestManagedStream_PlayThrough_SustainedSpeechStopsPlayback(t *testing.T) {
+	t.Setenv("BARGE_IN_PLAYTHROUGH_MS", "150")
+	stream := playThroughStream(t)
+	stream.onVADStart(StateIdle)
+	stream.mu.Lock()
+	onsetHeard := stream.onset.dur
+	stream.mu.Unlock()
+
+	time.Sleep(200 * time.Millisecond)
+	stream.stopPlayThroughIfDue(time.Now())
+	seen := drainUntil(stream, 300*time.Millisecond)
+	if _, ok := seen[StopPlayback]; !ok {
+		t.Fatalf("sustained speech over the reply did not stop playback (seen %v)", seen)
+	}
+	stream.mu.Lock()
+	stopped, heard := stream.onset.stopped, stream.onset.dur
+	cut := !stream.playout.end.After(time.Now())
+	stream.mu.Unlock()
+	if !stopped || !cut {
+		t.Fatalf("stopped=%v cut=%v", stopped, cut)
+	}
+	if heard < onsetHeard+150*time.Millisecond {
+		t.Fatalf("heard %v at the stop, %v at the onset: the reply played on in between", heard, onsetHeard)
+	}
+	if _, ok := seen[BotResponseTruncated]; !ok {
+		t.Fatalf("the cut reply was not corrected to what was heard")
+	}
+	// Once stopped it stays stopped: a second check emits nothing.
+	stream.stopPlayThroughIfDue(time.Now())
+	if _, ok := drainUntil(stream, 100*time.Millisecond)[StopPlayback]; ok {
+		t.Fatalf("StopPlayback emitted twice")
+	}
+}
+
+// 2026-09-23, English web session: "Okay." said with the floor was discarded as noise, and so was
+// every repeat. With nothing to resume it is the caller's turn.
+func TestProcessUtterance_EnglishShortReplyWithTheFloorIsATurn(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "Okay."}, &sequencedLLM{responses: []string{"Great."}}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+	session := NewConversationSession("okay")
+	session.CurrentLanguage = LanguageEn
+	stream := orch.NewManagedStream(context.Background(), session)
+	defer stream.Close()
+	stream.mu.Lock()
+	stream.state = StateProcessing
+	stream.utteranceSeq = 1
+	stream.inflightUtterances = 1
+	stream.mu.Unlock()
+	stream.processUtterance(make([]byte, 16000), 413*time.Millisecond, 1)
+	ev := waitForEventType(t, stream, TranscriptFinal, 3*time.Second)
+	if ev.Data != "Okay." {
+		t.Fatalf("TranscriptFinal = %v", ev.Data)
+	}
+}

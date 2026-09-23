@@ -309,6 +309,9 @@ type heardSnapshot struct {
 	text     string
 	dur      time.Duration
 	complete bool
+	// stopped: a transport that plays through a barge-in has been told to stop (StopPlayback), and
+	// text/dur/complete are what was heard at that moment rather than at the onset.
+	stopped bool
 }
 
 // replyRecord is the text last sent to transports as a BotResponse, and for which generation.
@@ -338,19 +341,91 @@ func (ms *ManagedStream) scheduleAudioLocked(gen, n int, now time.Time) {
 }
 
 // snapshotHeardAtOnsetLocked records what the caller had heard of the current reply at now, the
-// moment they started speaking over it (ms.mu held). The transport flushes its queue at this moment,
-// so nothing scheduled later on the timeline was played.
+// moment they started speaking over it (ms.mu held). A transport that stops outright flushes its
+// queue at this moment, so nothing scheduled later on the timeline was played; one that pauses holds
+// it, and one that plays through keeps playing until stopTransportPlayThrough or a confirmation.
 func (ms *ManagedStream) snapshotHeardAtOnsetLocked(now time.Time) {
 	gen := ms.payloadGen
 	s := heardSnapshot{gen: gen, seq: ms.utteranceSeq + 1, at: now}
 	if ms.playout.gen == gen {
 		s.text, s.dur, s.complete = ms.playout.heard(now)
-		if !ms.pausesOnBargeIn {
+		if !ms.pausesOnBargeIn && !ms.playsThroughBargeIn {
 			// The transport discards its queue: nothing scheduled after now will ever play.
 			ms.playout.cutAt(now)
 		}
 	}
 	ms.onset = s
+}
+
+// rereadHeardForPlayThroughLocked updates the onset snapshot to what the caller has heard by now, for
+// a transport that kept playing through the barge-in and has not been stopped yet (ms.mu held).
+func (ms *ManagedStream) rereadHeardForPlayThroughLocked(now time.Time) {
+	gen := ms.payloadGen
+	if !ms.playsThroughBargeIn || ms.onset.gen != gen || ms.onset.at.IsZero() || ms.onset.stopped {
+		return
+	}
+	if ms.playout.gen == gen {
+		ms.onset.text, ms.onset.dur, ms.onset.complete = ms.playout.heard(now)
+	}
+}
+
+// playThroughStopAfter is how long a caller must keep talking over the agent before a transport that
+// plays through tentative barge-ins is told to stop. Measured from VAD's own speech start, which
+// already sits a confirmation window after the caller's first sound. Env BARGE_IN_PLAYTHROUGH_MS.
+func playThroughStopAfter() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("BARGE_IN_PLAYTHROUGH_MS")); err == nil && v >= 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return 400 * time.Millisecond
+}
+
+// stopPlayThroughIfDue tells a play-through transport to stop once the caller has kept talking over
+// the reply for playThroughStopAfter (StopPlayback). The transport discards what it holds, so what
+// was heard is settled at this moment — as it is at the onset for a transport that stops outright,
+// only later: a blip too short to reach this point never cost the caller any of the reply.
+func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
+	ms.mu.Lock()
+	gen := ms.payloadGen
+	if !ms.playsThroughBargeIn || !ms.pendingBargeIn || ms.pendingBargeGen != gen ||
+		ms.onset.gen != gen || ms.onset.at.IsZero() || ms.onset.stopped ||
+		now.Sub(ms.onset.at) < playThroughStopAfter() {
+		ms.mu.Unlock()
+		return
+	}
+	talkedMs := now.Sub(ms.onset.at).Milliseconds()
+	ms.onset.stopped = true
+	var tr TruncatedResponse
+	settle := false
+	if ms.playout.gen == gen {
+		ms.onset.text, ms.onset.dur, ms.onset.complete = ms.playout.heard(now)
+		ms.playout.cutAt(now)
+		// With no turn in flight the reply was over and only playing out: settle what was heard now,
+		// as noteSpeechOverPlayout does. A turn still in flight settles on its own interrupt.
+		if ms.truthAppliedGen != gen && (ms.pipelineCtx == nil || ms.pipelineCtx.Err() != nil) {
+			tr, settle = ms.spokenTruthLocked(now)
+		}
+	}
+	ms.mu.Unlock()
+	ms.logger.Info("Caller kept talking over the agent: stopping playback", "talked_ms", talkedMs)
+	ms.emitWithGen(StopPlayback, nil, gen)
+	if settle && !(tr.Emitted && tr.Spoken == strings.TrimSpace(tr.Full)) {
+		ms.applySpokenTruthToContext(gen, tr)
+		ms.emitWithGen(BotResponseTruncated, tr, gen)
+	}
+}
+
+// SetTransportPlaysThroughBargeIn declares that the transport keeps playing when the caller starts
+// speaking over the agent and stops only when told: StopPlayback once they have kept talking for
+// BARGE_IN_PLAYTHROUGH_MS (400 ms), or Interrupted when the barge-in is confirmed. A false alarm
+// (BotResumed) never interrupted anything. For a transport that can only discard its queue — a
+// browser — this is what keeps a cough, a click or the agent's own echo from cutting a reply for
+// good: every speech onset used to stop playback outright, and a 217 ms blip 1 s into a greeting,
+// transcribed as nothing, cut the greeting at 13 of 175 characters (2026-09-23). Openings suffer most,
+// because the browser's echo canceller has not adapted yet in the first second of a call.
+func (ms *ManagedStream) SetTransportPlaysThroughBargeIn(v bool) {
+	ms.mu.Lock()
+	ms.playsThroughBargeIn = v
+	ms.mu.Unlock()
 }
 
 // SetTransportPausesOnBargeIn declares that the transport pauses its playback queue when the caller

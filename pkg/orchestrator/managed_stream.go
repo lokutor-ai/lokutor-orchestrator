@@ -335,6 +335,9 @@ type ManagedStream struct {
 	// pausesOnBargeIn: the transport pauses its playback queue when the caller starts speaking
 	// and resumes it on BotResumed, rather than discarding it (SetTransportPausesOnBargeIn).
 	pausesOnBargeIn bool
+	// playsThroughBargeIn: the transport keeps playing through a tentative barge-in and stops only
+	// when told — StopPlayback or Interrupted (SetTransportPlaysThroughBargeIn).
+	playsThroughBargeIn bool
 	// inflightUtterances counts processUtterance calls running (incremented in onVADEnd, before the
 	// goroutine starts). A rejected utterance uses it to tell whether StateProcessing is its own.
 	inflightUtterances int
@@ -785,6 +788,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		ms.closeConfirmationGateIfOpen()
 		ms.userAudio = append(ms.userAudio, chunk...)
 		ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+		ms.stopPlayThroughIfDue(time.Now())
 
 		// Feed audio to streaming STT for incremental processing
 		if ms.sttStarted && ms.sttAudioChan != nil {
@@ -1188,8 +1192,8 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 		now := time.Now()
 		ms.mu.Lock()
 		overPlayout := ms.playout.gen == ms.payloadGen && ms.playout.end.After(now)
-		pauses := ms.pausesOnBargeIn
-		if overPlayout && pauses {
+		tentative := ms.pausesOnBargeIn || ms.playsThroughBargeIn
+		if overPlayout && tentative {
 			ms.pendingBargeIn = true
 			ms.pendingBargeGen = ms.payloadGen
 			ms.turnoBargeinPeakScore = 0
@@ -1324,6 +1328,9 @@ func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 	if ms.pausesOnBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.at.IsZero() {
 		ms.playout.shiftFrom(ms.onset.at, time.Since(ms.onset.at))
 		resumePlayout = !ms.onset.complete
+	} else if ms.playsThroughBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.stopped {
+		// It never stopped: the reply is still playing if its audio has not run out.
+		resumePlayout = ms.playout.gen == ms.payloadGen && ms.playout.end.After(time.Now())
 	}
 
 	// onVADStart already told the client "listening" the moment this barge-in
@@ -1428,6 +1435,9 @@ func (ms *ManagedStream) confirmBargeInIfPending() {
 		// has talked over, and playing them now is precisely what a barge-in is
 		// meant to prevent.
 		ms.discardHeldAudioLocked()
+		// A transport that played through the barge-in stops now (on the Interrupted that
+		// handleInterrupt emits), so the caller heard the reply up to this moment, not the onset.
+		ms.rereadHeardForPlayThroughLocked(time.Now())
 	}
 	ms.mu.Unlock()
 	if pending {
@@ -1717,6 +1727,34 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// resulting status -- a second nil-payload emission here would just be
 		// a redundant, less-informative duplicate.
 		ms.resolvePendingBargeInFor(true)
+		return
+	}
+
+	// A filler phrase ("Thank you.", "Okay.", "Yeah.") is either the caller's short reply or what the
+	// recogniser falls back to on too little signal; recogniserFillerVerdict tells them apart by who
+	// had the floor and the call's language.
+	var lang Language
+	if ms.session != nil {
+		lang = ms.session.GetCurrentLanguage()
+	}
+	ms.mu.Lock()
+	overAgent := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
+	ms.mu.Unlock()
+	switch recogniserFillerVerdict(result.Text, lang, duration, overAgent) {
+	case fillerDiscard:
+		ms.logger.Info("Utterance discarded as noise, resuming bot",
+			"transcript", result.Text, "reason", "recogniser_filler", "over_agent", overAgent,
+			"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
+		ms.resolvePendingBargeInFor(true)
+		return
+	case fillerAskRepeat:
+		ms.logger.Warn("Recogniser returned a filler phrase for a long utterance — asking the caller to repeat",
+			"transcript", result.Text, "audio_duration_ms", duration.Milliseconds())
+		ms.mu.Lock()
+		ms.payloadGen++
+		gen := ms.payloadGen
+		ms.mu.Unlock()
+		ms.speakResponse(ctx, notHeardPrompt(lang), gen)
 		return
 	}
 
@@ -2823,69 +2861,100 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 	if audioDuration < 300*time.Millisecond && len(clean) <= 1 {
 		return true
 	}
-	var lang Language
-	if ms.session != nil {
-		lang = ms.session.GetCurrentLanguage()
-	}
-	if isRecogniserFiller(clean, lang, audioDuration) {
-		return true
-	}
 	return false
 }
 
 // recogniserFillers are the short English phrases Parakeet emits when handed too
 // little signal to work with. They are not transcription errors in the ordinary
 // sense — nothing like them was said — they are what the model falls back to, and
-// the same handful recurs across the industry ("thank you" above all).
+// the same handful recurs across the industry ("thank you" above all). Most of them
+// are also perfectly ordinary things for a caller to say, which is the whole
+// difficulty: see recogniserFillerVerdict.
 //
 // Compared case-insensitively with surrounding punctuation stripped, so entries
 // here carry none of their own.
-var recogniserFillers = map[string]bool{
-	"thank you": true, "thanks": true, "you": true,
-	"bye": true, "okay": true, "ok": true,
-	"uh": true, "um": true, "hmm": true, "mm": true,
-	"thanks for watching": true, "thank you for watching": true,
-	"subtitles by the amara.org community": true,
+var recogniserFillers = map[string]fillerKind{
+	"thank you": fillerReply, "thanks": fillerReply, "you": fillerReply,
+	"bye": fillerReply, "okay": fillerReply, "ok": fillerReply,
+	"uh": fillerHesitation, "um": fillerHesitation, "hmm": fillerHesitation, "mm": fillerHesitation,
+	"thanks for watching": fillerCaption, "thank you for watching": fillerCaption,
+	"subtitles by the amara.org community": fillerCaption,
 	// Added 2026-09-23 from a Spanish phone call: 280–700 ms fragments came back as each of
 	// these, and "Yeah." was answered as a turn. Deliberately not "no" or "sí": both are words.
-	"yeah": true, "yep": true, "i see": true, "i guess": true, "so i know": true,
-	"i know": true, "oh": true, "so": true, "right": true, "alright": true, "all right": true,
+	"yeah": fillerReply, "yep": fillerReply, "i see": fillerReply, "i guess": fillerReply,
+	"so i know": fillerReply, "i know": fillerReply, "oh": fillerReply, "so": fillerReply,
+	"right": fillerReply, "alright": fillerReply, "all right": fillerReply,
 }
 
-// isRecogniserFiller reports whether a transcript is one of those fallbacks rather
-// than something the caller said.
+// fillerKind is how plausible a filler phrase is as something a caller actually said.
+type fillerKind int
+
+const (
+	// fillerReply: a short reply people really give ("okay", "thank you", "yeah").
+	fillerReply fillerKind = iota + 1
+	// fillerHesitation: a sound made while thinking. Never a turn on its own.
+	fillerHesitation
+	// fillerCaption: subtitle-corpus boilerplate nobody says in under a second.
+	fillerCaption
+)
+
+// fillerVerdict is what processUtterance does with a transcript.
+type fillerVerdict int
+
+const (
+	fillerNone      fillerVerdict = iota // not a filler phrase: an ordinary turn
+	fillerTurn                           // a filler phrase the caller plausibly said: an ordinary turn
+	fillerDiscard                        // dropped; the agent carries on with what it was doing
+	fillerAskRepeat                      // the recogniser failed on real speech: ask the caller to repeat
+)
+
+// recogniserFillerVerdict decides whether a filler-phrase transcript is something the caller said
+// or something the recogniser made up. overAgent is whether the caller spoke over the agent — a
+// tentative barge-in is pending, so dropping the utterance resumes the reply rather than leaving
+// silence.
 //
-// Measured on production: 440ms of a Spanish caller's opening word came back as
-// "Thank you.", which fired a complete turn — the agent answered "De nada.", began
-// speaking it, and the caller's actual continuing sentence then registered as a
-// barge-in on that reply. The caller heard nothing and had answered nothing. The
-// existing guards all passed it: energy was high (RMS 0.21, well over
-// PARAKEET_MIN_RMS), no_speech_prob was low, and at 10 characters it cleared the
-// short-transcript check.
+// Why it depends on who had the floor. The rule used to be the phrase and the audio length alone: in
+// a non-English call always rejected; in English, rejected under 700 ms. Its justification was that
+// a wrongly rejected "thanks" "costs one missed turn the caller can simply repeat". On a real English
+// session (2026-09-23) it cost the whole conversation: a spoken "Okay", "Yeah" or "Thank you" runs
+// 300–650 ms, so each one was dropped, the repeat was dropped the same way, and the agent sat silent
+// through eight single-word turns in a row. The drop is deterministic; repeating never helps.
 //
-// An English filler phrase in a non-English call is essentially always this, so it
-// is rejected outright. In an English call the phrase is genuinely sayable, so it
-// needs the corroborating signal of implausibly short audio — nobody says "thanks
-// for watching" in 400ms. The asymmetric cost justifies the asymmetric rule: a
-// wrongly rejected "thanks" costs one missed turn the caller can simply repeat,
-// while a wrongly accepted one spends a whole turn answering a phantom and then
-// talks over the caller's real sentence.
-func isRecogniserFiller(transcript string, lang Language, audioDuration time.Duration) bool {
+// Over the agent, dropping costs nothing — the reply resumes — and a short "yeah"/"okay" there is a
+// backchannel, not a request for the floor. So every filler is dropped there, in any language. With
+// the floor, silence is the worst answer this system can give, so:
+//   - English (or auto-detect, where the caller may be speaking English): a reply-like filler is a
+//     turn. The failure this guarded — a caller's opening word misheard as "Thank you" and answered
+//     while their sentence continued — is now caught downstream: the continuation merge
+//     (spoken_truth.go) joins the two halves and drops the barely-heard reply.
+//   - Any other language: an English phrase is essentially never what was said (440 ms of a Spanish
+//     caller's opening word came back as "Thank you."). Short, it is dropped as before; at a second or
+//     more the caller said something real the recogniser could not read, which is the long empty
+//     transcript's case, and gets the same answer: ask them to repeat.
+//
+// Hesitations are never a turn by themselves. Caption boilerplate keeps the old corroboration: in
+// English it counts only when the audio is long enough to have said it.
+func recogniserFillerVerdict(transcript string, lang Language, audioDuration time.Duration, overAgent bool) fillerVerdict {
 	norm := strings.ToLower(strings.TrimSpace(transcript))
 	norm = strings.TrimFunc(norm, func(r rune) bool {
 		return unicode.IsPunct(r) || unicode.IsSpace(r)
 	})
-	if norm == "" || !recogniserFillers[norm] {
-		return false
+	kind := recogniserFillers[norm]
+	if norm == "" || kind == 0 {
+		return fillerNone
 	}
-	// An empty language is auto-detect, not "not English" — GetCurrentLanguage
-	// returns "" for "auto"/"na". The caller may well be speaking English, so it
-	// takes the same corroboration an English session does rather than the
-	// outright rejection a known non-English session gets.
-	if lang != LanguageEn && lang != "" {
-		return true
+	english := lang == LanguageEn || lang == ""
+	switch {
+	case overAgent, kind == fillerHesitation:
+		return fillerDiscard
+	case !english && audioDuration >= time.Second:
+		return fillerAskRepeat
+	case !english:
+		return fillerDiscard
+	case kind == fillerCaption && audioDuration < 700*time.Millisecond:
+		return fillerDiscard
 	}
-	return audioDuration < 700*time.Millisecond
+	return fillerTurn
 }
 
 func countWords(s string) int {
