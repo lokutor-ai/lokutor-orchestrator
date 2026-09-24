@@ -30,16 +30,15 @@ func TestSession_Defaults(t *testing.T) {
 // Message history & trimming
 // ---------------------------------------------------------------------------
 
-func TestSession_AddMessageTrimsToMax(t *testing.T) {
+func TestSession_AddMessageNeverDrops(t *testing.T) {
 	s := newTestSession()
 	s.MaxMessages = 5
 
 	for i := 0; i < 12; i++ {
 		s.AddMessage("user", "msg")
 	}
-	assert.LessOrEqual(t, len(s.Context), 5, "context must never exceed MaxMessages")
-
-	// The newest messages survive the trim.
+	// No summariser: past the cap nothing folds, and nothing is dropped (context_budget.go).
+	assert.Len(t, s.Context, 12, "a message the model can no longer see is a call that forgot")
 	last := s.GetContextCopy()
 	assert.Equal(t, "msg", last[len(last)-1].Content)
 }
@@ -107,63 +106,9 @@ func TestSession_NeedsSummarization(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		s.AddMessage("user", "m")
 	}
-	assert.False(t, s.NeedsSummarization(), "AddMessage trims AT max, never over")
-
-	// Simulate runtime policy change (e.g. memory pressure lowering the cap).
-	s.MaxMessages = 4
-	assert.True(t, s.NeedsSummarization(), "context over reduced cap triggers summarization")
-}
-
-func TestSession_SummarizeContext_ReplacesOldWithSummary(t *testing.T) {
-	s := newTestSession()
-	s.MaxMessages = 20
-
-	for i := 0; i < 12; i++ {
-		s.AddMessage("user", "old msg")
-	}
-	// Lower cap to force summarization territory.
-	s.MaxMessages = 6
-	require.True(t, s.NeedsSummarization())
-
-	s.SummarizeContext("the user said many things", 2)
-
-	ctx := s.GetContextCopy()
-	assert.LessOrEqual(t, len(ctx), s.MaxMessages+1, "post-summary context within bounds (+1 summary msg)")
-
-	foundSummary := false
-	for _, m := range ctx {
-		if m.Role == "system" && contains(m.Content, "[Summary of earlier conversation:") {
-			foundSummary = true
-		}
-	}
-	assert.True(t, foundSummary, "summary system message present after trim")
-}
-
-func TestSession_SummarizeContext_NoOpWhenUnderLimit(t *testing.T) {
-	s := newTestSession()
-	s.MaxMessages = 10
-	for i := 0; i < 3; i++ {
-		s.AddMessage("user", "keep me")
-	}
-	before := s.GetContextCopy()
-
-	s.SummarizeContext("ignored", 2)
-
-	assert.Equal(t, before, s.GetContextCopy(), "under-limit summarize is a no-op")
-}
-
-func TestSession_SummarizeContext_EmptySummarySkipsInjection(t *testing.T) {
-	s := newTestSession()
-	s.MaxMessages = 2
-	for i := 0; i < 6; i++ {
-		s.AddMessage("user", "old")
-	}
-
-	s.SummarizeContext("", 1)
-	ctx := s.GetContextCopy()
-	for _, m := range ctx {
-		assert.NotEqual(t, "system", m.Role, "no summary injected when summaryText empty")
-	}
+	assert.False(t, s.NeedsSummarization(), "at the cap is within it")
+	s.AddMessage("user", "m")
+	assert.True(t, s.NeedsSummarization(), "one past the cap, with no summariser to fold it, is a fold due")
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +204,8 @@ func TestSession_UserMemoryField(t *testing.T) {
 func TestSession_ConcurrentAccess(t *testing.T) {
 	s := newTestSession()
 	s.MaxMessages = 100
+	sum := &recordingSummarizer{}
+	s.SetHistorySummarizer(sum.summarize, nil)
 
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
@@ -275,8 +222,15 @@ func TestSession_ConcurrentAccess(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+	waitIdle(s)
 
-	assert.LessOrEqual(t, len(s.Context), 100)
+	// Folded under concurrent appends, and still nothing lost: every message is either in the
+	// conversation or counted into the summary.
+	s.mu.RLock()
+	kept := len(s.conversationLocked())
+	s.mu.RUnlock()
+	assert.Equal(t, 800, kept+s.FoldedMessages())
+	assert.Zero(t, s.TrimmedMessages())
 }
 
 // contains is a tiny helper to avoid importing strings everywhere.

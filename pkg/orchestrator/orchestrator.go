@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 )
 
 type ToolHandler func(args string) (string, error)
@@ -63,48 +64,24 @@ func (o *Orchestrator) GetLLMProvider() LLMProvider {
 	return o.llm
 }
 
+// SummarizeContext folds the session's history now, if it is over budget, and waits for the fold.
+// Calls fold on their own (AddMessageRaw); this is for callers that want it done synchronously.
+// Nothing is removed unless it is in the summary.
 func (o *Orchestrator) SummarizeContext(ctx context.Context, session *ConversationSession) error {
 	if o.llm == nil {
 		return fmt.Errorf("no LLM provider")
 	}
-	messages := session.GetContextCopy()
-
-	var turnsToSummarize []Message
-	for _, msg := range messages {
-		if msg.Role == "system" && strings.HasPrefix(msg.Content, "[Summary") {
-			continue
-		}
-		if msg.Role == "user" || msg.Role == "assistant" {
-			turnsToSummarize = append(turnsToSummarize, msg)
-		}
+	session.mu.Lock()
+	if session.summarizer == nil {
+		session.summarizer, session.foldLogger = o.summarizeHistory, o.logger
 	}
-
-	if len(turnsToSummarize) < 2 {
-		return nil
+	session.nextFoldAttempt = time.Time{}
+	fold := session.maybeStartFoldLocked()
+	session.mu.Unlock()
+	if fold != nil {
+		fold()
 	}
-
-	var sb strings.Builder
-	for _, msg := range turnsToSummarize {
-		content := msg.Content
-		if len(content) > 200 {
-			content = content[:200] + "..."
-		}
-		sb.WriteString(msg.Role + ": " + content + "\n")
-	}
-
-	prompt := o.config.SummarizationPrompt + "\n\n" + sb.String()
-	summaryMessages := []Message{
-		{Role: "system", Content: "You generate concise summaries of conversations. Keep key facts and context, max 3 sentences."},
-		{Role: "user", Content: prompt},
-	}
-
-	summary, err := o.llm.Complete(ctx, summaryMessages, nil)
-	if err != nil || summary == "" {
-		return err
-	}
-
-	session.SummarizeContext(summary, session.MaxMessages/2)
-	return nil
+	return ctx.Err()
 }
 
 func (o *Orchestrator) RegisterTool(name string, handler ToolHandler) {
@@ -324,6 +301,7 @@ func (o *Orchestrator) GetProviders() map[string]string {
 
 func (o *Orchestrator) NewSessionWithDefaults(userID string) *ConversationSession {
 	session := NewConversationSession(userID)
+	session.SetHistorySummarizer(o.summarizeHistory, o.logger)
 	session.MaxMessages = o.config.MaxContextMessages
 	// Negative disables the cap; zero means "unset", so fall back to the default rather than
 	// silently turning the budget off for every caller that builds a Config literal.

@@ -446,6 +446,15 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		logger = &NoOpLogger{}
 	}
 
+	// Every call's session folds its history rather than losing it (context_budget.go), however the
+	// session was built.
+	if session != nil && o != nil {
+		session.mu.Lock()
+		if session.summarizer == nil {
+			session.summarizer, session.foldLogger = o.summarizeHistory, o.logger
+		}
+		session.mu.Unlock()
+	}
 	ms := &ManagedStream{
 		orch:            o,
 		session:         session,
@@ -918,6 +927,13 @@ func trimmedHistory(s *ConversationSession) int {
 	return s.TrimmedMessages()
 }
 
+func foldedHistory(s *ConversationSession) int {
+	if s == nil {
+		return -1
+	}
+	return s.FoldedMessages()
+}
+
 func (ms *ManagedStream) logTurnLatency() {
 	end := ms.userSpeechEnd
 	first := ms.ttsFirstChunkTime
@@ -1039,9 +1055,11 @@ func (ms *ManagedStream) logTurnLatency() {
 		"llm_prompt_tokens", promptTok,
 		"llm_completion_tokens", completionTok,
 		"llm_total_tokens", totalTok,
-		// Conversation messages the token budget has dropped so far this call: history the model
-		// can no longer see.
+		// Conversation dropped WITHOUT a summary (only past the hard ceiling): history the model can
+		// no longer see in any form. Must read 0; see context_budget.go.
 		"context_trimmed_msgs", trimmedHistory(ms.session),
+		// Conversation folded into the call summary: still known to the model, condensed.
+		"context_folded_msgs", foldedHistory(ms.session),
 		"llm_to_tts_ms", llmToTTS,
 		"tts_first_chunk_ms", ttsFirst,
 		"discarded_ms", discarded,

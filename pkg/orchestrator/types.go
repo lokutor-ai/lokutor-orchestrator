@@ -603,13 +603,22 @@ type ConversationSession struct {
 	toolCallCounts  map[string]int // Track how many times each tool has been called
 	UserMemory      string         // Cross-call memory extracted from previous sessions
 
-	// MaxContextTokens caps the conversation by SIZE, which is what actually costs anything.
-	// MaxMessages caps it by count, and count is a poor proxy: one long turn can carry more than
-	// twenty short ones. Zero disables the token cap and leaves the count cap alone.
+	// MaxContextTokens budgets the CONVERSATION by size (the system prompt, call summary and
+	// knowledge passage are pinned outside it); MaxMessages by count. Past either, the oldest turns
+	// are folded into the call summary, never simply dropped — see context_budget.go. Zero disables
+	// the token budget and leaves the count alone.
 	MaxContextTokens int
-	// trimmedMessages counts the conversation messages the token budget has dropped this call,
-	// so a caller being "forgotten" shows in the turn log (TrimmedMessages).
+	// trimmedMessages counts conversation dropped WITHOUT being summarised: only past
+	// hardHistoryCeilingTokens, which a call reaches only if every fold has failed for an hour and
+	// more. It is in the turn log (context_trimmed_msgs) and must read 0.
 	trimmedMessages int
+	// foldedMessages counts conversation folded into the call summary (context_folded_msgs).
+	foldedMessages int
+	// summarizer writes the call summary; without one nothing folds and nothing is dropped.
+	summarizer      HistorySummarizer
+	foldLogger      Logger
+	folding         bool
+	nextFoldAttempt time.Time
 
 	// basePrompt is the agent's own prompt, before buildSystemPrompt wraps it in the guidelines
 	// and the language section. Kept so that a language change can REBUILD the system prompt
@@ -641,40 +650,32 @@ func (s *ConversationSession) AddMessage(role, content string) {
 	s.AddMessageRaw(Message{Role: role, Content: content})
 }
 
+// AddMessageRaw appends a message and never removes one. Past MaxMessages or MaxContextTokens it
+// starts a fold of the oldest turns into the call summary, beside the call; the turns leave the
+// context only once the summary holding them exists. See context_budget.go.
+//
+// It used to delete. The count cap sliced off the oldest messages (and, before that was fixed, the
+// system prompt with them), and the token budget deleted oldest-first against a total that
+// included the system prompt, so an agent with long instructions kept almost none of its call. On
+// 2026-09-24 a caller said "soy Dani" and was asked for their name three more times in 65 seconds.
 func (s *ConversationSession) AddMessageRaw(msg Message) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.Context = append(s.Context, msg)
-	if len(s.Context) > s.MaxMessages {
-		// Keep the leading system message. The trim used to be a plain tail slice, which drops
-		// index 0 — and index 0 is the system prompt, carrying the entire language section, the
-		// guardrails and the agent's own instructions. A call long enough to reach MaxMessages
-		// therefore lost every rule holding it to one language, silently, in the middle of a
-		// conversation. Nothing logged it and the model simply started behaving like a different
-		// agent.
-		//
-		// This is not hypothetical head-room: context on a real call was measured growing past
-		// 7,000 tokens with no ceiling in sight, because summarizeContextIfNeeded — the function
-		// meant to cap it — is never called from anywhere.
-		if len(s.Context) > 0 && s.Context[0].Role == "system" {
-			keep := s.MaxMessages - 1
-			if keep < 1 {
-				keep = 1
-			}
-			tail := s.Context[1:]
-			if len(tail) > keep {
-				tail = tail[len(tail)-keep:]
-			}
-			s.Context = append(s.Context[:1:1], tail...)
-		} else {
-			s.Context = s.Context[len(s.Context)-s.MaxMessages:]
-		}
-	}
-	s.trimToTokenBudgetLocked()
+	dropped := s.enforceHardCeilingLocked()
+	fold := s.maybeStartFoldLocked()
+	logger := s.foldLogger
 	if msg.Role == "user" {
 		s.LastUser = msg.Content
 	} else if msg.Role == "assistant" && msg.Content != "" {
 		s.LastAssistant = msg.Content
+	}
+	s.mu.Unlock()
+	if dropped > 0 && logger != nil {
+		logger.Error("Conversation dropped WITHOUT a summary: the call outgrew the model's context and no fold succeeded — the caller's earlier turns are lost to the model",
+			"messages_dropped", dropped, "ceiling_tokens", hardHistoryCeilingTokens)
+	}
+	if fold != nil {
+		go fold()
 	}
 }
 
@@ -746,38 +747,11 @@ func (s *ConversationSession) ClearContext() {
 	s.LastAssistant = ""
 }
 
-// SummarizeContext removes old messages and replaces them with a summary message
-// when the context exceeds the max. Keeps the last keepLast messages intact.
-func (s *ConversationSession) SummarizeContext(summaryText string, keepLast int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.Context) <= s.MaxMessages {
-		return
-	}
-	trimCount := len(s.Context) - s.MaxMessages
-	if keepLast > 0 && trimCount > len(s.Context)-keepLast {
-		trimCount = len(s.Context) - keepLast
-	}
-	if trimCount <= 0 {
-		return
-	}
-	removed := s.Context[:trimCount]
-	s.Context = s.Context[trimCount:]
-
-	if summaryText != "" {
-		summaryMsg := Message{
-			Role:    "system",
-			Content: "[Summary of earlier conversation: " + summaryText + "]",
-		}
-		s.Context = append([]Message{summaryMsg}, s.Context...)
-	}
-	_ = removed
-}
-
+// NeedsSummarization reports whether the conversation is past its budget, i.e. a fold is due.
 func (s *ConversationSession) NeedsSummarization() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.Context) > s.MaxMessages
+	return s.overBudgetLocked(s.conversationLocked())
 }
 
 func (s *ConversationSession) GetContextCopy() []Message {
