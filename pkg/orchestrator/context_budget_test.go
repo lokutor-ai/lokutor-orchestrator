@@ -361,3 +361,71 @@ func (c *capturingLLM) Complete(ctx context.Context, messages []Message, tools [
 }
 
 func (c *capturingLLM) Name() string { return "capturing" }
+
+// 2026-09-24, first deploy of the fold: the web path sets the agent's prompt, then a client's
+// "prompt" message set another, and SetSystemPrompt APPENDED it as a second system message. Only
+// index 0 was pinned, so the client's ~2,000-token prompt counted as conversation and was folded
+// into a 3-token summary about a second into every web session, before the caller said anything.
+func TestAClientPromptIsNeverFolded(t *testing.T) {
+	llm := &capturingLLM{reply: "x"}
+	o := NewWithLogger(&MockSTTProvider{}, llm, &MockTTSProvider{}, nil, DefaultConfig(), &NoOpLogger{})
+	s := o.NewSessionWithDefaults("web")
+	o.SetSystemPrompt(s, "You are a warm, natural conversational partner.")
+	client := "CLIENT PROMPT: " + strings.Repeat("you are the reception desk of Hotel Sol. ", 200)
+	o.SetSystemPrompt(s, client)
+	s.AddMessage("user", OpeningTrigger)
+	s.AddMessage("assistant", "¡Hola! Hotel Sol, ¿en qué puedo ayudarte?")
+	waitIdle(s)
+
+	if s.FoldedMessages() != 0 {
+		t.Fatalf("%d messages folded before the caller spoke", s.FoldedMessages())
+	}
+	ctx := s.GetContextCopy()
+	systems := 0
+	for _, m := range ctx {
+		if m.Role == "system" {
+			systems++
+		}
+	}
+	if systems != 1 {
+		t.Errorf("%d system messages, want the one prompt SetSystemPrompt was last given", systems)
+	}
+	if !strings.Contains(ctx[0].Content, "CLIENT PROMPT") {
+		t.Error("the client's prompt is not the system prompt")
+	}
+	if strings.Contains(ctx[0].Content, "warm, natural conversational partner") {
+		t.Error("the replaced prompt is still there")
+	}
+}
+
+// A system message anywhere is instructions, not conversation: never counted, never folded.
+func TestStraySystemMessagesArePinned(t *testing.T) {
+	sum := &recordingSummarizer{}
+	s := NewConversationSession("stray")
+	s.MaxMessages = 1000
+	s.MaxContextTokens = 50
+	s.SetHistorySummarizer(sum.summarize, nil)
+	s.AddMessage("system", "SYSTEM")
+	s.AddMessage("user", "hola")
+	s.AddMessage("system", "EXTRA INSTRUCTIONS "+strings.Repeat("z", 2000))
+	s.AddMessage("assistant", "hola")
+	waitIdle(s)
+	if sum.calls != 0 {
+		t.Errorf("a fold ran for a 2-message conversation because a system message was counted")
+	}
+	if !strings.Contains(contextText(s), "EXTRA INSTRUCTIONS") {
+		t.Error("the extra instructions were folded away")
+	}
+}
+
+// SetSystemPrompt on a session whose first message is the call summary puts the prompt first.
+func TestSetSystemPromptGoesFirst(t *testing.T) {
+	o := NewWithLogger(&MockSTTProvider{}, &capturingLLM{}, &MockTTSProvider{}, nil, DefaultConfig(), &NoOpLogger{})
+	s := NewConversationSession("s")
+	s.Context = []Message{{Role: "system", Content: callSummaryHeader + "Caller: Dani."}, {Role: "user", Content: "hola"}}
+	o.SetSystemPrompt(s, "PROMPT")
+	ctx := s.GetContextCopy()
+	if !strings.Contains(ctx[0].Content, "PROMPT") || !strings.HasPrefix(ctx[1].Content, callSummaryPrefix) {
+		t.Fatalf("got %q then %q", ctx[0].Content[:10], ctx[1].Content[:10])
+	}
+}

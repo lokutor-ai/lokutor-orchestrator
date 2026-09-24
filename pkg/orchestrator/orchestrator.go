@@ -446,7 +446,7 @@ func (o *Orchestrator) SetSystemPrompt(session *ConversationSession, prompt stri
 	lang, mem := session.CurrentLanguage, session.UserMemory
 	session.mu.Unlock()
 
-	session.AddMessage("system", composeSystemPrompt(prompt, lang, mem))
+	session.setSystemMessage(composeSystemPrompt(prompt, lang, mem))
 }
 
 // composeSystemPrompt renders the full system message. It is the single place the language section

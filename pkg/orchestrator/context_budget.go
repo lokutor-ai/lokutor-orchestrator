@@ -22,9 +22,9 @@ import (
 // so plainly: context_trimmed_msgs 2, 5, 7, 7, 7, 7, 16.
 //
 // So, now:
-//   - MaxContextTokens budgets the CONVERSATION alone. The system prompt, the call summary and the
-//     knowledge-base passage are pinned: they are never folded and do not count against it. How
-//     large an agent's instructions are no longer decides how much of its call it remembers.
+//   - MaxContextTokens budgets the CONVERSATION alone. Every system message (the instructions, the
+//     call summary, the knowledge-base passage) is pinned: never folded, not counted. How large an
+//     agent's instructions are no longer decides how much of its call it remembers.
 //   - Past the budget (or past MaxMessages), the oldest turns are handed to the summariser, and
 //     only once it has written them into the summary are they removed, down to half the budget,
 //     so a fold happens about once per half-budget of conversation rather than every turn.
@@ -71,13 +71,30 @@ func (s *ConversationSession) SetHistorySummarizer(f HistorySummarizer, logger L
 	s.foldLogger = logger
 }
 
-// isPinnedMessage reports whether the message at index i sits outside the conversation budget and
-// is never folded: the system prompt, the call summary and the knowledge-base passage.
+// isPinnedMessage reports whether a message sits outside the conversation budget and is never
+// folded: every system message — the agent's instructions, the call summary, the knowledge passage.
+// Instructions are not conversation, wherever they sit. On 2026-09-24 only index 0 was pinned, and a
+// web/SDK client's prompt, which SetSystemPrompt then appended as a SECOND system message, was
+// counted as conversation and folded into a few-token summary about a second into every session.
 func isPinnedMessage(i int, m Message) bool {
-	if m.Role != "system" {
-		return false
+	return m.Role == "system"
+}
+
+// setSystemMessage makes content the session's system prompt: it replaces the leading system
+// message, or puts one first. It used to append, so a prompt set on a session that already had
+// one (the web path sets the agent's, then a client's "prompt" message sets another) left two
+// system prompts, the later one outside the pinned first position; SetLanguage then rebuilt the
+// first from the later one's basePrompt, so the two disagreed as well.
+func (s *ConversationSession) setSystemMessage(content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Context) > 0 && s.Context[0].Role == "system" &&
+		!strings.HasPrefix(s.Context[0].Content, callSummaryPrefix) &&
+		!strings.HasPrefix(s.Context[0].Content, knowledgeContextPrefix) {
+		s.Context[0].Content = content
+		return
 	}
-	return i == 0 || strings.HasPrefix(m.Content, knowledgeContextPrefix) || strings.HasPrefix(m.Content, callSummaryPrefix)
+	s.Context = append([]Message{{Role: "system", Content: content}}, s.Context...)
 }
 
 func messageTokens(m Message) int {

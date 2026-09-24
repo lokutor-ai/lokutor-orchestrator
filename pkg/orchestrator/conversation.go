@@ -85,7 +85,7 @@ func (c *Conversation) SetLanguageByString(language string) error {
 }
 
 func (c *Conversation) SetSystemPrompt(prompt string) {
-	c.session.AddMessage("system", prompt)
+	c.session.setSystemMessage(prompt)
 }
 
 func (c *Conversation) ProcessAudio(ctx context.Context, audioBytes []byte, onAudioChunk func([]byte) error) (string, string, error) {
