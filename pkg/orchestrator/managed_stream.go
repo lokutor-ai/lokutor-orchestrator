@@ -381,6 +381,10 @@ type ManagedStream struct {
 	// preSpeechBuf stores the last ~300ms of audio unconditionally, updated BEFORE VAD.
 	// Used in onVADStart to prepend speech onset that VAD's confirmation window missed.
 	preSpeechBuf *bytes.Buffer
+	// speechLeadIn is the copy of preSpeechBuf onVADStart prepended to userAudio for the utterance
+	// in progress. The speculative transcription snapshots speechAudioBuf, which never had it, so
+	// it has to be added back there — see maybeSpeculateSTT.
+	speechLeadIn []byte
 
 	// Streaming STT: process audio incrementally instead of full buffer
 	sttChan       chan []byte
@@ -1174,11 +1178,13 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	// preSpeechBuf is updated BEFORE VAD in handleAudio, so it never includes
 	// the current chunk — no duplicates in userAudio.
 	ms.mu.Lock()
+	ms.speechLeadIn = nil
 	if ms.preSpeechBuf.Len() > 0 {
 		buf := ms.preSpeechBuf.Bytes()
 		leadIn := make([]byte, len(buf))
 		copy(leadIn, buf)
-		ms.userAudio = append(leadIn, ms.userAudio...)
+		ms.speechLeadIn = leadIn
+		ms.userAudio = append(append([]byte(nil), leadIn...), ms.userAudio...)
 	}
 	ms.mu.Unlock()
 
@@ -1510,6 +1516,8 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 
 	speechAudio := ms.speechAudioBuf
 	ms.speechAudioBuf = make([]byte, 0, 44100)
+	// With the buffer it belongs to: a VAD start the cooldown ignores never sets a new one.
+	ms.speechLeadIn = nil
 
 	// Adaptive VAD: if energy was rising before speech end, the user is likely
 	// pausing mid-thought — extend the minimum duration to avoid splitting
@@ -1758,7 +1766,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.resolvePendingBargeInFor(true)
 		return
 	case fillerAskRepeat:
-		ms.logger.Warn("Recogniser returned a filler phrase for a long utterance — asking the caller to repeat",
+		ms.logger.Warn("Recogniser returned an English filler for the caller's turn in another language — asking the caller to repeat",
 			"transcript", result.Text, "audio_duration_ms", duration.Milliseconds())
 		ms.mu.Lock()
 		ms.payloadGen++
@@ -2935,9 +2943,12 @@ const (
 //     while their sentence continued — is now caught downstream: the continuation merge
 //     (spoken_truth.go) joins the two halves and drops the barely-heard reply.
 //   - Any other language: an English phrase is essentially never what was said (440 ms of a Spanish
-//     caller's opening word came back as "Thank you."). Short, it is dropped as before; at a second or
-//     more the caller said something real the recogniser could not read, which is the long empty
-//     transcript's case, and gets the same answer: ask them to repeat.
+//     caller's opening word came back as "Thank you."), but the caller did say something, so ask
+//     them to repeat — at any length. It used to be dropped under a second, and on a Spanish call
+//     (2026-09-24) a caller answering "¿cómo te llamas?" with just their name, 440 and 420 ms, got
+//     "Yeah." and "Okay." back, both dropped: the agent said nothing to either, exactly the English
+//     failure above. A short answer is still a whole answer. One short "¿Puedes repetirlo?" costs
+//     little when the audio was only a noise the gates before this let through.
 //
 // Hesitations are never a turn by themselves. Caption boilerplate keeps the old corroboration: in
 // English it counts only when the audio is long enough to have said it.
@@ -2954,10 +2965,8 @@ func recogniserFillerVerdict(transcript string, lang Language, audioDuration tim
 	switch {
 	case overAgent, kind == fillerHesitation:
 		return fillerDiscard
-	case !english && audioDuration >= time.Second:
-		return fillerAskRepeat
 	case !english:
-		return fillerDiscard
+		return fillerAskRepeat
 	case kind == fillerCaption && audioDuration < 700*time.Millisecond:
 		return fillerDiscard
 	}

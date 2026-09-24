@@ -13,7 +13,7 @@ import (
 //
 // 2026-09-23: in an English session a spoken "Thank you." (×3), "Yeah." (×3) and "Okay." (×2), each
 // 300–640 ms, were every one discarded as noise with no_speech_prob 0. The agent never answered; a
-// repeat was dropped exactly like the original.
+// repeat was dropped exactly like the original. 2026-09-24: the same in Spanish, a caller's name.
 func TestRecogniserFillerVerdict(t *testing.T) {
 	const short = 440 * time.Millisecond
 	const long = 1500 * time.Millisecond
@@ -36,12 +36,18 @@ func TestRecogniserFillerVerdict(t *testing.T) {
 		{"english yeah over the agent", "Yeah.", LanguageEn, short, true, fillerDiscard},
 		{"spanish yeah over the agent", "Yeah.", "es", long, true, fillerDiscard},
 
-		// 2026-09-19, verbatim: an English phrase in a Spanish call is not what was said.
-		{"english filler in a spanish call", "Thank you.", "es", short, false, fillerDiscard},
-		{"case and punctuation are not a defence", "THANK YOU!!", "es", short, false, fillerDiscard},
-		{"catalan call", "thanks", "ca", short, false, fillerDiscard},
-		// ...but a second or more of it is real speech the recogniser could not read.
+		// 2026-09-19, verbatim: an English phrase in a Spanish call is not what was said, so it is
+		// never answered as a turn...
+		{"english filler in a spanish call asks", "Thank you.", "es", short, false, fillerAskRepeat},
+		{"case and punctuation are not a defence", "THANK YOU!!", "es", short, false, fillerAskRepeat},
+		{"catalan call", "thanks", "ca", short, false, fillerAskRepeat},
 		{"long filler in a spanish call asks", "Thank you.", "es", long, false, fillerAskRepeat},
+		// ...and 2026-09-24, verbatim: a caller's name alone, with the floor, came back as these and
+		// was dropped both times, so the agent never answered. Silence is not an answer.
+		{"spanish name heard as yeah", "Yeah.", "es", 439 * time.Millisecond, false, fillerAskRepeat},
+		{"spanish name heard as okay", "Okay.", "es", 419 * time.Millisecond, false, fillerAskRepeat},
+		// Hesitations stay silent in every language.
+		{"spanish call hesitation", "Mm.", "es", short, false, fillerDiscard},
 
 		// Hesitations are never a turn; caption boilerplate needs time to have been said.
 		{"hesitation with the floor", "Um.", LanguageEn, short, false, fillerDiscard},

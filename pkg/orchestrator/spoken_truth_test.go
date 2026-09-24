@@ -404,7 +404,9 @@ func TestRejectedNoiseRestoresIdleOnlyWhenItOwnsProcessing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := DefaultConfig()
 			cfg.SilenceTimeout = 0
-			orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "Thank you."}, &sequencedLLM{}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+			// A hesitation: discarded in any language, with or without the floor. ("Thank you." on a
+			// Spanish call used to be the example, but with the floor it now asks the caller to repeat.)
+			orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "Mm."}, &sequencedLLM{}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
 			session := NewConversationSession("noise-state")
 			session.CurrentLanguage = LanguageEs
 			stream := orch.NewManagedStream(context.Background(), session)

@@ -170,15 +170,31 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		return
 	}
 
+	// The snapshot carries the same ~300ms lead-in onVADStart gives userAudio, for the same reason:
+	// the VAD confirms speech a few frames after it starts, so the frames it appended from begin
+	// part-way into the first word. Without it this path — which answers ~96% of production turns —
+	// transcribed every utterance minus its onset, while the batch path it replaces had it.
+	// Measured on the deploy smoke stimulus ("Hola, ¿a qué hora abre la oficina mañana?"), cut where
+	// production's VAD actually cut it: the two segments transcribe as "Yeah." and "Abre la oficina
+	// mañana." without the lead-in — exactly what production heard, 68 of 68 sessions on 2026-09-23 —
+	// and as "Hola." and "¿Qué hora abre la oficina mañana?" with it. A one-word answer loses the most:
+	// on 2026-09-24 a caller's name, ~430 ms, came back "Yeah." and "Okay." with its onset cut off.
+	//
+	// It also puts both sides of awaitUsable's tail check on the same footing: finalLen is
+	// len(userAudio), which includes the lead-in, so a snapshot without it read every tail ~300ms
+	// longer than the audio actually appended after it.
 	ms.mu.Lock()
-	snapshot := make([]byte, len(ms.speechAudioBuf))
-	copy(snapshot, ms.speechAudioBuf)
+	speechLen := len(ms.speechAudioBuf)
+	snapshot := make([]byte, 0, len(ms.speechLeadIn)+speechLen)
+	snapshot = append(snapshot, ms.speechLeadIn...)
+	snapshot = append(snapshot, ms.speechAudioBuf...)
 	lang := ms.session.GetCurrentLanguage()
 	// The number this in-flight utterance will carry once onVADEnd commits it.
 	seq := ms.utteranceSeq + 1
 	ms.mu.Unlock()
 
-	if len(snapshot) < defaultSpecSTTMinBytes {
+	// Measured on the speech alone: the lead-in would otherwise clear this on any blip.
+	if speechLen < defaultSpecSTTMinBytes {
 		return
 	}
 	if !ms.specSTT.begin(len(snapshot), seq) {
