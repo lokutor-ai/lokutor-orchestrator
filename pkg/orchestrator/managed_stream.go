@@ -544,16 +544,23 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		}
 	}
 
-	detector := NewBackchannelDetector(DefaultBackchannelConfig(), 44100, func(raw []byte) {
-		ms.emitBackchannel(raw)
-	})
-	detector.clips = make([][]byte, 0)
-	ms.backch = detector
+	// Backchannels only when configured (Config.Backchannels). With ms.backch nil every backchannel
+	// path is a no-op and no clips are synthesised at session start.
+	if o != nil && o.config.Backchannels {
+		// The detector reads the CALLER's audio, which reaches the stream at 16 kHz on both the web
+		// and the phone path (phone audio is upsampled 8 -> 16 kHz before it gets here). It was
+		// constructed at 44100, the playback rate, so every pitch it measured was 2.76x too high.
+		detector := NewBackchannelDetector(DefaultBackchannelConfig(), backchannelInputRate, func(raw []byte) {
+			ms.emitBackchannel(raw)
+		})
+		detector.clips = make([][]byte, 0)
+		ms.backch = detector
+	}
 
 	go ms.audioProcessor()
 	go ms.monitorInactivity()
 
-	if o != nil && o.tts != nil {
+	if ms.backch != nil && o.tts != nil {
 		go ms.generateBackchannelClips(o)
 	}
 
@@ -3567,6 +3574,9 @@ var backchannelPhrases = []string{"mhm", "mm", "hm"}
 // language means the session has not pinned one, and passing it through unchanged resolves to the
 // same unmarked default the reply path uses, rather than guessing at a pack the reply will not use.
 func backchannelLangFor(lang Language) Language { return lang }
+
+// backchannelInputRate is the rate of the caller audio the backchannel detector analyses.
+const backchannelInputRate = 16000
 
 func backchannelPhrasesForLang(Language) []string { return backchannelPhrases }
 

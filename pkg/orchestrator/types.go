@@ -426,6 +426,15 @@ type Config struct {
 	// Response caching: cache common responses to skip LLM entirely
 	ResponseCaching bool
 
+	// Backchannels: the agent says "mhm" / "mm" / "hm" while the caller is still talking. Off by
+	// default since 2026-09-25. The clips are synthesised from two or three characters, which the
+	// Versa engine pads to its 0.7 s minimum, so each is mostly sound the model invents, at about the
+	// loudness of speech (0.5-1.3x the reply's RMS on the 754k voices); and the detector was fed
+	// 16 kHz caller audio labelled 44.1 kHz, reading every pitch 2.8x high. Turning it back on needs
+	// clips that are short, quiet and real (recorded, or trimmed to their voiced part), not just
+	// this flag.
+	Backchannels bool
+
 	// TTS connection pool size
 	TTSConnectionPoolSize int
 
