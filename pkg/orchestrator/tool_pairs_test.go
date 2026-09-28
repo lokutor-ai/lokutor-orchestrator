@@ -209,3 +209,24 @@ func TestManagedStream_ChainedToolCapAnswersInsteadOfFailing(t *testing.T) {
 	assert.Equal(t, 3, ran, "the fourth call is refused, not run")
 	mu.Unlock()
 }
+
+func TestToolCallInSpeech(t *testing.T) {
+	tools := []Tool{
+		{Type: "function", Function: map[string]interface{}{"name": "search_apartments"}},
+		{Type: "function", Function: map[string]interface{}{"name": "search"}},
+	}
+	for _, s := range []string{
+		`tool: search_apartments arguments: bedrooms 3`,
+		`{"city": "Atlanta", "bedrooms": 3}`,
+		`Search_Apartments with city Atlanta.`,
+	} {
+		assert.True(t, toolCallInSpeech(s, tools), "%q", s)
+	}
+	for _, s := range []string{
+		"Sure thing, looking for three-bedroom places in Atlanta now.",
+		"Let me search for that.", // a tool name without an underscore is also a word
+		"Your order ships Tuesday.",
+	} {
+		assert.False(t, toolCallInSpeech(s, tools), "%q", s)
+	}
+}

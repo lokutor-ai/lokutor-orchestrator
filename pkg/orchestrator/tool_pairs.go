@@ -124,3 +124,27 @@ func toolCallIDs(toolCalls interface{}) ([]string, bool) {
 	}
 	return ids, true
 }
+
+// toolCallInSpeech reports whether text is a tool call written out as words instead of made: it
+// names one of the session's tools that has an underscore (never a spoken word) or holds a JSON
+// object. gpt-oss does this now and then, and the text is otherwise read aloud: on 2026-09-29 a
+// benchmark caller heard "tool search apartments arguments bedrooms city Atlanta max price".
+func toolCallInSpeech(text string, tools []Tool) bool {
+	if strings.Contains(text, `{"`) || strings.Contains(text, `":`) {
+		return true
+	}
+	lower := strings.ToLower(text)
+	for _, t := range tools {
+		raw, err := json.Marshal(t.Function)
+		if err != nil {
+			continue
+		}
+		var fn struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(raw, &fn) == nil && strings.Contains(fn.Name, "_") && strings.Contains(lower, strings.ToLower(fn.Name)) {
+			return true
+		}
+	}
+	return false
+}

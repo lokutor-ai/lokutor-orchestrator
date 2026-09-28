@@ -2434,6 +2434,11 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 			"gen", gen, "text_len", len(text), "reason", ctx.Err().Error())
 		return
 	}
+	if ms.session != nil && toolCallInSpeech(text, ms.session.GetTools()) {
+		ms.logger.Warn("Not speaking: the reply text is a tool call written out, not made",
+			"gen", gen, "text", text)
+		return
+	}
 
 	// Prosody processor: disabled — it modifies text in unpredictable ways
 	// (adds filler words, inserts "...", changes pacing) which causes the TTS
