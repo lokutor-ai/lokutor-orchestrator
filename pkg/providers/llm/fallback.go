@@ -35,6 +35,50 @@ func shouldFailover(err error) bool {
 	return err != nil
 }
 
+// chainError is what a chain returns when more than one provider failed: every provider's error, by
+// name. It used to return only the last one. On 2026-09-29 that hid every real failure behind the
+// backup's: Groq's tier allows 8,000 tokens a minute, so under a few concurrent calls it answers 429 at
+// once, and five benchmark calls went silent after their tool calls logging only "groq ... 429" --
+// Cerebras's own error, the one that mattered, was recorded nowhere.
+type chainError struct {
+	names []string
+	errs  []error
+}
+
+func (e *chainError) Error() string {
+	parts := make([]string, len(e.errs))
+	for i, err := range e.errs {
+		parts[i] = e.names[i] + ": " + err.Error()
+	}
+	return "every LLM provider failed: " + strings.Join(parts, "; ")
+}
+
+// Unwrap keeps errors.Is/As working against any provider's error.
+func (e *chainError) Unwrap() []error { return e.errs }
+
+// chainFailures collects the providers that failed a turn, in order.
+type chainFailures struct {
+	names []string
+	errs  []error
+}
+
+func (f *chainFailures) add(p orchestrator.LLMProvider, err error) {
+	f.names = append(f.names, p.Name())
+	f.errs = append(f.errs, err)
+}
+
+// err is nil for no failures, the error itself for one (unchanged from before), and a chainError
+// naming each for more.
+func (f *chainFailures) err() error {
+	switch len(f.errs) {
+	case 0:
+		return nil
+	case 1:
+		return f.errs[0]
+	}
+	return &chainError{names: f.names, errs: f.errs}
+}
+
 // ChainLLM wraps an ordered list of LLM providers and automatically retries
 // on the next one when the current provider fails with a rate-limit-shaped
 // error. This is how several separate free/low tiers (or a fast-but-tight
@@ -63,15 +107,15 @@ func NewChainLLM(name string, providers ...orchestrator.LLMProvider) *ChainLLM {
 func (c *ChainLLM) Name() string { return c.name }
 
 func (c *ChainLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
-	var lastErr error
+	var failed chainFailures
 	for _, p := range c.providers {
 		text, err := p.Complete(ctx, messages, tools)
 		if err == nil || ctx.Err() != nil || !shouldFailover(err) {
 			return text, err
 		}
-		lastErr = err
+		failed.add(p, err)
 	}
-	return "", lastErr
+	return "", failed.err()
 }
 
 // llmHedgeDelay is how long the first provider has to produce its first token before the next one
@@ -112,7 +156,7 @@ func (c *ChainLLM) streamSequential(
 	onChunk func(string) error,
 	onToolCall func(orchestrator.ToolCallEventData) error,
 ) (string, error) {
-	var lastErr error
+	var failed chainFailures
 	for _, p := range c.providers {
 		started := false
 		trackChunk := func(s string) error {
@@ -135,12 +179,12 @@ func (c *ChainLLM) streamSequential(
 		if err == nil || started || ctx.Err() != nil || !shouldFailover(err) {
 			return text, err
 		}
-		lastErr = err
+		failed.add(p, err)
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no LLM providers configured in chain %q", c.name)
+	if err := failed.err(); err != nil {
+		return "", err
 	}
-	return "", lastErr
+	return "", fmt.Errorf("no LLM providers configured in chain %q", c.name)
 }
 
 // streamHedged runs providers[0], starts providers[1] alongside it if no output has arrived after
@@ -225,7 +269,7 @@ func (c *ChainLLM) streamHedged(
 	next := 1
 	timer := time.NewTimer(hedge)
 	defer timer.Stop()
-	var lastErr error
+	var failed chainFailures
 	for {
 		select {
 		case <-ctx.Done():
@@ -262,7 +306,7 @@ func (c *ChainLLM) streamHedged(
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
-			lastErr = r.err
+			failed.add(c.providers[r.idx], r.err)
 			if running > 0 {
 				continue // the other attempt may still answer
 			}
@@ -271,7 +315,7 @@ func (c *ChainLLM) streamHedged(
 				next++
 				continue
 			}
-			return "", lastErr
+			return "", failed.err()
 		}
 	}
 }

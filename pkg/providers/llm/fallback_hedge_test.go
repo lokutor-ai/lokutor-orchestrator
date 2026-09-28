@@ -117,3 +117,29 @@ func TestChainHedge_DisabledIsSequential(t *testing.T) {
 		t.Fatalf("text=%q err=%v b.calls=%d", text, err, b.calls.Load())
 	}
 }
+
+// When every provider fails, each one's error is reported by name, not only the last. On 2026-09-29
+// the backup's instant 429 (Groq's 8,000 tokens/minute) was the only error logged for five silent
+// turns, and the primary's failure -- the one that mattered -- was lost.
+func TestHedgedChainReportsEveryProvidersFailure(t *testing.T) {
+	t.Setenv("LLM_HEDGE_MS", "50")
+	primaryErr := errors.New("cerebras api error (status 400): bad tool message")
+	backupErr := errors.New("groq api error (status 429): rate limit")
+	primary := &fakeStreamer{name: "cerebras", firstAfter: 10 * time.Millisecond, err: primaryErr}
+	backup := &fakeStreamer{name: "groq", err: backupErr}
+	c := NewChainLLM("test", primary, backup)
+
+	_, err := c.StreamComplete(context.Background(), nil, nil,
+		func(string) error { return nil }, func(orchestrator.ToolCallEventData) error { return nil })
+	if err == nil {
+		t.Fatal("expected an error when every provider fails")
+	}
+	if !errors.Is(err, primaryErr) || !errors.Is(err, backupErr) {
+		t.Fatalf("both providers' errors must be reachable, got %v", err)
+	}
+	for _, want := range []string{"cerebras:", "bad tool message", "groq:", "429"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
