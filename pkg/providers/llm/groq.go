@@ -42,7 +42,7 @@ func (l *GroqLLM) applyReasoningEffort(payload map[string]interface{}) {
 func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": messages,
+		"messages": forGptOss(l.model, messages),
 	}
 	l.applyReasoningEffort(payload)
 	if len(tools) > 0 {
@@ -98,7 +98,7 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": messages,
+		"messages": forGptOss(l.model, messages),
 		"stream":   true,
 	}
 	// Streaming omits token counts unless asked; see requestStreamUsage in usage.go.

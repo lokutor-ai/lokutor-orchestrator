@@ -50,7 +50,7 @@ func (l *CerebrasLLM) Name() string { return "cerebras-llm" }
 func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": messages,
+		"messages": forGptOss(l.model, messages),
 	}
 	l.applyReasoningEffort(payload)
 	if len(tools) > 0 {
@@ -103,7 +103,7 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": messages,
+		"messages": forGptOss(l.model, messages),
 		"stream":   true,
 	}
 	// Streaming omits token counts unless asked; see requestStreamUsage in usage.go.
