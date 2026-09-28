@@ -154,6 +154,15 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	tailStart := time.Now()
 	ms.speculator.Cancel()
 
+	if ok {
+		// The guess is spoken as it stands, so it gets the check the streamed path gives each
+		// sentence: a tool call written out, or leaked reasoning, becomes a miss and the turn is
+		// generated again instead (unspeakableReply).
+		if reason := unspeakableReply(response, ms.session.GetTools()); reason != "" {
+			ms.logger.Warn("Speculative reply discarded: not speech", "reason", reason, "text", response)
+			ok = false
+		}
+	}
 	if !ok {
 		// Miss. Anything rendered for the guessed reply is wrong for this turn, and a render still
 		// in flight would hold a synthesiser slot the confirmed path is about to need — on a node

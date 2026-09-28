@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -188,6 +189,9 @@ func (ms *ManagedStream) dispatchToolCall(ctx context.Context, tcData ToolCallEv
 // pathological chain across many distinct tool names.
 const maxNonStreamingToolRounds = 8
 
+// errUnspeakableReply stops a reply stream at a sentence that must not be spoken (unspeakableReply).
+var errUnspeakableReply = errors.New("reply is not speech")
+
 // maxChainedToolRounds is how many rounds of tool calls the model may make after the first one's
 // results, on the streaming path, before it has to answer with what it has.
 const maxChainedToolRounds = 4
@@ -367,109 +371,152 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		}
 	}()
 
-	_, err := provider.StreamComplete(ctx, messages, ms.session.GetTools(),
-		func(chunk string) error {
-			fullText.WriteString(chunk)
-			pendingSentence.WriteString(chunk)
+	// unspeakable is set when the reply turns out to be a tool call written out, or the model's
+	// reasoning, instead of speech (unspeakableReply). The stream is stopped at that sentence, before
+	// it is spoken, and the model asked once more: the call it meant to make was never made, and a
+	// second try usually makes it. On 2026-09-29 ten of a hundred benchmark calls hit this, mostly
+	// "add it to my cart", and until the speech guard callers heard "product id prod quantity one".
+	tools := ms.session.GetTools()
+	unspeakable := ""
+	var err error
+	for attempt := 1; ; attempt++ {
+		unspeakable = ""
+		_, err = provider.StreamComplete(ctx, messages, tools,
+			func(chunk string) error {
+				fullText.WriteString(chunk)
+				pendingSentence.WriteString(chunk)
 
-			// Signal first token arrival (stops the filler timer)
-			select {
-			case firstToken <- struct{}{}:
-			default:
-			}
-
-			if ms.llmEndTime.IsZero() {
-				ms.llmEndTime = time.Now()
-			}
-
-			buf := pendingSentence.String()
-
-			// Decide where to flush. Sentence-ending punctuation always flushes
-			// (natural prosody). For the FIRST chunk only, also flush at a clause
-			// boundary (comma/semicolon/colon) past a small minimum, and if no
-			// punctuation has appeared by firstChunkMaxChars, cut at the last
-			// word boundary — so the opening chunk stays short and the bot
-			// starts speaking quickly instead of waiting for a whole long
-			// sentence to synthesize.
-			// Sentence-ending punctuation is the only boundary the synthesiser can be handed
-			// without changing how the line is spoken — but only when it really ends a sentence.
-			// Cutting at every '.' turned "a las 4 p.m." into three synthesis calls and "3.14"
-			// into two, each paying the engine's start-up cost again (an audible gap) and each
-			// too short for the language token to condition anything (an English-sounding
-			// fragment mid-sentence). See sentence_boundary.go.
-			flushEnd := nextFlushPoint(
-				buf, false,
-				splitFirstChunk && !firstChunkDone, firstChunkClauseMin,
-				minSpokenSegment,
-			)
-			if splitFirstChunk && flushEnd < 0 && !firstChunkDone && len(buf) >= firstChunkMaxChars {
-				if sp := strings.LastIndexByte(strings.TrimRight(buf[:firstChunkMaxChars], " "), ' '); sp > firstChunkClauseMin {
-					flushEnd = sp + 1
+				// Signal first token arrival (stops the filler timer)
+				select {
+				case firstToken <- struct{}{}:
+				default:
 				}
-			}
-			if flushEnd > 0 {
-				seg := strings.TrimSpace(buf[:flushEnd])
-				if seg != "" {
-					ttsQueue <- seg
-					firstChunkDone = true
+
+				if ms.llmEndTime.IsZero() {
+					ms.llmEndTime = time.Now()
 				}
-				rest := strings.TrimSpace(buf[flushEnd:])
-				pendingSentence.Reset()
-				pendingSentence.WriteString(rest)
-			}
 
-			return nil
-		},
-		func(tc ToolCallEventData) error {
-			// Check for infinite tool loop
-			if !ms.session.RecordToolCall(tc.Name) {
-				ms.emit(ErrorEvent, fmt.Sprintf("Tool loop detected: %s called too many times. Aborting to prevent infinite retry.", tc.Name))
-				return fmt.Errorf("tool loop detected: %s", tc.Name)
-			}
+				buf := pendingSentence.String()
 
-			hasToolCalls = true
-			ms.emit(ToolCall, tc)
+				// Decide where to flush. Sentence-ending punctuation always flushes
+				// (natural prosody). For the FIRST chunk only, also flush at a clause
+				// boundary (comma/semicolon/colon) past a small minimum, and if no
+				// punctuation has appeared by firstChunkMaxChars, cut at the last
+				// word boundary — so the opening chunk stays short and the bot
+				// starts speaking quickly instead of waiting for a whole long
+				// sentence to synthesize.
+				// Sentence-ending punctuation is the only boundary the synthesiser can be handed
+				// without changing how the line is spoken — but only when it really ends a sentence.
+				// Cutting at every '.' turned "a las 4 p.m." into three synthesis calls and "3.14"
+				// into two, each paying the engine's start-up cost again (an audible gap) and each
+				// too short for the language token to condition anything (an English-sounding
+				// fragment mid-sentence). See sentence_boundary.go.
+				flushEnd := nextFlushPoint(
+					buf, false,
+					splitFirstChunk && !firstChunkDone, firstChunkClauseMin,
+					minSpokenSegment,
+				)
+				if splitFirstChunk && flushEnd < 0 && !firstChunkDone && len(buf) >= firstChunkMaxChars {
+					if sp := strings.LastIndexByte(strings.TrimRight(buf[:firstChunkMaxChars], " "), ' '); sp > firstChunkClauseMin {
+						flushEnd = sp + 1
+					}
+				}
+				if flushEnd > 0 {
+					seg := strings.TrimSpace(buf[:flushEnd])
+					if reason := unspeakableReply(seg, tools); reason != "" && !hasToolCalls {
+						unspeakable = reason
+						return errUnspeakableReply
+					}
+					if seg != "" {
+						ttsQueue <- seg
+						firstChunkDone = true
+					}
+					rest := strings.TrimSpace(buf[flushEnd:])
+					pendingSentence.Reset()
+					pendingSentence.WriteString(rest)
+				}
 
-			filler := strings.TrimSpace(fullText.String())
-			if filler != "" {
-				go func(t string) {
-					sCtx, sCancel := context.WithCancel(ctx)
-					defer sCancel()
-					ms.speakText(sCtx, t, gen)
-				}(filler)
-				fullText.Reset()
-			} else {
-				// No pending text — speak a deterministic filler so there's no dead air
-				// while the tool executes (Vapi/Pipecat pattern: platform speaks the
-				// acknowledgment, not the LLM).
-				fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
-				if fillerPhrase != "" {
+				return nil
+			},
+			func(tc ToolCallEventData) error {
+				// Check for infinite tool loop
+				if !ms.session.RecordToolCall(tc.Name) {
+					ms.emit(ErrorEvent, fmt.Sprintf("Tool loop detected: %s called too many times. Aborting to prevent infinite retry.", tc.Name))
+					return fmt.Errorf("tool loop detected: %s", tc.Name)
+				}
+
+				hasToolCalls = true
+				ms.emit(ToolCall, tc)
+
+				filler := strings.TrimSpace(fullText.String())
+				if filler != "" {
 					go func(t string) {
 						sCtx, sCancel := context.WithCancel(ctx)
 						defer sCancel()
 						ms.speakText(sCtx, t, gen)
-					}(fillerPhrase)
+					}(filler)
+					fullText.Reset()
+				} else {
+					// No pending text — speak a deterministic filler so there's no dead air
+					// while the tool executes (Vapi/Pipecat pattern: platform speaks the
+					// acknowledgment, not the LLM).
+					fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
+					if fillerPhrase != "" {
+						go func(t string) {
+							sCtx, sCancel := context.WithCancel(ctx)
+							defer sCancel()
+							ms.speakText(sCtx, t, gen)
+						}(fillerPhrase)
+					}
 				}
-			}
 
-			toolWg.Add(1)
-			go func(tcData ToolCallEventData) {
-				defer toolWg.Done()
-				result := ms.dispatchToolCall(ctx, tcData)
-				toolMu.Lock()
-				toolResults = append(toolResults, toolExchange{TC: tcData, Result: result})
-				toolMu.Unlock()
-			}(tc)
+				toolWg.Add(1)
+				go func(tcData ToolCallEventData) {
+					defer toolWg.Done()
+					result := ms.dispatchToolCall(ctx, tcData)
+					toolMu.Lock()
+					toolResults = append(toolResults, toolExchange{TC: tcData, Result: result})
+					toolMu.Unlock()
+				}(tc)
 
-			return nil
-		},
-	)
+				return nil
+			},
+		)
+		if err == nil && unspeakable == "" && !hasToolCalls {
+			// The last sentence is only whole once the stream has ended.
+			unspeakable = unspeakableReply(strings.TrimSpace(pendingSentence.String()), tools)
+		}
+		if unspeakable == "" || ctx.Err() != nil {
+			break
+		}
+		ms.logger.Warn("Not speaking: the model wrote its tool call or its reasoning as the reply",
+			"reason", unspeakable, "attempt", attempt, "gen", gen, "text", fullText.String())
+		fullText.Reset()
+		pendingSentence.Reset()
+		if attempt == 2 {
+			break
+		}
+	}
+	if errors.Is(err, errUnspeakableReply) {
+		err = nil
+	}
 
 	toolWg.Wait()
 
 	flushSentence()
 	close(ttsQueue)
 	ttsWg.Wait()
+
+	if unspeakable != "" && !hasToolCalls && err == nil {
+		// Both tries came back unspeakable: the caller hears nothing for this turn, and says so here.
+		ms.logger.Warn("Turn abandoned: the model's reply was not speech twice in a row", "reason", unspeakable, "gen", gen)
+		ms.mu.Lock()
+		if ms.state != StateInterrupted {
+			ms.state = StateIdle
+		}
+		ms.mu.Unlock()
+		return
+	}
 
 	if err != nil {
 		ms.mu.Lock()

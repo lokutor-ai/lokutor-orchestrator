@@ -230,3 +230,72 @@ func TestToolCallInSpeech(t *testing.T) {
 		assert.False(t, toolCallInSpeech(s, tools), "%q", s)
 	}
 }
+
+func TestUnspeakableReply(t *testing.T) {
+	tools := []Tool{{Type: "function", Function: map[string]interface{}{"name": "add_to_cart"}}}
+	// Logged on 2026-09-29.
+	for _, s := range []string{
+		"Sure, here's a desk around three hundred dollars.We have product PROD1 price ninety-nine point nine nine, which is under three hundred.",
+		"Add it.We should call add_to_cart.We need to add product PROD1.",
+		`{"product_id":"PROD1","quantity":1}Done, one hiking boots Premium is now in your cart.`,
+	} {
+		assert.NotEmpty(t, unspeakableReply(s, tools), "%q", s)
+	}
+	for _, s := range []string{
+		"It's ninety-nine ninety-nine. Want me to add it?",
+		"Your flight leaves at 4 p.m. on Friday.",
+		"That's 3.14 percent, about U.S. average.",
+		"¿Te lo añado al carrito? Vale.",
+	} {
+		assert.Empty(t, unspeakableReply(s, tools), "%q", s)
+	}
+}
+
+// A reply that turns out to be a written-out tool call is stopped before it is spoken, and the model
+// is asked again; the second answer, a real tool call, is made.
+func TestManagedStream_WrittenOutToolCallIsRetried(t *testing.T) {
+	llm := &recordingStreamingLLM{script: []struct {
+		text  string
+		calls []ToolCallEventData
+	}{
+		{text: "Sure thing.We should call add_to_cart.We need to add it."},
+		{calls: []ToolCallEventData{{Name: "add_to_cart", Arguments: `{"product_id":"PROD1"}`, CallID: "c1"}}},
+		{text: "Done, it's in your cart."},
+	}}
+	stt := &MockSTTProvider{transcribeResult: "add it"}
+	tts := &MockTTSProvider{synthesizeResult: []byte{1, 2, 3}}
+	orch := NewWithAllLayers(stt, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+	var added sync.WaitGroup
+	added.Add(1)
+	orch.RegisterTool("add_to_cart", func(string) (string, error) { added.Done(); return `{"status":"success"}`, nil })
+
+	session := NewConversationSession("written-out")
+	session.SetTools([]Tool{{Type: "function", Function: map[string]interface{}{"name": "add_to_cart"}}})
+	ms := orch.NewManagedStream(context.Background(), session)
+	defer ms.Close()
+
+	go ms.runLLMAndTTS(context.Background(), "add it")
+
+	var spoken string
+	timeout := time.After(3 * time.Second)
+	for spoken == "" {
+		select {
+		case ev := <-ms.Events():
+			switch ev.Type {
+			case BotResponse:
+				spoken, _ = ev.Data.(string)
+			case ErrorEvent:
+				t.Fatalf("turn failed: %v", ev.Data)
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for the answer after the retried tool call")
+		}
+	}
+	added.Wait()
+	assert.Equal(t, "Done, it's in your cart.", spoken)
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	for _, m := range session.Context {
+		assert.NotContains(t, m.Content, "We should call", "the unspoken reply is not recorded")
+	}
+}

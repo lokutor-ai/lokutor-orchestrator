@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -147,4 +148,25 @@ func toolCallInSpeech(text string, tools []Tool) bool {
 		}
 	}
 	return false
+}
+
+// gluedSentences matches a sentence run into the next with no space ("dollars.We have"), which the
+// model's spoken replies never do and its reasoning, when it leaks into the reply, always does: "Add
+// it.We should call add_to_cart.We need to add product PROD1." (2026-09-29, ten of a hundred benchmark
+// calls). A decimal, "p.m." or "U.S." does not match: it needs a lowercase letter, the stop, then a
+// capitalised word.
+var gluedSentences = regexp.MustCompile(`\p{Ll}[.!?]\p{Lu}\p{Ll}`)
+
+// unspeakableReply says why text must not be read to the caller, or "" if it can be: a tool call
+// written out instead of made (toolCallInSpeech), or the model's reasoning leaking into its reply.
+// gpt-oss does both when its tool call comes out malformed and the provider cannot parse it as one:
+// the call is then never made, and without this the caller heard "product id prod quantity one".
+func unspeakableReply(text string, tools []Tool) string {
+	if toolCallInSpeech(text, tools) {
+		return "tool call written out"
+	}
+	if gluedSentences.MatchString(text) {
+		return "model reasoning"
+	}
+	return ""
 }
