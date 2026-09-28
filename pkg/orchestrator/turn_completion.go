@@ -66,6 +66,19 @@ func NewTurnCompletionAnalyzer() *TurnCompletionAnalyzer {
 	}
 }
 
+// disfluentOpeners: words that, said with nothing else, open a turn rather than make one.
+var disfluentOpeners = map[string]bool{
+	"hey": true, "hi": true, "hello": true, "um": true, "uh": true, "uhm": true, "erm": true, "er": true,
+	"hmm": true, "mm": true, "mmm": true, "oh": true, "well": true, "so": true, "like": true,
+	"hola": true, "eh": true, "em": true, "bueno": true, "pues": true, "este": true,
+}
+
+// trailingFillers: a sentence ending on one of these trails off; it has not ended.
+var trailingFillers = map[string]bool{
+	"um": true, "uh": true, "uhm": true, "erm": true, "er": true, "hmm": true, "mm": true, "mmm": true,
+	"eh": true, "em": true,
+}
+
 func (tca *TurnCompletionAnalyzer) IsLikelyComplete(text string) bool {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -77,6 +90,29 @@ func (tca *TurnCompletionAnalyzer) IsLikelyComplete(text string) bool {
 	// match the final dot of "..." and misclassify the utterance as complete.
 	if regexp.MustCompile(`\.{3,}\s*$`).MatchString(text) {
 		return false
+	}
+
+	// Disfluent openings and trailing fillers, also before completionMarkers: the recogniser
+	// punctuates "Hey." and "I'd like, um." as sentences, so they read as finished and got no
+	// confirmation wait at all. On Full-Duplex-Bench v3 (100 real disfluent requests, 2026-09-28)
+	// the agent answered "Hey..." or "Like, uh," with "Sure thing, what do you need?" while the
+	// caller was still starting, in 42 of 100 calls. A greeting or filler said alone, or a sentence
+	// that trails off on a filler, is someone about to say more. Answers ("yes", "okay", "no") are
+	// not in this set: they stay complete.
+	if words := strings.Fields(strings.ToLower(text)); len(words) > 0 {
+		allOpeners := true
+		for _, w := range words {
+			if !disfluentOpeners[strings.Trim(w, ".,!?¿¡…")] {
+				allOpeners = false
+				break
+			}
+		}
+		if allOpeners {
+			return false
+		}
+		if trailingFillers[strings.Trim(words[len(words)-1], ".,!?¿¡…")] && !strings.HasSuffix(text, "?") {
+			return false
+		}
 	}
 
 	for _, p := range tca.completionMarkers {

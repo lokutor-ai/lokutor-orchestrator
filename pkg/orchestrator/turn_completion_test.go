@@ -78,6 +78,23 @@ func TestTurnCompletion_ShortUtterances(t *testing.T) {
 	assert.False(t, tca.IsLikelyComplete("hmm"))
 }
 
+// The recogniser punctuates disfluent openings as sentences ("Hey.", "Um."), which the completion
+// markers read as finished: Full-Duplex-Bench v3 callers were answered after one word.
+func TestTurnCompletion_DisfluentOpeningsAndTrailingFillers(t *testing.T) {
+	tca := NewTurnCompletionAnalyzer()
+
+	for _, tc := range []string{"Hey.", "Hi.", "Hello.", "Um.", "Uh.", "So.", "Well.", "Oh.",
+		"Hey, oh, um.", "Hi, um.", "Hola.", "Eh.", "Bueno.", "I'd like to, um.", "Could you check my order, uh.",
+		"Quería, eh."} {
+		assert.False(t, tca.IsLikelyComplete(tc), "%q should be incomplete", tc)
+	}
+	// Answers stay complete, and so do real sentences that merely contain a filler.
+	for _, tc := range []string{"Okay.", "Yes.", "No.", "Sure.", "Vale.", "Sí.", "Hey, can you track my order?",
+		"Um, I need to book a flight to Tokyo.", "Well, that works for me.", "Hello, is this the right number?"} {
+		assert.True(t, tca.IsLikelyComplete(tc), "%q should be complete", tc)
+	}
+}
+
 func TestTurnCompletion_ArticleEndingIncomplete(t *testing.T) {
 	tca := NewTurnCompletionAnalyzer()
 
