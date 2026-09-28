@@ -1,0 +1,126 @@
+package orchestrator
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// toolExchange is one tool call and what it returned.
+type toolExchange struct {
+	TC     ToolCallEventData `json:"tool_call"`
+	Result string            `json:"result"`
+}
+
+// recordToolExchange appends a round of tool calls to the history the way every provider requires
+// it: the assistant message carrying the calls, then one result per call, in a single append so
+// nothing can land between them.
+func (ms *ManagedStream) recordToolExchange(content string, calls []toolExchange) {
+	if len(calls) == 0 {
+		return
+	}
+	tcData := make([]interface{}, 0, len(calls))
+	for _, c := range calls {
+		tcData = append(tcData, map[string]interface{}{
+			"id":   c.TC.CallID,
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      c.TC.Name,
+				"arguments": c.TC.Arguments,
+			},
+		})
+	}
+	msgs := []Message{{Role: "assistant", Content: content, ToolCalls: tcData}}
+	for _, c := range calls {
+		// Give the model something it can use rather than an empty tool message.
+		result := strings.TrimSpace(c.Result)
+		if result == "" {
+			result = `{"result": "no result"}`
+		} else if !strings.HasPrefix(result, "{") && !strings.HasPrefix(result, "[") {
+			result = fmt.Sprintf(`{"result": %s}`, jsonQuote(result))
+		}
+		msgs = append(msgs, Message{Role: "tool", Content: result, ToolCallID: c.TC.CallID, Name: c.TC.Name})
+	}
+	ms.session.AddMessagesRaw(msgs...)
+}
+
+// pairedToolMessages returns msgs without the tool exchanges a provider would reject: a tool message
+// that answers no call just before it, and the tool calls of an assistant message that are not each
+// answered right after it (the calls and their partial results go; the message's words, if any,
+// stay). One such message fails every request that carries it and stays in the history, so it
+// silences the rest of the call, not one turn: on 2026-09-29 chained tool calls recorded their
+// results without the calls, Cerebras answered 400 to every later turn, and five benchmark calls went
+// quiet. dropped counts the messages removed.
+func pairedToolMessages(msgs []Message) (out []Message, dropped int) {
+	out = make([]Message, 0, len(msgs))
+	for i := 0; i < len(msgs); {
+		m := msgs[i]
+		if m.Role == "tool" {
+			// A result that answers a call was taken with the call, below.
+			dropped++
+			i++
+			continue
+		}
+		i++
+		if m.ToolCalls == nil {
+			out = append(out, m)
+			continue
+		}
+		j := i
+		for j < len(msgs) && msgs[j].Role == "tool" {
+			j++
+		}
+		ids, ok := toolCallIDs(m.ToolCalls)
+		if !ok {
+			// A shape this cannot read is left alone: it only removes what it can show is broken.
+			out = append(out, msgs[i-1:j]...)
+			i = j
+			continue
+		}
+		want := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			want[id] = true
+		}
+		var results []Message
+		for _, r := range msgs[i:j] {
+			if want[r.ToolCallID] {
+				results = append(results, r)
+				delete(want, r.ToolCallID)
+			} else {
+				dropped++
+			}
+		}
+		if len(ids) > 0 && len(want) == 0 {
+			out = append(out, m)
+			out = append(out, results...)
+		} else {
+			dropped += len(results)
+			if strings.TrimSpace(m.Content) != "" {
+				out = append(out, Message{Role: m.Role, Content: m.Content, Name: m.Name})
+			} else {
+				dropped++
+			}
+		}
+		i = j
+	}
+	return out, dropped
+}
+
+// toolCallIDs reads the call ids out of a message's ToolCalls, whatever shape it was built in.
+func toolCallIDs(toolCalls interface{}) ([]string, bool) {
+	raw, err := json.Marshal(toolCalls)
+	if err != nil {
+		return nil, false
+	}
+	var calls []struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(raw, &calls) != nil {
+		return nil, false
+	}
+	ids := make([]string, len(calls))
+	for i, c := range calls {
+		ids[i] = c.ID
+	}
+	return ids, true
+}

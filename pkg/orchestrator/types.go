@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -628,6 +629,9 @@ type ConversationSession struct {
 	foldLogger      Logger
 	folding         bool
 	nextFoldAttempt time.Time
+	// unpairedLogged is how many unpaired tool messages GetContextCopy last reported, so an orphan
+	// that stays in the history is logged once rather than on every model call.
+	unpairedLogged atomic.Int64
 
 	// basePrompt is the agent's own prompt, before buildSystemPrompt wraps it in the guidelines
 	// and the language section. Kept so that a language change can REBUILD the system prompt
@@ -668,15 +672,22 @@ func (s *ConversationSession) AddMessage(role, content string) {
 // included the system prompt, so an agent with long instructions kept almost none of its call. On
 // 2026-09-24 a caller said "soy Dani" and was asked for their name three more times in 65 seconds.
 func (s *ConversationSession) AddMessageRaw(msg Message) {
+	s.AddMessagesRaw(msg)
+}
+
+// AddMessagesRaw appends msgs together, as AddMessageRaw appends one: nothing can land between them.
+func (s *ConversationSession) AddMessagesRaw(msgs ...Message) {
 	s.mu.Lock()
-	s.Context = append(s.Context, msg)
+	s.Context = append(s.Context, msgs...)
 	dropped := s.enforceHardCeilingLocked()
 	fold := s.maybeStartFoldLocked()
 	logger := s.foldLogger
-	if msg.Role == "user" {
-		s.LastUser = msg.Content
-	} else if msg.Role == "assistant" && msg.Content != "" {
-		s.LastAssistant = msg.Content
+	for _, msg := range msgs {
+		if msg.Role == "user" {
+			s.LastUser = msg.Content
+		} else if msg.Role == "assistant" && msg.Content != "" {
+			s.LastAssistant = msg.Content
+		}
 	}
 	s.mu.Unlock()
 	if dropped > 0 && logger != nil {
@@ -763,11 +774,17 @@ func (s *ConversationSession) NeedsSummarization() bool {
 	return s.overBudgetLocked(s.conversationLocked())
 }
 
+// GetContextCopy is the history as a model is shown it, without any tool exchange a provider would
+// reject (pairedToolMessages). Dropping one is a bug upstream, so it is logged.
 func (s *ConversationSession) GetContextCopy() []Message {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-	contextCopy := make([]Message, len(s.Context))
-	copy(contextCopy, s.Context)
+	contextCopy, dropped := pairedToolMessages(s.Context)
+	logger := s.foldLogger
+	s.mu.RUnlock()
+	if dropped > 0 && logger != nil && s.unpairedLogged.Swap(int64(dropped)) != int64(dropped) {
+		logger.Error("Unpaired tool messages left out of the model's context — a provider rejects the whole request over one, so something recorded a tool call or result on its own",
+			"messages_dropped", dropped)
+	}
 	return contextCopy
 }
 

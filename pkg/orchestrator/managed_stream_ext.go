@@ -188,6 +188,10 @@ func (ms *ManagedStream) dispatchToolCall(ctx context.Context, tcData ToolCallEv
 // pathological chain across many distinct tool names.
 const maxNonStreamingToolRounds = 8
 
+// maxChainedToolRounds is how many rounds of tool calls the model may make after the first one's
+// results, on the streaming path, before it has to answer with what it has.
+const maxChainedToolRounds = 4
+
 func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen int, userTranscript string, calls []ToolCallEventData) {
 	fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
 	if fillerPhrase != "" {
@@ -207,11 +211,7 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 	}
 
 	for round := 0; round < maxNonStreamingToolRounds; round++ {
-		type toolRes struct {
-			TC     ToolCallEventData
-			Result string
-		}
-		var results []toolRes
+		var results []toolExchange
 		var resMu sync.Mutex
 		var wg sync.WaitGroup
 
@@ -227,42 +227,16 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 				defer wg.Done()
 				result := ms.dispatchToolCall(ctx, tcData)
 				resMu.Lock()
-				results = append(results, toolRes{TC: tcData, Result: result})
+				results = append(results, toolExchange{TC: tcData, Result: result})
 				resMu.Unlock()
 			}(tc)
 		}
 		wg.Wait()
 
-		var tcData []interface{}
 		for _, r := range results {
-			tcData = append(tcData, map[string]interface{}{
-				"id":   r.TC.CallID,
-				"type": "function",
-				"function": map[string]interface{}{
-					"name":      r.TC.Name,
-					"arguments": r.TC.Arguments,
-				},
-			})
 			ms.emit(ToolResult, map[string]interface{}{"tool_call": r.TC, "result": r.Result})
 		}
-		ms.session.AddMessageRaw(Message{
-			Role:      "assistant",
-			ToolCalls: tcData,
-		})
-		for _, r := range results {
-			resultContent := strings.TrimSpace(r.Result)
-			if resultContent == "" {
-				resultContent = `{"result": "no result"}`
-			} else if !strings.HasPrefix(resultContent, "{") && !strings.HasPrefix(resultContent, "[") {
-				resultContent = fmt.Sprintf(`{"result": %s}`, jsonQuote(resultContent))
-			}
-			ms.session.AddMessageRaw(Message{
-				Role:       "tool",
-				Content:    resultContent,
-				ToolCallID: r.TC.CallID,
-				Name:       r.TC.Name,
-			})
-		}
+		ms.recordToolExchange("", results)
 
 		final, err := ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), ms.session.GetTools())
 		if err != nil {
@@ -319,11 +293,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	var hasToolCalls bool
 	messages := ms.session.GetContextCopy()
 
-	type toolRes struct {
-		TC     ToolCallEventData `json:"tool_call"`
-		Result string            `json:"result"`
-	}
-	var toolResults []toolRes
+	var toolResults []toolExchange
 	var toolMu sync.Mutex
 
 	ttsQueue := make(chan string, 16)
@@ -487,7 +457,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				defer toolWg.Done()
 				result := ms.dispatchToolCall(ctx, tcData)
 				toolMu.Lock()
-				toolResults = append(toolResults, toolRes{TC: tcData, Result: result})
+				toolResults = append(toolResults, toolExchange{TC: tcData, Result: result})
 				toolMu.Unlock()
 			}(tc)
 
@@ -526,42 +496,10 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	}
 
 	if hasToolCalls {
-		var tcData []interface{}
 		for _, tr := range toolResults {
-			tcData = append(tcData, map[string]interface{}{
-				"id":   tr.TC.CallID,
-				"type": "function",
-				"function": map[string]interface{}{
-					"name":      tr.TC.Name,
-					"arguments": tr.TC.Arguments,
-				},
-			})
 			ms.emit(ToolResult, tr)
 		}
-
-		ms.session.AddMessageRaw(Message{
-			Role:      "assistant",
-			Content:   response,
-			ToolCalls: tcData,
-		})
-
-		for _, tr := range toolResults {
-			// Handle empty/malformed results: give the LLM something actionable
-			// rather than an empty tool message it can't use.
-			resultContent := strings.TrimSpace(tr.Result)
-			if resultContent == "" {
-				resultContent = `{"result": "no result"}`
-			} else if !strings.HasPrefix(resultContent, "{") && !strings.HasPrefix(resultContent, "[") {
-				// Wrap non-JSON results so the LLM can parse them consistently
-				resultContent = fmt.Sprintf(`{"result": %s}`, jsonQuote(resultContent))
-			}
-			ms.session.AddMessageRaw(Message{
-				Role:       "tool",
-				Content:    resultContent,
-				ToolCallID: tr.TC.CallID,
-				Name:       tr.TC.Name,
-			})
-		}
+		ms.recordToolExchange(response, toolResults)
 
 		go func() {
 			freshCtx, c := context.WithCancel(ms.ctx)
@@ -583,43 +521,47 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			// BotThinking is emitted from inside speakText (via speakResponse at the end of this
 			// goroutine), not here — see the comment on that emission for why.
 
-			// Pass tools so the LLM can make further tool calls (multi-step chains).
-			// Use streaming if available so we get real-time text + tool callbacks.
+			// Pass tools so the model can chain further calls. Each round's calls are recorded with
+			// their results (recordToolExchange) and the model is asked again, until it answers in
+			// words or maxChainedToolRounds runs out. Round two used to record only the results — a
+			// tool message answering no call, which Cerebras rejects with a 400, so every later turn
+			// of the call failed too and the caller heard nothing for the rest of it — and never asked
+			// again, so a chained call was answered "Got it." (Full-Duplex-Bench v3, 2026-09-29).
 			tools := ms.session.GetTools()
 			responseText := ""
-			if sProv, ok := ms.orch.llm.(StreamingLLMProvider); ok && len(tools) > 0 {
+			sProv, streaming := ms.orch.llm.(StreamingLLMProvider)
+			for round := 1; ; round++ {
+				if !streaming || len(tools) == 0 {
+					responseText, err = ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), tools)
+					break
+				}
+				var calls []toolExchange
 				responseText, err = sProv.StreamComplete(rCtx, ms.session.GetContextCopy(), tools,
 					func(chunk string) error { return nil }, // text handled below
 					func(tc ToolCallEventData) error {
-						// Multi-step tool chain: execute and append result to context.
-						// Uses the same dispatchToolCall as round one (server handler
-						// with a 15s timeout, or a client-side wait with a 10s
-						// timeout) — previously this block had no client-tool branch
-						// at all and returned "unknown tool" for any tool without a
-						// registered server handler, silently breaking client-side
-						// tools specifically on chained (round 2+) calls.
+						// The same dispatchToolCall as round one: a server handler (15 s timeout) or
+						// the client's answer (10 s). Past the per-tool cap the model is told so,
+						// rather than the turn failing: an error here would leave the caller silent.
 						ms.emit(ToolCall, tc)
-						if !ms.session.RecordToolCall(tc.Name) {
-							return fmt.Errorf("tool loop detected: %s", tc.Name)
+						res := `{"error": "this tool has already been called three times for this request; answer the caller with what you have"}`
+						if ms.session.RecordToolCall(tc.Name) {
+							res = ms.dispatchToolCall(rCtx, tc)
 						}
-						res := ms.dispatchToolCall(rCtx, tc)
-						ms.session.AddMessageRaw(Message{
-							Role:       "tool",
-							Content:    res,
-							ToolCallID: tc.CallID,
-							Name:       tc.Name,
-						})
+						calls = append(calls, toolExchange{TC: tc, Result: res})
 						ms.emit(ToolResult, map[string]interface{}{
 							"tool_call": tc,
 							"result":    res,
 						})
 						return nil
 					})
+				ms.recordToolExchange("", calls)
 				if err != nil {
 					responseText = ""
+					break
 				}
-			} else {
-				responseText, err = ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), tools)
+				if len(calls) == 0 || round >= maxChainedToolRounds {
+					break
+				}
 			}
 			if err != nil {
 				if rCtx.Err() == nil {
