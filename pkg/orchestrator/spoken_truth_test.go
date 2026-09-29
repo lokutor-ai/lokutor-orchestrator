@@ -620,3 +620,50 @@ func TestMergeCarry(t *testing.T) {
 		t.Fatalf("fast joint pass: %q", got)
 	}
 }
+
+func TestMergeBarge(t *testing.T) {
+	newStream := func(stt STTProvider) *ManagedStream {
+		orch := New(stt, &MockLLMProvider{completeResult: "ok"}, &MockTTSProvider{}, DefaultConfig())
+		return orch.NewManagedStream(context.Background(), NewConversationSession("merge-barge"))
+	}
+
+	// A previous utterance that settled on its own is joined as text: no recognition call, no wait.
+	ms := newStream(&slowSTT{delay: time.Hour})
+	defer ms.Close()
+	hola := &committedUtterance{audio: make([]byte, 3200), transcript: "Hola.", endedAt: time.Now()}
+	start := time.Now()
+	got, joined, ok := ms.mergeBarge(context.Background(), hola, make([]byte, 3200), "¿Qué hora abre la oficina mañana?", nil)
+	if !ok || got != "Hola. ¿Qué hora abre la oficina mañana?" || len(joined) == 0 {
+		t.Fatalf("settled fragment: %q ok=%v", got, ok)
+	}
+	if waited := time.Since(start); waited > 50*time.Millisecond {
+		t.Fatalf("settled fragment waited %v", waited)
+	}
+
+	// An open fragment with a joint pass slower than the budget keeps the turns separate, within budget.
+	base := &committedUtterance{audio: make([]byte, 3200), transcript: "Quería reservar un vuelo a", endedAt: time.Now()}
+	own := "Madrid el viernes."
+	slow := newStream(&slowSTT{delay: time.Second, text: "Quería reservar un vuelo a Madrid el viernes."})
+	defer slow.Close()
+	j := slow.startJointTranscription(context.Background(), base, make([]byte, 3200))
+	start = time.Now()
+	if _, _, ok := slow.mergeBarge(context.Background(), base, make([]byte, 3200), own, j); ok {
+		t.Fatal("a joint pass past its budget must not be used")
+	}
+	if waited := time.Since(start); waited > jointWaitBudget+100*time.Millisecond {
+		t.Fatalf("waited %v for a joint pass past its budget of %v", waited, jointWaitBudget)
+	}
+
+	// No joint pass started for this base: separate, immediately.
+	if _, _, ok := slow.mergeBarge(context.Background(), base, make([]byte, 3200), own, nil); ok {
+		t.Fatal("no joint pass means separate turns")
+	}
+
+	// A joint pass ready in time is used.
+	fast := newStream(&slowSTT{delay: 10 * time.Millisecond, text: "Quería reservar un vuelo a Madrid, el viernes."})
+	defer fast.Close()
+	j = fast.startJointTranscription(context.Background(), base, make([]byte, 3200))
+	if got, _, ok := fast.mergeBarge(context.Background(), base, make([]byte, 3200), own, j); !ok || got != "Quería reservar un vuelo a Madrid, el viernes." {
+		t.Fatalf("fast joint pass: %q ok=%v", got, ok)
+	}
+}

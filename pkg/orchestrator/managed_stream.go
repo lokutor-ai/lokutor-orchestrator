@@ -1703,14 +1703,22 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		return
 	}
 
-	// A carried fragment (the caller paused mid-thought, then carried on) is transcribed together with
-	// this utterance. Start that joint pass now, beside this utterance's own transcription, not after
-	// it: see jointWaitBudget. mergeCarry below uses it only if the same fragment is still carried.
+	// A carried fragment (the caller paused mid-thought, then carried on), or the utterance whose reply
+	// this one was spoken over, is transcribed together with this utterance. Start that joint pass now,
+	// beside this utterance's own transcription, not after it: see jointWaitBudget. mergeCarry and
+	// mergeBarge below use it only if it is still the same earlier utterance. One that settled on its own
+	// ("Hola.") is joined as text instead, so no pass is started for it.
 	var joint *jointTranscription
 	ms.mu.Lock()
 	peek := ms.carry
+	if peek != nil && time.Since(peek.endedAt) > continuationMergeWindow {
+		peek = nil
+	}
+	if peek == nil {
+		peek = ms.bargeBaseLocked(time.Now(), seq, ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen)
+	}
 	ms.mu.Unlock()
-	if peek != nil && time.Since(peek.endedAt) <= continuationMergeWindow && needsJointPass(peek.transcript) {
+	if peek != nil && needsJointPass(peek.transcript) {
 		joint = ms.startJointTranscription(ctx, peek, audioData)
 	}
 	defer func() {
@@ -2222,7 +2230,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			_, tailOK := mergeableTail(ms.session.Context)
 			ms.session.mu.Unlock()
 			if tailOK {
-				if merged, joined, ok := ms.transcribeJoined(ctx, bargeBase, audioData, ownTranscript, true); ok {
+				if merged, joined, ok := ms.mergeBarge(ctx, bargeBase, audioData, ownTranscript, joint); ok {
 					transcript = merged
 					uttAudio = joined
 					revisedFrom = bargeBase
