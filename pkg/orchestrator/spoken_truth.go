@@ -493,6 +493,30 @@ func sameWords(a, b string) bool {
 	return strings.Join(strings.Fields(a), " ") == strings.Join(strings.Fields(b), " ")
 }
 
+// replyUnheardLocked reports whether gen's reply was abandoned before any of it reached the caller:
+// speakText's resume check discarded a sentence of it and no audio of it was ever sent (ms.mu held).
+func (ms *ManagedStream) replyUnheardLocked(gen int) bool {
+	return gen != 0 && ms.resumeDiscardGen == gen && ms.synthesizedTextLocked(gen) == ""
+}
+
+// withdrawUnheardReply takes back a reply that was put in context and the transcript before it was
+// spoken, when none of it was. A speculative hit and a non-streaming model have the whole reply in
+// hand and record it first; speakText's resume check can then abandon every sentence of it. The
+// streaming path commits after speaking and simply does not record it (commitStreamedReply).
+func (ms *ManagedStream) withdrawUnheardReply(gen int, response string) {
+	ms.mu.Lock()
+	unheard := ms.replyUnheardLocked(gen) && ms.truthAppliedGen != gen
+	ms.mu.Unlock()
+	if !unheard || strings.TrimSpace(response) == "" {
+		return
+	}
+	// Spoken "" with Emitted: the reply leaves context (applySpokenTruthToContext logs it) and every
+	// transcript drops its line, exactly as for a reply interrupted before a word of it was heard.
+	tr := TruncatedResponse{Full: response, Emitted: true}
+	ms.applySpokenTruthToContext(gen, tr)
+	ms.emitWithGen(BotResponseTruncated, tr, gen)
+}
+
 // synthesizedTextLocked is the text of every segment of gen that reached the transport (ms.mu held):
 // the provisional record of a reply whose pipeline was cancelled before it committed itself.
 func (ms *ManagedStream) synthesizedTextLocked(gen int) string {
@@ -565,6 +589,19 @@ func (ms *ManagedStream) commitStreamedReply(ctx context.Context, gen int, respo
 	ms.replyCommitMu.Lock()
 	defer ms.replyCommitMu.Unlock()
 	if ctx.Err() == nil {
+		ms.mu.Lock()
+		unheard := ms.replyUnheardLocked(gen)
+		ms.mu.Unlock()
+		if unheard && response != "" {
+			// Nothing cancels the turn when speakText abandons a reply because the caller resumed, so
+			// this is still the live-context branch — and it used to record the whole reply as said and
+			// send it to the transcript. On 2026-09-28 (agent_1790600579818180595) the answer to "¿Puedes
+			// reservarme la cita?" was discarded that way, both sentences, and still became the agent's
+			// line in context and on screen; the caller never heard a word of it.
+			ms.logger.Info("Reply not recorded: the caller resumed before any of it played",
+				"gen", gen, "text_len", len(response))
+			return
+		}
 		if response != "" {
 			ms.session.AddMessage("assistant", response)
 			ms.emitBotResponseWithGen(response, gen)

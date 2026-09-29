@@ -218,6 +218,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 
 	ms.logger.Info("Speculative LLM response used", "transcript", transcript)
 	ms.speakResponse(rCtx, response, gen)
+	ms.withdrawUnheardReply(gen, response)
 	return true
 }
 

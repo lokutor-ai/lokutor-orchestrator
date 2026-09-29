@@ -295,7 +295,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	var fullText strings.Builder
 	var hasToolCalls bool
-	messages := ms.session.GetContextCopy()
+	// Plus the check-in note when this is the silence nudge — see llmMessages.
+	messages := ms.llmMessages(userTranscript)
 
 	var toolResults []toolExchange
 	var toolMu sync.Mutex
@@ -381,7 +382,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	var err error
 	for attempt := 1; ; attempt++ {
 		unspeakable = ""
-		_, err = provider.StreamComplete(ctx, messages, tools,
+		_, err = provider.StreamComplete(ctx, messages, ms.toolsOffered(userTranscript),
 			func(chunk string) error {
 				fullText.WriteString(chunk)
 				pendingSentence.WriteString(chunk)

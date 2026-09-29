@@ -81,7 +81,7 @@ func (c *ResponseCache) InvalidateAll() {
 }
 
 func CacheKeyFor(text, lastUserText string) string {
-	if text == "[USER_SILENCE_TIMEOUT]" {
+	if text == silenceTimeoutTrigger {
 		return "silence_timeout"
 	}
 	if len(text) > 64 {

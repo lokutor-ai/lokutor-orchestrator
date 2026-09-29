@@ -256,6 +256,12 @@ type ManagedStream struct {
 	// scheduling (GC pause, CPU throttling) rather than anything this package's own logic is doing
 	// — a different class of problem with a different fix.
 	ckEnterSpecMs int64
+	// responseTrigger is what started the response now being generated: "" for a caller's turn,
+	// or the bot-initiated reason ("opening", "silence_timeout"). A bot-initiated response has no
+	// caller turn behind it, so every caller-anchored clock above still holds the LAST caller turn's
+	// values — which is how the silence nudge came to be logged as a turn with a 10-25 SECOND
+	// ck_pre_llm_ms and every checkpoint at zero. See logBotInitiatedLatency.
+	responseTrigger string
 	// lastDropLogGen rate-limits the dropped-audio warning to one line per
 	// response rather than one per frame.
 	lastDropLogGen int
@@ -348,8 +354,12 @@ type ManagedStream struct {
 	mergeOnConfirm     bool
 	truthAppliedGen    int
 	replyCommitMu      sync.Mutex
-	lastUtt            *committedUtterance
-	carry              *committedUtterance
+	// resumeDiscardGen is the last generation speakText abandoned a sentence of because the caller
+	// had started speaking again before it played. With no audio of that generation ever sent, the
+	// reply was never heard and must not be recorded as said — see replyUnheardLocked.
+	resumeDiscardGen int
+	lastUtt          *committedUtterance
+	carry            *committedUtterance
 
 	// Post-interrupt backoff: block bot output for a short window after a
 	// barge-in so it doesn't talk over the user (Vapi backoffSeconds pattern).
@@ -942,6 +952,14 @@ func foldedHistory(s *ConversationSession) int {
 }
 
 func (ms *ManagedStream) logTurnLatency() {
+	ms.mu.Lock()
+	trigger := ms.responseTrigger
+	ms.mu.Unlock()
+	if trigger != "" {
+		ms.logBotInitiatedLatency(trigger)
+		return
+	}
+
 	end := ms.userSpeechEnd
 	first := ms.ttsFirstChunkTime
 	if end.IsZero() || first.IsZero() || first.Before(end) {
@@ -1503,6 +1521,9 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.ckCacheMs = 0
 	ms.specMissTailMs = 0
 	ms.ckEnterSpecMs = 0
+	// A caller's turn from here on, whatever the bot last said unprompted. The speculative-hit path
+	// never enters runLLMAndTTS, so this is the only reset it gets.
+	ms.responseTrigger = ""
 	ms.mu.Unlock()
 	ms.emit(UserStopped, nil)
 
@@ -2318,7 +2339,11 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.pipelineCtx = rCtx
 	ms.payloadGen++
 	gen := ms.payloadGen
-	if !ms.sttEndTime.IsZero() {
+	ms.responseTrigger = responseTriggerFor(transcript)
+	// Only a caller's turn has an sttEnd of its own to measure from. For a bot-initiated response
+	// sttEndTime belongs to the previous caller turn, and the span to it is how long the caller has
+	// been quiet, not how long anything took.
+	if ms.responseTrigger == "" && !ms.sttEndTime.IsZero() {
 		ms.ckPreLLMMs = enteredAt.Sub(ms.sttEndTime).Milliseconds()
 	}
 	ms.ckLockMs = lockWait.Milliseconds()
@@ -2365,7 +2390,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 		return
 	}
 
-	response, err := ms.orch.GenerateResponse(rCtx, ms.session)
+	response, err := ms.orch.llm.Complete(rCtx, ms.llmMessages(transcript), ms.toolsOffered(transcript))
 	if err != nil {
 		ms.mu.Lock()
 		if ms.state != StateInterrupted {
@@ -2411,6 +2436,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 
 	// Full-response TTS (single pass, no sentence pipelining — avoids residual audio on interrupt)
 	ms.speakText(rCtx, response, gen)
+	ms.withdrawUnheardReply(gen, response)
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
@@ -2489,9 +2515,10 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 			ms.state = StateListening
 		}
 		discarded := ms.discardedMs
+		ms.resumeDiscardGen = gen
 		ms.mu.Unlock()
 		ms.logger.Info("Discarding generated response: caller started speaking again before playback began",
-			"text_len", len(text), "discarded_ms_total", discarded)
+			"gen", gen, "text_len", len(text), "discarded_ms_total", discarded)
 		return
 	}
 
@@ -3663,7 +3690,7 @@ func (ms *ManagedStream) monitorInactivity() {
 			}
 
 			if !thinking && !speaking && !userSpeaking {
-				if time.Since(lastActivity) > timeout {
+				if idle := time.Since(lastActivity); idle > timeout {
 					ms.updateActivity()
 					go func() {
 						ms.mu.Lock()
@@ -3694,8 +3721,18 @@ func (ms *ManagedStream) monitorInactivity() {
 							return
 						}
 						ms.silenceNudgeSent = true
+						state := ms.state
 						ms.mu.Unlock()
-						ms.runLLMAndTTS(ms.ctx, "[USER_SILENCE_TIMEOUT]")
+						// Said out loud, because nothing else in the log marks it: the nudge's reply
+						// used to appear only as a "turn latency" line with no processUtterance before
+						// it, which read as a caller's turn held 10-25 s in the gate and answered late.
+						// caller_unanswered: their last turn has no reply in context, so this answers
+						// it rather than checking in (llmMessages).
+						ms.logger.Info("Silence timeout: bot speaking unprompted",
+							"idle_ms", idle.Milliseconds(), "timeout_ms", timeout.Milliseconds(),
+							"state", state,
+							"caller_unanswered", callerAwaitingReply(ms.session.GetContextCopy()))
+						ms.runLLMAndTTS(ms.ctx, silenceTimeoutTrigger)
 					}()
 				}
 			}
