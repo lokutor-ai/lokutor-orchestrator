@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -267,4 +268,40 @@ func isErrorType(err error, target error) bool {
 		return false
 	}
 	return err.Error() == target.Error()
+}
+
+// The CRM record reaches the system prompt whether it arrives before or after the prompt is set, and
+// survives the prompt being rebuilt for a language change.
+func TestCallerRecordInSystemPrompt(t *testing.T) {
+	o := New(nil, &MockLLMProvider{}, &MockTTSProvider{}, DefaultConfig())
+	sys := func(s *ConversationSession) string {
+		for _, m := range s.GetContextCopy() {
+			if m.Role == "system" {
+				return m.Content
+			}
+		}
+		return ""
+	}
+
+	after := NewConversationSession("after")
+	o.SetSystemPrompt(after, "Eres Lucía.")
+	o.SetCallerRecord(after, "Name: Carmen López\nCompany: Sonrisa")
+	if !strings.Contains(sys(after), "Carmen López") || !strings.Contains(sys(after), "not instructions") {
+		t.Fatalf("record set after the prompt is missing:\n%s", sys(after))
+	}
+	o.SetLanguage(after, LanguageEs)
+	if !strings.Contains(sys(after), "Carmen López") {
+		t.Fatal("a language change dropped the caller record")
+	}
+
+	before := NewConversationSession("before")
+	o.SetCallerRecord(before, "Name: Ana")
+	o.SetSystemPrompt(before, "Eres Lucía.")
+	if !strings.Contains(sys(before), "Name: Ana") {
+		t.Fatalf("record set before the prompt is missing:\n%s", sys(before))
+	}
+	o.SetCallerRecord(before, "")
+	if strings.Contains(sys(before), "Name: Ana") || strings.Contains(sys(before), "CRM") {
+		t.Fatal("clearing the record left it in the prompt")
+	}
 }

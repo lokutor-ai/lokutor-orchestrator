@@ -612,6 +612,10 @@ type ConversationSession struct {
 	Tools           []Tool
 	toolCallCounts  map[string]int // Track how many times each tool has been called
 	UserMemory      string         // Cross-call memory extracted from previous sessions
+	// CallerRecord is what the customer's CRM knows about the person on the call (name, company,
+	// open deals, recent notes), looked up when the call starts. It is rendered into the system prompt
+	// under its own heading, so it survives the prompt being rebuilt for a language change.
+	CallerRecord string
 
 	// MaxContextTokens budgets the CONVERSATION by size (the system prompt, call summary and
 	// knowledge passage are pinned outside it); MaxMessages by count. Past either, the oldest turns
