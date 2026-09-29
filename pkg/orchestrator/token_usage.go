@@ -29,6 +29,31 @@ type TokenUsage struct {
 	completionTokens int
 	totalTokens      int
 	reported         bool
+	// answeredBy is the provider a chain's turn came from. Since 2026-09-29 the second provider is a
+	// different model at a different price, so which one answered is part of what a turn cost and said.
+	answeredBy string
+}
+
+// SetAnsweredBy records the provider that produced the output. A tool round is a second call, and the
+// last one is what the caller hears, so a later call overwrites.
+func (u *TokenUsage) SetAnsweredBy(name string) {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.answeredBy = name
+}
+
+// AnsweredBy is the provider recorded by SetAnsweredBy, or "" when nothing recorded one (a single
+// provider rather than a chain).
+func (u *TokenUsage) AnsweredBy() string {
+	if u == nil {
+		return ""
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.answeredBy
 }
 
 // Record stores the counts a provider parsed. Later calls accumulate rather than overwrite: one

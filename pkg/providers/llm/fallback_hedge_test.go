@@ -143,3 +143,34 @@ func TestHedgedChainReportsEveryProvidersFailure(t *testing.T) {
 		}
 	}
 }
+
+// Which provider answered is recorded on the turn's usage sink, for the turn log: since 2026-09-29 the
+// second provider is a different model at a different price.
+func TestChainRecordsWhichProviderAnswered(t *testing.T) {
+	run := func(c *ChainLLM) string {
+		u := &orchestrator.TokenUsage{}
+		ctx := orchestrator.WithTokenUsage(context.Background(), u)
+		if _, err := c.StreamComplete(ctx, nil, nil, func(string) error { return nil }, nil); err != nil {
+			t.Fatal(err)
+		}
+		return u.AnsweredBy()
+	}
+	t.Setenv("LLM_HEDGE_MS", "200")
+	if got := run(NewChainLLM("t", &fakeStreamer{name: "a", firstAfter: 10 * time.Millisecond, chunks: []string{"x"}},
+		&fakeStreamer{name: "b", chunks: []string{"y"}})); got != "a" {
+		t.Fatalf("fast primary: answered by %q", got)
+	}
+	if got := run(NewChainLLM("t", &fakeStreamer{name: "a", firstAfter: 3 * time.Second, chunks: []string{"x"}},
+		&fakeStreamer{name: "b", firstAfter: 50 * time.Millisecond, chunks: []string{"y"}})); got != "b" {
+		t.Fatalf("hedge win: answered by %q", got)
+	}
+	if got := run(NewChainLLM("t", &fakeStreamer{name: "a", err: errors.New("429")},
+		&fakeStreamer{name: "b", chunks: []string{"y"}})); got != "b" {
+		t.Fatalf("failover: answered by %q", got)
+	}
+	t.Setenv("LLM_HEDGE_MS", "0")
+	if got := run(NewChainLLM("t", &fakeStreamer{name: "a", err: errors.New("429")},
+		&fakeStreamer{name: "b", chunks: []string{"y"}})); got != "b" {
+		t.Fatalf("sequential failover: answered by %q", got)
+	}
+}

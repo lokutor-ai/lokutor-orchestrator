@@ -110,6 +110,9 @@ func (c *ChainLLM) Complete(ctx context.Context, messages []orchestrator.Message
 	var failed chainFailures
 	for _, p := range c.providers {
 		text, err := p.Complete(ctx, messages, tools)
+		if err == nil {
+			orchestrator.TokenUsageFrom(ctx).SetAnsweredBy(p.Name())
+		}
 		if err == nil || ctx.Err() != nil || !shouldFailover(err) {
 			return text, err
 		}
@@ -176,6 +179,9 @@ func (c *ChainLLM) streamSequential(
 			text, err = p.Complete(ctx, messages, tools)
 		}
 
+		if err == nil || started {
+			orchestrator.TokenUsageFrom(ctx).SetAnsweredBy(p.Name())
+		}
 		if err == nil || started || ctx.Err() != nil || !shouldFailover(err) {
 			return text, err
 		}
@@ -217,6 +223,7 @@ func (c *ChainLLM) streamHedged(
 		defer mu.Unlock()
 		if winner == -1 {
 			winner = i
+			orchestrator.TokenUsageFrom(ctx).SetAnsweredBy(c.providers[i].Name())
 			for j, cancel := range cancels {
 				if j != i && cancel != nil {
 					cancel()

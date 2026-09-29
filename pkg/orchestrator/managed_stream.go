@@ -1081,6 +1081,7 @@ func (ms *ManagedStream) logTurnLatency() {
 		"spec_miss_tail_ms", specMissTail,
 		"llm_ms", llm,
 		// What the language model actually charged us for this turn. -1 = not reported.
+		"llm_provider", turnTokens.AnsweredBy(),
 		"llm_prompt_tokens", promptTok,
 		"llm_completion_tokens", completionTok,
 		"llm_total_tokens", totalTok,
