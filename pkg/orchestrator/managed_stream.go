@@ -225,7 +225,10 @@ type ManagedStream struct {
 	// lying is exactly what this log line exists to stop, so the span is split
 	// until it accounts for itself.
 	confirmWaitMs int64
-	specAwaitMs   int64
+	// joinWaitMs is how long this turn waited on the joint transcription of a carried fragment and its
+	// continuation (mergeCarry). It was the unnamed bulk of gate_other_ms under load (2026-09-29).
+	joinWaitMs  int64
+	specAwaitMs int64
 	// Checkpoints across the sttEnd -> llmStart span, so a large value points
 	// at a line rather than a region. Measured in ms from sttEndTime.
 	ckShadowMs int64 // through the noise checks and the Turno shadow block
@@ -1012,7 +1015,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	// turn_gate_ms split into its parts, so a large value names its own cause
 	// instead of being a span nobody can attribute.
 	ms.mu.Lock()
-	confirmWait, specAwait := ms.confirmWaitMs, ms.specAwaitMs
+	confirmWait, specAwait, joinWait := ms.confirmWaitMs, ms.specAwaitMs, ms.joinWaitMs
 	ckShadow, ckGate, ckBarge, ckCache := ms.ckShadowMs, ms.ckGateMs, ms.ckBargeMs, ms.ckCacheMs
 	ckPreLLM, ckLock := ms.ckPreLLMMs, ms.ckLockMs
 	specMissTail := ms.specMissTailMs
@@ -1031,7 +1034,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	}
 	gateOther := gate
 	if gateOther > 0 {
-		gateOther -= confirmWait + specAwait
+		gateOther -= confirmWait + specAwait + joinWait
 		if gateOther < 0 {
 			gateOther = 0
 		}
@@ -1053,6 +1056,7 @@ func (ms *ManagedStream) logTurnLatency() {
 		// Where turn_gate_ms went: the mid-thought confirmation wait, the
 		// speculative-LLM await, and whatever is left over.
 		"gate_confirm_ms", confirmWait,
+		"gate_join_ms", joinWait,
 		"gate_spec_await_ms", specAwait,
 		"gate_other_ms", gateOther,
 		// Cumulative milliseconds from sttEnd to each checkpoint, so a slow
@@ -1513,6 +1517,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 	ms.discardStart = time.Time{}
 	ms.confirmWaitMs = 0
 	ms.specAwaitMs = 0
+	ms.joinWaitMs = 0
 	ms.ckShadowMs = 0
 	ms.ckPreLLMMs = 0
 	ms.ckLockMs = 0
@@ -1698,6 +1703,22 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		return
 	}
 
+	// A carried fragment (the caller paused mid-thought, then carried on) is transcribed together with
+	// this utterance. Start that joint pass now, beside this utterance's own transcription, not after
+	// it: see jointWaitBudget. mergeCarry below uses it only if the same fragment is still carried.
+	var joint *jointTranscription
+	ms.mu.Lock()
+	peek := ms.carry
+	ms.mu.Unlock()
+	if peek != nil && time.Since(peek.endedAt) <= continuationMergeWindow && needsJointPass(peek.transcript) {
+		joint = ms.startJointTranscription(ctx, peek, audioData)
+	}
+	defer func() {
+		if joint != nil {
+			joint.cancel()
+		}
+	}()
+
 	ms.sttStartTime = time.Now()
 
 	// Read the LATEST streaming partial — don't wait, just grab what's available
@@ -1882,10 +1903,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	carryBase := ms.takeCarryLocked(time.Now())
 	ms.mu.Unlock()
 	if carryBase != nil {
-		if merged, joined, ok := ms.transcribeJoined(ctx, carryBase, audioData, ownTranscript, false); ok {
-			transcript = merged
-			uttAudio = joined
-		}
+		transcript, uttAudio = ms.mergeCarry(ctx, carryBase, audioData, ownTranscript, joint)
 	}
 
 	// Mid-thought pause guard: VAD's silence-based end-of-turn has no way to

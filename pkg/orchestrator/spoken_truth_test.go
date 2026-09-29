@@ -543,3 +543,80 @@ func TestProcessUtterance_EnglishShortReplyWithTheFloorIsATurn(t *testing.T) {
 		t.Fatalf("TranscriptFinal = %v", ev.Data)
 	}
 }
+
+// The recogniser writes a joint transcription's sentences with no space between them; that is still
+// more words than the continuation alone.
+func TestAcceptMergedSentencesRunTogether(t *testing.T) {
+	if !acceptMerged("Hola.¿Qué hora abre la oficina mañana?", "¿Qué hora abre la oficina mañana?") {
+		t.Fatal(`"Hola.¿Qué hora…" joins both halves and must be accepted`)
+	}
+	if got := spaceSentences("Hola.¿Qué hora? Sí.Vale, 3.5 euros"); got != "Hola. ¿Qué hora? Sí. Vale, 3.5 euros" {
+		t.Fatalf("spaceSentences: %q", got)
+	}
+}
+
+func TestNeedsJointPass(t *testing.T) {
+	for frag, want := range map[string]bool{
+		"Hola.": false, "Um.": false, "Vale, sí.": false, "¿Sí?": false,
+		"Hola": true, "I'd like to book a flight to": true, "Mi nombre es Pito,": true, "": false,
+	} {
+		if got := needsJointPass(frag); got != want {
+			t.Errorf("needsJointPass(%q) = %v, want %v", frag, got, want)
+		}
+	}
+}
+
+// slowSTT answers after delay, or when its context is cancelled.
+type slowSTT struct {
+	delay time.Duration
+	text  string
+}
+
+func (s *slowSTT) Transcribe(ctx context.Context, audio []byte, lang Language) (TranscriptionResult, error) {
+	select {
+	case <-time.After(s.delay):
+		return TranscriptionResult{Text: s.text}, nil
+	case <-ctx.Done():
+		return TranscriptionResult{}, ctx.Err()
+	}
+}
+func (s *slowSTT) Name() string { return "slowSTT" }
+
+func TestMergeCarry(t *testing.T) {
+	base := &committedUtterance{audio: make([]byte, 3200), transcript: "Quería reservar un vuelo a", endedAt: time.Now()}
+	own := "Madrid el viernes."
+	newStream := func(stt STTProvider) *ManagedStream {
+		orch := New(stt, &MockLLMProvider{completeResult: "ok"}, &MockTTSProvider{}, DefaultConfig())
+		return orch.NewManagedStream(context.Background(), NewConversationSession("merge-carry"))
+	}
+
+	// A fragment that settles on its own is joined as text with no second recognition call.
+	ms := newStream(&slowSTT{delay: time.Hour})
+	defer ms.Close()
+	short := &committedUtterance{audio: make([]byte, 3200), transcript: "Hola.", endedAt: time.Now()}
+	if got, _ := ms.mergeCarry(context.Background(), short, make([]byte, 3200), "¿Qué hora abre?", nil); got != "Hola. ¿Qué hora abre?" {
+		t.Fatalf("short fragment: %q", got)
+	}
+
+	// A joint pass slower than the budget is not waited for: the two halves are joined as text, and the
+	// first half is kept.
+	slow := newStream(&slowSTT{delay: time.Second, text: "Quería reservar un vuelo a Madrid el viernes."})
+	defer slow.Close()
+	j := slow.startJointTranscription(context.Background(), base, make([]byte, 3200))
+	start := time.Now()
+	got, _ := slow.mergeCarry(context.Background(), base, make([]byte, 3200), own, j)
+	if got != "Quería reservar un vuelo a Madrid el viernes." {
+		t.Fatalf("slow joint pass: %q", got)
+	}
+	if waited := time.Since(start); waited > jointWaitBudget+100*time.Millisecond {
+		t.Fatalf("waited %v for a joint pass past its budget of %v", waited, jointWaitBudget)
+	}
+
+	// A joint pass ready in time is used.
+	fast := newStream(&slowSTT{delay: 10 * time.Millisecond, text: "Quería reservar un vuelo a Madrid, el viernes."})
+	defer fast.Close()
+	j = fast.startJointTranscription(context.Background(), base, make([]byte, 3200))
+	if got, _ := fast.mergeCarry(context.Background(), base, make([]byte, 3200), own, j); got != "Quería reservar un vuelo a Madrid, el viernes." {
+		t.Fatalf("fast joint pass: %q", got)
+	}
+}
