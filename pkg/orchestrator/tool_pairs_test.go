@@ -235,9 +235,11 @@ func TestUnspeakableReply(t *testing.T) {
 	tools := []Tool{{Type: "function", Function: map[string]interface{}{"name": "add_to_cart"}}}
 	// Logged on 2026-09-29.
 	for _, s := range []string{
-		"Sure, here's a desk around three hundred dollars.We have product PROD1 price ninety-nine point nine nine, which is under three hundred.",
 		"Add it.We should call add_to_cart.We need to add product PROD1.",
+		"Sure thing, adding another.We need to call add_to_cart again with quantity 1.",
 		`{"product_id":"PROD1","quantity":1}Done, one hiking boots Premium is now in your cart.`,
+		`Yes, please add it to my…?{"product_id":"PROD1","quantity":1}All set.`,
+		"Okay. The assistant should answer with: We need to follow instructions.",
 	} {
 		assert.NotEmpty(t, unspeakableReply(s, tools), "%q", s)
 	}
@@ -246,6 +248,10 @@ func TestUnspeakableReply(t *testing.T) {
 		"Your flight leaves at 4 p.m. on Friday.",
 		"That's 3.14 percent, about U.S. average.",
 		"¿Te lo añado al carrito? Vale.",
+		// gpt-oss joins its own messages with no space in good replies too.
+		"Sorry, I'm not sure what you meant.What's your budget for monthly rent?",
+		"I found a premium item for about two ninety dollars.Here are a few options under three hundred dollars.",
+		"We need your passport number to finish the booking.",
 	} {
 		assert.Empty(t, unspeakableReply(s, tools), "%q", s)
 	}
@@ -258,7 +264,7 @@ func TestManagedStream_WrittenOutToolCallIsRetried(t *testing.T) {
 		text  string
 		calls []ToolCallEventData
 	}{
-		{text: "Sure thing.We should call add_to_cart.We need to add it."},
+		{text: "Sure thing.We should call add_to_cart.We need to add it."}, // leaked reasoning
 		{calls: []ToolCallEventData{{Name: "add_to_cart", Arguments: `{"product_id":"PROD1"}`, CallID: "c1"}}},
 		{text: "Done, it's in your cart."},
 	}}

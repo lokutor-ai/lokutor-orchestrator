@@ -150,12 +150,13 @@ func toolCallInSpeech(text string, tools []Tool) bool {
 	return false
 }
 
-// gluedSentences matches a sentence run into the next with no space ("dollars.We have"), which the
-// model's spoken replies never do and its reasoning, when it leaks into the reply, always does: "Add
-// it.We should call add_to_cart.We need to add product PROD1." (2026-09-29, ten of a hundred benchmark
-// calls). A decimal, "p.m." or "U.S." does not match: it needs a lowercase letter, the stop, then a
-// capitalised word.
-var gluedSentences = regexp.MustCompile(`\p{Ll}[.!?]\p{Lu}\p{Ll}`)
+// reasoningInReply matches gpt-oss's reasoning when it leaks into a reply. It talks about the call it
+// has to make and about the caller in the third person, which a reply to the caller never does: "Add
+// it.We should call add_to_cart.We need to call add_to_cart now.Let's call." and "The assistant should
+// answer with:" (2026-09-29). Sentences run together with no space are NOT the sign: gpt-oss joins its
+// own messages that way in good replies too ("Sorry, I'm not sure what you meant.What's your budget?"),
+// and a rule on that alone threw away fine answers.
+var reasoningInReply = regexp.MustCompile(`(?i)\b(we (need|should|must|have) to (call|invoke|execute|format)|we should call|let's (call|invoke)|now (call|execute)\b|need to call|the user (says|said|wants|asked|seems|is asking)|user says|the assistant (should|must|needs to|will)|call the tool)`)
 
 // unspeakableReply says why text must not be read to the caller, or "" if it can be: a tool call
 // written out instead of made (toolCallInSpeech), or the model's reasoning leaking into its reply.
@@ -165,7 +166,7 @@ func unspeakableReply(text string, tools []Tool) string {
 	if toolCallInSpeech(text, tools) {
 		return "tool call written out"
 	}
-	if gluedSentences.MatchString(text) {
+	if reasoningInReply.MatchString(text) {
 		return "model reasoning"
 	}
 	return ""
