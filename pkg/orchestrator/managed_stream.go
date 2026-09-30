@@ -109,6 +109,13 @@ type ManagedStream struct {
 	echoNearEndBuf []byte
 	echoNearEndGen int
 	echoMu         sync.Mutex
+	// echoFarPending is outgoing audio not yet played, echoFarClock how far echoFarEndBuf has been
+	// filled in real time (echo_correlation.go, advanceFarEndEcho).
+	echoFarPending []echoFarChunk
+	echoFarClock   time.Time
+	// echoHeldPlayThroughAt is the onset of the barge-in for which play-through was kept going
+	// because the speech matched the agent's own audio (logged once per barge-in).
+	echoHeldPlayThroughAt time.Time
 
 	cmdChan       chan []byte
 	interruptChan chan struct{}
@@ -810,6 +817,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	if ms.inputSampleRate != 16000 {
 		audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
 	}
+	ms.advanceFarEndEcho(time.Now())
 	ms.mu.Lock()
 	pendingGenForEcho := ms.pendingBargeGen
 	pendingForEcho := ms.pendingBargeIn
@@ -2785,15 +2793,13 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 }
 
 func (ms *ManagedStream) emitFrames(data []byte, frameSize, gen int) {
-	// Echo correlation runs regardless of whether Turno is loaded — it doesn't depend on that
-	// model at all — so the resample happens unconditionally; noteFarEndAudio below (Turno's own
-	// consumable copy) reuses the same resampled chunk rather than resampling twice.
-	farChunk16k := data
-	if ms.playbackRate != 16000 {
-		farChunk16k = resampleTo16k(data, ms.playbackRate)
-	}
-	ms.noteFarEndEcho(farChunk16k)
+	// Turno's far-end channel. The echo check's own copy is fed later, where each chunk goes on
+	// the playout clock (emitWithGen), so it lines up with what the caller's speaker plays.
 	if ms.turno != nil {
+		farChunk16k := data
+		if ms.playbackRate != 16000 {
+			farChunk16k = resampleTo16k(data, ms.playbackRate)
+		}
 		ms.noteFarEndAudio(farChunk16k)
 	}
 	for i := 0; i < len(data); i += frameSize {
@@ -3472,6 +3478,14 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		// caller's playout clock (spoken_truth.go).
 		if chunk, ok := data.([]byte); ok {
 			ms.scheduleAudioLocked(gen, len(chunk), time.Now())
+			if ms.playout.gen == gen && ms.playbackRate > 0 {
+				dur := time.Duration(len(chunk)) * time.Second / time.Duration(int64(ms.playbackRate)*2)
+				far := chunk
+				if ms.playbackRate != 16000 {
+					far = resampleTo16k(chunk, ms.playbackRate)
+				}
+				ms.noteFarEndEchoScheduled(gen, far, ms.playout.end.Add(-dur))
+			}
 		}
 	}
 	ms.mu.Unlock()
