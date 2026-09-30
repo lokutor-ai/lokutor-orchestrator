@@ -75,6 +75,24 @@ func TestForGptOssInPrompt(t *testing.T) {
 	assert.Equal(t, "add it", got[1].Content)
 }
 
+func TestForGptOssBeforeLastUser(t *testing.T) {
+	history := gptOssHistory()
+	got := forGptOss("gpt-oss-120b", history, GptOssToolHistoryBeforeLastUser)
+	assert.Equal(t, []orchestrator.Message{
+		{Role: "system", Content: "prompt"},
+		{Role: "user", Content: "add it"},
+		{Role: "assistant", Content: "Done."},
+		{Role: "user", Content: "what's in it"},
+		{Role: "assistant", Content: "One item."},
+		{Role: "system", Content: "# Tools called earlier in this call\n" +
+			`Tool add_to_cart was called with {"product_id":"PROD1"} and returned {"status":"success"}` + "\n" +
+			`Tool view_cart was called with {} and returned {"items":1}`},
+		{Role: "user", Content: "add another"},
+		history[10],
+		history[11],
+	}, got)
+}
+
 func TestSetGptOssToolHistory(t *testing.T) {
 	c, g, o := NewCerebrasLLM("k", ""), NewGroqLLM("k", ""), NewOpenRouterLLM("k", "", nil, "")
 	SetGptOssToolHistory(NewChainLLM("chain", c, NewChainLLM("inner", g, o)), GptOssToolHistoryInPrompt)

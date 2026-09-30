@@ -18,6 +18,9 @@ const (
 	// GptOssToolHistoryInPrompt sends them together as one section at the end of the first system
 	// message.
 	GptOssToolHistoryInPrompt GptOssToolHistory = "prompt"
+	// GptOssToolHistoryBeforeLastUser sends them together as one system message just before the
+	// caller's latest message.
+	GptOssToolHistoryBeforeLastUser GptOssToolHistory = "tail"
 )
 
 // defaultGptOssToolHistory is what a provider uses when nothing was set.
@@ -29,7 +32,7 @@ const earlierToolsHeading = "# Tools called earlier in this call"
 // ParseGptOssToolHistory reads a GptOssToolHistory by name; ok is false for anything else.
 func ParseGptOssToolHistory(s string) (h GptOssToolHistory, ok bool) {
 	switch h := GptOssToolHistory(strings.ToLower(strings.TrimSpace(s))); h {
-	case GptOssToolHistoryNotes, GptOssToolHistoryInPrompt:
+	case GptOssToolHistoryNotes, GptOssToolHistoryInPrompt, GptOssToolHistoryBeforeLastUser:
 		return h, true
 	}
 	return "", false
@@ -93,10 +96,14 @@ func forGptOss(model string, messages []orchestrator.Message, where GptOssToolHi
 	type call struct{ name, args string }
 	calls := map[string]call{}
 	var folded []string
+	lastUserAt := 0
 	out := make([]orchestrator.Message, 0, len(messages)+1)
 	for i, m := range messages {
 		switch {
 		case i >= lastUser:
+			if i == lastUser {
+				lastUserAt = len(out)
+			}
 			out = append(out, m)
 		case m.ToolCalls != nil:
 			for _, c := range toolCallsIn(m.ToolCalls) {
@@ -111,7 +118,7 @@ func forGptOss(model string, messages []orchestrator.Message, where GptOssToolHi
 				c.name = m.Name
 			}
 			note := fmt.Sprintf("Tool %s was called with %s and returned %s", c.name, c.args, m.Content)
-			if where == GptOssToolHistoryInPrompt {
+			if where == GptOssToolHistoryInPrompt || where == GptOssToolHistoryBeforeLastUser {
 				folded = append(folded, note)
 			} else {
 				out = append(out, orchestrator.Message{Role: "system", Content: note})
@@ -122,6 +129,10 @@ func forGptOss(model string, messages []orchestrator.Message, where GptOssToolHi
 	}
 	if len(folded) > 0 {
 		section := earlierToolsHeading + "\n" + strings.Join(folded, "\n")
+		if where == GptOssToolHistoryBeforeLastUser {
+			note := orchestrator.Message{Role: "system", Content: section}
+			return append(out[:lastUserAt:lastUserAt], append([]orchestrator.Message{note}, out[lastUserAt:]...)...)
+		}
 		if len(out) > 0 && out[0].Role == "system" {
 			// out[0] is a copy: the session's own system prompt is not touched.
 			out[0].Content = strings.TrimRight(out[0].Content, "\n") + "\n\n" + section
