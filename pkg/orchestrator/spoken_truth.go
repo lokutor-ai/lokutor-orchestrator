@@ -722,6 +722,19 @@ type jointTranscription struct {
 	err    error
 }
 
+// result is the joint pass's text and error once it has finished, and nothing while it is still
+// running: when awaitJoint gives up on it (past jointWaitBudget) the goroutine may still be writing
+// them, and the log lines that reported them read them anyway -- a data race, and the reason
+// go test -race failed TestMergeBarge and TestMergeCarry.
+func (j *jointTranscription) result() (string, error) {
+	select {
+	case <-j.done:
+		return j.text, j.err
+	default:
+		return "", nil
+	}
+}
+
 // needsJointPass reports whether a carried fragment gains anything from being transcribed again together
 // with its continuation. A short fragment the recogniser closed as a sentence of its own ("Hola.",
 // "Vale.", "Um.") does not: its words are settled and joining the text is exact, so the second
@@ -775,8 +788,9 @@ func (ms *ManagedStream) mergeCarry(ctx context.Context, base *committedUtteranc
 	}
 	merged, why := ms.awaitJoint(ctx, joint, own)
 	if merged == "" {
+		jointText, jointErr := joint.result()
 		ms.logger.Info("Continuation: joint transcription "+why+", joined as text", "previous", base.transcript,
-			"continuation", own, "joint", joint.text, "merged", asText, "error", joint.err)
+			"continuation", own, "joint", jointText, "merged", asText, "error", jointErr)
 		return asText, joint.joined
 	}
 	ms.logger.Info("Continuation: transcribed together with the previous utterance",
@@ -833,8 +847,9 @@ func (ms *ManagedStream) mergeBarge(ctx context.Context, base *committedUtteranc
 	}
 	merged, why := ms.awaitJoint(ctx, joint, own)
 	if merged == "" {
+		jointText, jointErr := joint.result()
 		ms.logger.Info("Continuation: joint transcription "+why+", keeping the two halves separate",
-			"previous", base.transcript, "continuation", own, "joint", joint.text, "error", joint.err)
+			"previous", base.transcript, "continuation", own, "joint", jointText, "error", jointErr)
 		return "", nil, false
 	}
 	ms.logger.Info("Continuation: transcribed together with the previous utterance",
