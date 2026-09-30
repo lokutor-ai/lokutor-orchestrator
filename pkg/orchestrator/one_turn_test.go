@@ -240,3 +240,30 @@ func TestManagedStream_UnspeakableTwiceAfterToolIsNotSpoken(t *testing.T) {
 		}
 	}
 }
+
+func TestWhenTokensSettled_WaitsForADrain(t *testing.T) {
+	u := &TokenUsage{}
+	logged := make(chan [2]int, 1)
+	log := func() { p, c, _, _ := u.Snapshot(); logged <- [2]int{p, c} }
+
+	whenTokensSettled(u, log) // nothing draining: logged at once
+	assert.Equal(t, [2]int{0, 0}, <-logged)
+
+	done := u.DrainStarted()
+	whenTokensSettled(u, log)
+	select {
+	case <-logged:
+		t.Fatal("logged before the drain ended")
+	case <-time.After(50 * time.Millisecond):
+	}
+	u.Record(4593, 195, 4788)
+	done()
+	select {
+	case got := <-logged:
+		assert.Equal(t, [2]int{4593, 195}, got)
+	case <-time.After(time.Second):
+		t.Fatal("never logged")
+	}
+	assert.Nil(t, u.Draining())
+	done() // a second call is harmless
+}

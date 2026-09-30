@@ -106,3 +106,57 @@ func TestGroqStream_GluedRunOnIsCut(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "¿Cuántas llamadas recibís al día?", got)
 }
+
+// In production the provider runs inside the hedged chain, which cancelled the winning attempt's
+// context as soon as it returned. The drain stopped with it, so every cut turn logged -1 tokens
+// (telnyx_1790771177025627965, 2026-09-30: 8 of 22 turns). The winner's context now outlives the
+// return long enough for the rest of the stream, and its usage, to be read.
+func TestHedgedChain_CutReplyStillCountsItsTokens(t *testing.T) {
+	t.Setenv("LLM_HEDGE_MS", "800")
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		for _, l := range []string{
+			`{"choices":[{"delta":{"content":"¿Cuántas llamadas recibís al día?"}}]}`,
+			`{"choices":[{"delta":{"reasoning":"User hasn't responded."}}]}`,
+			`{"choices":[{"delta":{"content":"Unas veinte, supongo."}}]}`,
+		} {
+			fmt.Fprintln(w, "data: "+l)
+			fl.Flush()
+		}
+		time.Sleep(150 * time.Millisecond) // the model still writing after the cut
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":" Perfecto, ¿y en qué idiomas?"}}]}`)
+		fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":4593,"completion_tokens":195,"total_tokens":4788}}`)
+		fmt.Fprintln(w, "data: [DONE]")
+		fl.Flush()
+	}))
+	defer slow.Close()
+	backup := sseServer(`{"choices":[{"delta":{"content":"backup"}}]}`)
+	defer backup.Close()
+
+	cer := NewCerebrasLLM("k", "gpt-oss-120b")
+	cer.url = slow.URL
+	grq := NewGroqLLM("k", "openai/gpt-oss-120b")
+	grq.url = backup.URL
+	chain := NewChainLLM("test", cer, grq)
+
+	u := &orchestrator.TokenUsage{}
+	ctx, cancel := context.WithCancel(orchestrator.WithTokenUsage(context.Background(), u))
+	defer cancel()
+	got, err := chain.StreamComplete(ctx, nil, nil, func(string) error { return nil }, nil)
+	assert.NoError(t, err)
+	assert.Equal(t, "¿Cuántas llamadas recibís al día?", got)
+	assert.NotNil(t, u.Draining(), "the rest of the stream is still being read")
+	select {
+	case <-u.Draining():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the drain never finished")
+	}
+	p, c, _, ok := u.Snapshot()
+	assert.True(t, ok, "the cut turn's tokens are counted")
+	assert.Equal(t, 4593, p)
+	assert.Equal(t, 195, c)
+	if cuts := u.TakeRunOns(); assert.Len(t, cuts, 1) {
+		assert.Equal(t, "Unas veinte, supongo. Perfecto, ¿y en qué idiomas?", cuts[0].Dropped())
+	}
+}

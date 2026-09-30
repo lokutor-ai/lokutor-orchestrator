@@ -36,6 +36,47 @@ type TokenUsage struct {
 	// runOns are the replies a provider cut short because the model went on past its turn (see
 	// providers/llm oneTurn): what it said and did not get to say is part of what the turn said.
 	runOns []*RunOnCut
+	// drains counts cut replies whose streams are still being read for their token counts; drained
+	// is closed when the last one ends.
+	drains  int
+	drained chan struct{}
+}
+
+// DrainStarted marks a stream read on after its reply was cut; call done when it ends.
+func (u *TokenUsage) DrainStarted() (done func()) {
+	if u == nil {
+		return func() {}
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.drains == 0 {
+		u.drained = make(chan struct{})
+	}
+	u.drains++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			u.mu.Lock()
+			defer u.mu.Unlock()
+			u.drains--
+			if u.drains == 0 {
+				close(u.drained)
+			}
+		})
+	}
+}
+
+// Draining is closed when no cut reply's stream is still being read, nil if none is now.
+func (u *TokenUsage) Draining() <-chan struct{} {
+	if u == nil {
+		return nil
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.drains == 0 {
+		return nil
+	}
+	return u.drained
 }
 
 // RunOnCut is one reply cut where the model's next message began. Dropped grows after the cut, as

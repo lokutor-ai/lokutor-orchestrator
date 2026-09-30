@@ -264,8 +264,15 @@ func (c *ChainLLM) streamHedged(
 	}
 	defer func() {
 		mu.Lock()
-		for _, cancel := range cancels {
-			if cancel != nil {
+		for i, cancel := range cancels {
+			switch {
+			case cancel == nil:
+			case i == winner:
+				// The winner's stream may still be read after its reply was cut, for its token
+				// counts (drainAfterCut), and cancelling its context here ended that read at once:
+				// every cut turn logged -1 tokens. It goes once the drain has had its time.
+				time.AfterFunc(drainTimeout, cancel)
+			default:
 				cancel()
 			}
 		}

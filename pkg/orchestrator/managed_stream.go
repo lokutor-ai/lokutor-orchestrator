@@ -1028,10 +1028,6 @@ func (ms *ManagedStream) logTurnLatency() {
 	// unit-economics report, so these lines are what replaces the estimate with measurement. A
 	// genuine zero and "the provider did not tell us" would average very differently, and only one
 	// of them is a reason to go looking.
-	promptTok, completionTok, totalTok := -1, -1, -1
-	if p, c, t, ok := turnTokens.Snapshot(); ok {
-		promptTok, completionTok, totalTok = p, c, t
-	}
 	gateOther := gate
 	if gateOther > 0 {
 		gateOther -= confirmWait + specAwait + joinWait
@@ -1040,6 +1036,45 @@ func (ms *ManagedStream) logTurnLatency() {
 		}
 	}
 
+	sttSpeculative := ms.sttSpeculative
+	trimmed, folded := trimmedHistory(ms.session), foldedHistory(ms.session)
+	// Everything but the tokens is read now; see whenTokensSettled for why they may come later.
+	whenTokensSettled(turnTokens, func() {
+		promptTok, completionTok, totalTok := -1, -1, -1
+		if p, c, t, ok := turnTokens.Snapshot(); ok {
+			promptTok, completionTok, totalTok = p, c, t
+		}
+		ms.logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
+			ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm,
+			turnTokens.AnsweredBy(), promptTok, completionTok, totalTok, trimmed, folded,
+			llmToTTS, ttsFirst, discarded, unaccounted, ttfa, sttSpeculative)
+	})
+}
+
+// whenTokensSettled runs log once the turn's token counts are in. They normally are by first audio,
+// but a reply cut where the model's next message began is returned at once while the rest of its
+// stream is read in the background for the counts (providers/llm drainAfterCut); logging then read
+// -1 for every cut turn, the turns that cost most. So when a drain is still running, log waits for
+// it on its own goroutine, at most 2 s: this is called on the audio path and must not block it.
+func whenTokensSettled(u *TokenUsage, log func()) {
+	ch := u.Draining()
+	if ch == nil {
+		log()
+		return
+	}
+	go func() {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+		}
+		log()
+	}()
+}
+
+func (ms *ManagedStream) logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
+	ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm int64,
+	provider string, promptTok, completionTok, totalTok, trimmed, folded int,
+	llmToTTS, ttsFirst, discarded, unaccounted, ttfa int64, sttSpeculative bool) {
 	ms.logger.Info("turn latency",
 		// The caller's clock: last voiced frame -> first audio out.
 		"e2e_ms", e2e,
@@ -1051,7 +1086,7 @@ func (ms *ManagedStream) logTurnLatency() {
 		// When false on a turn that should have qualified, the accept check in
 		// specSTT.awaitUsable rejected it — worth knowing, because the
 		// difference between true and false here is most of stt_ms.
-		"stt_speculative", ms.sttSpeculative,
+		"stt_speculative", sttSpeculative,
 		"turn_gate_ms", gate,
 		// Where turn_gate_ms went: the mid-thought confirmation wait, the
 		// speculative-LLM await, and whatever is left over.
@@ -1081,15 +1116,15 @@ func (ms *ManagedStream) logTurnLatency() {
 		"spec_miss_tail_ms", specMissTail,
 		"llm_ms", llm,
 		// What the language model actually charged us for this turn. -1 = not reported.
-		"llm_provider", turnTokens.AnsweredBy(),
+		"llm_provider", provider,
 		"llm_prompt_tokens", promptTok,
 		"llm_completion_tokens", completionTok,
 		"llm_total_tokens", totalTok,
 		// Conversation dropped WITHOUT a summary (only past the hard ceiling): history the model can
 		// no longer see in any form. Must read 0; see context_budget.go.
-		"context_trimmed_msgs", trimmedHistory(ms.session),
+		"context_trimmed_msgs", trimmed,
 		// Conversation folded into the call summary: still known to the model, condensed.
-		"context_folded_msgs", foldedHistory(ms.session),
+		"context_folded_msgs", folded,
 		"llm_to_tts_ms", llmToTTS,
 		"tts_first_chunk_ms", ttsFirst,
 		"discarded_ms", discarded,

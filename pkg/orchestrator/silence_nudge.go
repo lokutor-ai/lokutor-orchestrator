@@ -116,21 +116,25 @@ func (ms *ManagedStream) logBotInitiatedLatency(trigger string) {
 	ms.mu.Lock()
 	turnTokens := ms.turnTokens
 	ms.mu.Unlock()
-	promptTok, completionTok, totalTok := -1, -1, -1
-	if p, c, t, ok := turnTokens.Snapshot(); ok {
-		promptTok, completionTok, totalTok = p, c, t
-	}
-	ms.logger.Info("bot-initiated response latency",
-		"trigger", trigger,
-		// llmStart -> first audio out: the whole time this response took to be heard.
-		"response_ms", stageMs(ms.llmStartTime, first),
-		"llm_ms", stageMs(ms.llmStartTime, ms.llmEndTime),
-		"llm_prompt_tokens", promptTok,
-		"llm_completion_tokens", completionTok,
-		"llm_total_tokens", totalTok,
-		"llm_to_tts_ms", stageMs(ms.llmEndTime, ms.ttsStartTime),
-		"tts_first_chunk_ms", stageMs(ms.ttsStartTime, first),
-	)
+	response, llm := stageMs(ms.llmStartTime, first), stageMs(ms.llmStartTime, ms.llmEndTime)
+	llmToTTS, ttsFirst := stageMs(ms.llmEndTime, ms.ttsStartTime), stageMs(ms.ttsStartTime, first)
+	whenTokensSettled(turnTokens, func() {
+		promptTok, completionTok, totalTok := -1, -1, -1
+		if p, c, t, ok := turnTokens.Snapshot(); ok {
+			promptTok, completionTok, totalTok = p, c, t
+		}
+		ms.logger.Info("bot-initiated response latency",
+			"trigger", trigger,
+			// llmStart -> first audio out: the whole time this response took to be heard.
+			"response_ms", response,
+			"llm_ms", llm,
+			"llm_prompt_tokens", promptTok,
+			"llm_completion_tokens", completionTok,
+			"llm_total_tokens", totalTok,
+			"llm_to_tts_ms", llmToTTS,
+			"tts_first_chunk_ms", ttsFirst,
+		)
+	})
 }
 
 // toolsOffered is the tools the model may call when generating for transcript: none for the silence

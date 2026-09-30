@@ -20,12 +20,18 @@ func oneTurnFor(ctx context.Context, model string) *orchestrator.ReplyTurn {
 	return orchestrator.NewReplyTurn(ctx)
 }
 
+// drainTimeout bounds how long a cut reply's stream is read on, and so how long ChainLLM keeps the
+// winning attempt's context alive after it returns.
+const drainTimeout = 15 * time.Second
+
 // drainAfterCut reads the rest of a stream the reply was cut from, in the background, so the turn
 // is not held until the model stops talking to itself: the tokens are still counted, and what was
-// dropped is kept for the log. The body is closed when the stream ends, ctx ends, or after 15 s.
+// dropped is kept for the log. The body is closed when the stream ends, ctx ends, or at drainTimeout.
 func drainAfterCut(ctx context.Context, reader *bufio.Reader, body io.Closer, cut *orchestrator.RunOnCut) {
+	done := orchestrator.TokenUsageFrom(ctx).DrainStarted()
 	go func() {
-		timer := time.AfterFunc(15*time.Second, func() { body.Close() })
+		defer done()
+		timer := time.AfterFunc(drainTimeout, func() { body.Close() })
 		defer timer.Stop()
 		defer body.Close()
 		for {
