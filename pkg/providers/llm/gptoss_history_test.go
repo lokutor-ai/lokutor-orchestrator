@@ -45,39 +45,17 @@ func TestForGptOssNotes(t *testing.T) {
 		history[11],
 	}
 	assert.Equal(t, want, forGptOss("gpt-oss-120b", history, GptOssToolHistoryNotes))
-	assert.Equal(t, want, forGptOss("gpt-oss-120b", history, ""), "notes is the default")
 
 	assert.Equal(t, history, forGptOss("llama-3.3-70b", history, GptOssToolHistoryNotes), "other models are sent the history unchanged")
 	current := history[9:]
-	assert.Equal(t, current, forGptOss("openai/gpt-oss-120b", current, GptOssToolHistoryInPrompt), "nothing earlier, nothing to rewrite")
-}
-
-func TestForGptOssInPrompt(t *testing.T) {
-	history := gptOssHistory()
-	got := forGptOss("gpt-oss-120b", history, GptOssToolHistoryInPrompt)
-	assert.Equal(t, []orchestrator.Message{
-		{Role: "system", Content: "prompt\n\n# Tools called earlier in this call\n" +
-			`Tool add_to_cart was called with {"product_id":"PROD1"} and returned {"status":"success"}` + "\n" +
-			`Tool view_cart was called with {} and returned {"items":1}`},
-		{Role: "user", Content: "add it"},
-		{Role: "assistant", Content: "Done."},
-		{Role: "user", Content: "what's in it"},
-		{Role: "assistant", Content: "One item."},
-		{Role: "user", Content: "add another"},
-		history[10],
-		history[11],
-	}, got)
-	assert.Equal(t, "prompt", history[0].Content, "the session's system prompt is not modified")
-
-	noPrompt := history[1:]
-	got = forGptOss("gpt-oss-120b", noPrompt, GptOssToolHistoryInPrompt)
-	assert.Equal(t, "system", got[0].Role, "with no system message, the section is one")
-	assert.Equal(t, "add it", got[1].Content)
+	assert.Equal(t, current, forGptOss("openai/gpt-oss-120b", current, GptOssToolHistoryBeforeLastUser), "nothing earlier, nothing to rewrite")
 }
 
 func TestForGptOssBeforeLastUser(t *testing.T) {
 	history := gptOssHistory()
 	got := forGptOss("gpt-oss-120b", history, GptOssToolHistoryBeforeLastUser)
+	assert.Equal(t, got, forGptOss("gpt-oss-120b", history, ""), "tail is the default")
+	assert.Equal(t, "prompt", history[0].Content, "the session's messages are not modified")
 	assert.Equal(t, []orchestrator.Message{
 		{Role: "system", Content: "prompt"},
 		{Role: "user", Content: "add it"},
@@ -95,14 +73,14 @@ func TestForGptOssBeforeLastUser(t *testing.T) {
 
 func TestSetGptOssToolHistory(t *testing.T) {
 	c, g, o := NewCerebrasLLM("k", ""), NewGroqLLM("k", ""), NewOpenRouterLLM("k", "", nil, "")
-	SetGptOssToolHistory(NewChainLLM("chain", c, NewChainLLM("inner", g, o)), GptOssToolHistoryInPrompt)
-	assert.Equal(t, GptOssToolHistoryInPrompt, c.toolHistory)
-	assert.Equal(t, GptOssToolHistoryInPrompt, g.toolHistory)
-	assert.Equal(t, GptOssToolHistoryInPrompt, o.toolHistory)
+	SetGptOssToolHistory(NewChainLLM("chain", c, NewChainLLM("inner", g, o)), GptOssToolHistoryNotes)
+	assert.Equal(t, GptOssToolHistoryNotes, c.toolHistory)
+	assert.Equal(t, GptOssToolHistoryNotes, g.toolHistory)
+	assert.Equal(t, GptOssToolHistoryNotes, o.toolHistory)
 
-	h, ok := ParseGptOssToolHistory(" Prompt ")
+	h, ok := ParseGptOssToolHistory(" Tail ")
 	assert.True(t, ok)
-	assert.Equal(t, GptOssToolHistoryInPrompt, h)
-	_, ok = ParseGptOssToolHistory("top")
-	assert.False(t, ok)
+	assert.Equal(t, GptOssToolHistoryBeforeLastUser, h)
+	_, ok = ParseGptOssToolHistory("prompt")
+	assert.False(t, ok, "the fold into the system prompt was measured and not kept")
 }
