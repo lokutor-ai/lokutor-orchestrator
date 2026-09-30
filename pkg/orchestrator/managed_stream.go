@@ -3266,10 +3266,6 @@ func (ms *ManagedStream) Close() {
 		ms.cancelPipeline()
 		ms.cancel()
 
-		// Cross-call memory: extract key facts from the conversation so the next
-		// session with this user can start with context (Retell/ElevenLabs pattern).
-		ms.extractUserMemory()
-
 		// Give the audio goroutine a moment to notice ms.cancel() and stop feeding
 		// Turno BEFORE the models are freed. This sleep used to come after the
 		// Destroy calls, which meant a chunk already inside handleAudio could
@@ -3298,54 +3294,6 @@ func (ms *ManagedStream) Close() {
 		close(ms.events)
 		ms.eventsMu.Unlock()
 	})
-}
-
-// extractUserMemory runs a cheap LLM extraction over the conversation to capture
-// key facts (name, preferences, identifiers) for cross-call memory. Non-blocking.
-func (ms *ManagedStream) extractUserMemory() {
-	if ms.orch == nil || ms.orch.llm == nil {
-		return
-	}
-	messages := ms.session.GetContextCopy()
-	if len(messages) < 2 {
-		return
-	}
-
-	// Build a compact transcript for the extraction call
-	var sb strings.Builder
-	for _, msg := range messages {
-		if msg.Role == "user" || msg.Role == "assistant" {
-			content := msg.Content
-			if len(content) > 300 {
-				content = content[:300] + "..."
-			}
-			sb.WriteString(msg.Role + ": " + content + "\n")
-		}
-	}
-
-	go func(transcript string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		prompt := "Extract key facts about this user from the conversation transcript. " +
-			"Return a concise list of facts: name, preferences, identifiers, or important context. " +
-			"Format as plain text, max 5 lines.\n\nTranscript:\n" + transcript
-
-		extractionMessages := []Message{
-			{Role: "system", Content: "You extract structured user facts from conversations. Be concise and factual."},
-			{Role: "user", Content: prompt},
-		}
-		facts, err := ms.orch.llm.Complete(ctx, extractionMessages, nil)
-		if err != nil || facts == "" {
-			return
-		}
-
-		// Store the extracted facts in the session for use by the next session
-		ms.session.mu.Lock()
-		ms.session.UserMemory = strings.TrimSpace(facts)
-		ms.session.mu.Unlock()
-		ms.logger.Info("Cross-call memory extracted", "facts_len", len(facts))
-	}(sb.String())
 }
 
 func (ms *ManagedStream) ExportLastUserAudio() (raw []byte, processed []byte) {

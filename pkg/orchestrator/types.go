@@ -611,7 +611,10 @@ type ConversationSession struct {
 	CurrentLanguage Language
 	Tools           []Tool
 	toolCallCounts  map[string]int // Track how many times each tool has been called
-	UserMemory      string         // Cross-call memory extracted from previous sessions
+	// UserMemory is rendered into the system prompt under "# User Information" when the host sets it
+	// before SetSystemPrompt. Nothing in the orchestrator writes it: Close used to fill it with an LLM
+	// call over the transcript, on a session discarded as the call ended, so no call ever read it.
+	UserMemory string
 	// CallerRecord is what the customer's CRM knows about the person on the call (name, company,
 	// open deals, recent notes), looked up when the call starts. It is rendered into the system prompt
 	// under its own heading, so it survives the prompt being rebuilt for a language change.

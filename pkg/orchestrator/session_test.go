@@ -186,7 +186,7 @@ func TestSession_SetGetTools(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// UserMemory (cross-call persistence hook)
+// UserMemory (set by the host, rendered into the system prompt)
 // ---------------------------------------------------------------------------
 
 func TestSession_UserMemoryField(t *testing.T) {
