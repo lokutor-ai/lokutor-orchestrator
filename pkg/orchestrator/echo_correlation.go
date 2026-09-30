@@ -1,6 +1,9 @@
 package orchestrator
 
-import "math"
+import (
+	"math"
+	"time"
+)
 
 // echo_correlation.go: amplitude/timing acoustic-echo detection for the barge-in confirmation
 // gate, replacing text-transcript similarity (the former isLikelyEcho, compared against
@@ -36,11 +39,17 @@ const (
 	// systems reason about audio in the same-sized slices, though they never share a buffer.
 	echoFrameBytes = 320 * 2
 
-	// echoFarEndBufCap caps the non-destructive far-end copy at 2s of 16kHz PCM16, the same
-	// window turno_bargein.go carries — long enough to cover any plausible speaker-to-mic-to-STT
-	// round trip on a browser call (dominated by network + audio-buffer latency, not propagation
-	// delay, since there is no physical distance worth measuring on a laptop).
-	echoFarEndBufCap = 2 * 16000 * 2
+	// echoFarEndBufCap caps the far-end copy at 12s of 16kHz PCM16. It holds what the caller's
+	// speaker has played, in real time (see advanceFarEndEcho), so it has to be at least as long as
+	// the near-end window it is compared with — the whole pending barge-in, which can run for a few
+	// seconds — plus the echo's delay.
+	echoFarEndBufCap = 12 * 16000 * 2
+
+	// echoMaxLagFrames bounds how far behind the speaker the microphone may hear it: 1.5s of
+	// 20ms frames covers a Bluetooth sink (~0.35s) plus a browser's playout buffering and network
+	// jitter. Searching every alignment of a long far-end window instead let an unrelated older
+	// stretch of the agent's speech match by chance.
+	echoMaxLagFrames = 75
 
 	// echoMinNearFrames is the shortest near-end snapshot worth correlating at all. Below three
 	// 20ms frames (60ms) a correlation coefficient is noise, not a measurement — a real decision
@@ -57,20 +66,119 @@ const (
 	echoCorrelationThreshold = 0.75
 )
 
-// noteFarEndEcho appends the bot's own outgoing audio (already resampled to 16kHz PCM16 by the
-// caller) to the non-destructive far-end copy. Called unconditionally from emitFrames, unlike
-// Turno's noteFarEndAudio which only runs when ms.turno is loaded — this mechanism doesn't depend
-// on Turno at all.
-func (ms *ManagedStream) noteFarEndEcho(pcm16kHz []byte) {
+// echoFarChunk is outgoing audio handed to the transport, not yet played: start is when the
+// caller's playout clock (spoken_truth.go) says it starts playing.
+type echoFarChunk struct {
+	gen   int
+	start time.Time
+	pcm   []byte // 16kHz PCM16
+}
+
+// noteFarEndEchoScheduled queues outgoing audio for the echo check at the time it will PLAY, not
+// the time it was sent. Synthesis runs several times faster than real time, so the audio sent
+// most recently is seconds ahead of what the speaker is playing; the far-end copy used to be
+// "the last 2s sent", which on any reply longer than that held audio the caller had not heard yet
+// while the audio actually playing had already been dropped, and the correlation compared the
+// microphone with the wrong speech (production scores sat near 0 on real echo). Called where
+// emitWithGen puts a chunk on the playout clock, with the time that chunk starts playing.
+func (ms *ManagedStream) noteFarEndEchoScheduled(gen int, pcm16kHz []byte, start time.Time) {
 	if len(pcm16kHz) == 0 {
 		return
 	}
 	ms.echoMu.Lock()
-	ms.echoFarEndBuf = append(ms.echoFarEndBuf, pcm16kHz...)
+	// A new generation replaces what the previous one still had queued: the transport drops it.
+	kept := ms.echoFarPending[:0]
+	for _, c := range ms.echoFarPending {
+		if c.gen >= gen {
+			kept = append(kept, c)
+		}
+	}
+	ms.echoFarPending = append(kept, echoFarChunk{gen: gen, start: start, pcm: pcm16kHz})
+	ms.echoMu.Unlock()
+}
+
+// dropUnplayedFarEndEcho forgets queued audio that will not play after now: the transport was told
+// to stop, or discards its queue at a barge-in (the two places the playout clock is cut).
+func (ms *ManagedStream) dropUnplayedFarEndEcho(now time.Time) {
+	ms.echoMu.Lock()
+	kept := ms.echoFarPending[:0]
+	for _, c := range ms.echoFarPending {
+		if c.start.Before(now) {
+			played := int(now.Sub(c.start).Seconds()*16000) * 2
+			if played < len(c.pcm) {
+				c.pcm = c.pcm[:played]
+			}
+			kept = append(kept, c)
+		}
+	}
+	ms.echoFarPending = kept
+	ms.echoMu.Unlock()
+}
+
+// advanceFarEndEcho moves what the speaker has played up to now from the queue into echoFarEndBuf,
+// with silence wherever nothing was playing, so echoFarEndBuf mirrors the speaker in real time and
+// ends at the same instant as the microphone audio fed alongside it (handleAudio calls this for
+// every microphone frame). The first call only starts the clock.
+func (ms *ManagedStream) advanceFarEndEcho(now time.Time) {
+	ms.echoMu.Lock()
+	defer ms.echoMu.Unlock()
+	if ms.echoFarClock.IsZero() {
+		ms.echoFarClock = now
+		return
+	}
+	maxSpan := time.Duration(echoFarEndBufCap/2) * time.Second / 16000
+	if now.Sub(ms.echoFarClock) > maxSpan {
+		ms.echoFarClock = now.Add(-maxSpan)
+	}
+	bytesFor := func(d time.Duration) int { return int(d.Seconds()*16000) * 2 }
+	durOf := func(n int) time.Duration { return time.Duration(n/2) * time.Second / 16000 }
+	for ms.echoFarClock.Before(now) {
+		if len(ms.echoFarPending) == 0 {
+			n := bytesFor(now.Sub(ms.echoFarClock))
+			if n == 0 {
+				break
+			}
+			ms.echoFarEndBuf = append(ms.echoFarEndBuf, make([]byte, n)...)
+			ms.echoFarClock = ms.echoFarClock.Add(durOf(n))
+			break
+		}
+		c := &ms.echoFarPending[0]
+		if c.start.After(ms.echoFarClock) {
+			gapEnd := c.start
+			if gapEnd.After(now) {
+				gapEnd = now
+			}
+			n := bytesFor(gapEnd.Sub(ms.echoFarClock))
+			if n == 0 {
+				// Less than one sample of gap: the chunk starts now.
+				c.start = ms.echoFarClock
+				continue
+			}
+			ms.echoFarEndBuf = append(ms.echoFarEndBuf, make([]byte, n)...)
+			ms.echoFarClock = ms.echoFarClock.Add(durOf(n))
+			continue
+		}
+		off := bytesFor(ms.echoFarClock.Sub(c.start))
+		if off >= len(c.pcm) {
+			ms.echoFarPending = ms.echoFarPending[1:]
+			continue
+		}
+		n := len(c.pcm) - off
+		if want := bytesFor(now.Sub(ms.echoFarClock)); want < n {
+			n = want
+		}
+		if n == 0 {
+			break
+		}
+		ms.echoFarEndBuf = append(ms.echoFarEndBuf, c.pcm[off:off+n]...)
+		ms.echoFarClock = ms.echoFarClock.Add(durOf(n))
+		if off+n >= len(c.pcm) {
+			ms.echoFarPending = ms.echoFarPending[1:]
+		}
+	}
 	if excess := len(ms.echoFarEndBuf) - echoFarEndBufCap; excess > 0 {
 		ms.echoFarEndBuf = ms.echoFarEndBuf[excess:]
 	}
-	ms.echoMu.Unlock()
 }
 
 // resetNearEndEcho clears the near-end accumulator and pins it to gen, the response generation
@@ -183,6 +291,11 @@ func (ms *ManagedStream) isLikelyAcousticEcho(gen int) (echo bool, score float64
 	nearEnv := rmsEnvelope(near, echoFrameBytes)
 	farEnv := rmsEnvelope(far, echoFrameBytes)
 	nearFrames = len(nearEnv)
+	// Both buffers end at the latest microphone frame, so the echo can only sit up to
+	// echoMaxLagFrames back from the far end's tail.
+	if maxFar := len(nearEnv) + echoMaxLagFrames; len(farEnv) > maxFar {
+		farEnv = farEnv[len(farEnv)-maxFar:]
+	}
 	if len(nearEnv) < echoMinNearFrames || len(farEnv) < len(nearEnv) {
 		return false, 0, 0, nearFrames
 	}

@@ -214,3 +214,83 @@ func TestIsLikelyAcousticEcho_StaleGenerationIsIgnored(t *testing.T) {
 		t.Errorf("expected 0 near frames for a non-matching generation, got %d", nearFrames)
 	}
 }
+
+// The echo check's far end is what the caller's speaker has played by now, not what was sent: audio
+// sent ahead of its playout time must not be in it yet, and must be once its time comes.
+func TestAdvanceFarEndEcho_FollowsPlayoutNotSend(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "hi"}
+	llm := &MockLLMProvider{completeResult: "ok"}
+	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
+	orch := NewWithVAD(stt, llm, tts, NewRMSVAD(0.05, 50*time.Millisecond), DefaultConfig())
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("far-playout"))
+	defer stream.Close()
+
+	t0 := time.Now()
+	stream.advanceFarEndEcho(t0) // starts the clock
+	// One second of loud audio, sent now but scheduled to play from t0+1s.
+	loud := tone(16000, 0.3, 8000)
+	stream.noteFarEndEchoScheduled(1, loud, t0.Add(time.Second))
+
+	rms := func(pcm []byte) float64 {
+		env := rmsEnvelope(pcm, echoFrameBytes)
+		var s float64
+		for _, v := range env {
+			s += v
+		}
+		return s / math.Max(1, float64(len(env)))
+	}
+	farTail := func(d time.Duration) []byte {
+		stream.echoMu.Lock()
+		defer stream.echoMu.Unlock()
+		n := int(d.Seconds()*16000) * 2
+		if n > len(stream.echoFarEndBuf) {
+			n = len(stream.echoFarEndBuf)
+		}
+		return append([]byte(nil), stream.echoFarEndBuf[len(stream.echoFarEndBuf)-n:]...)
+	}
+
+	stream.advanceFarEndEcho(t0.Add(500 * time.Millisecond))
+	if got := rms(farTail(500 * time.Millisecond)); got > 0.001 {
+		t.Fatalf("audio scheduled to play at +1s is in the far end at +0.5s (rms %.3f)", got)
+	}
+	stream.advanceFarEndEcho(t0.Add(1500 * time.Millisecond))
+	if got := rms(farTail(500 * time.Millisecond)); got < 0.1 {
+		t.Fatalf("audio playing from +1s is missing from the far end at +1.5s (rms %.3f)", got)
+	}
+	stream.echoMu.Lock()
+	n := len(stream.echoFarEndBuf)
+	stream.echoMu.Unlock()
+	if want := int(1.5*16000) * 2; n < want-640 || n > want+640 {
+		t.Fatalf("far end holds %d bytes after 1.5s of playout, want about %d", n, want)
+	}
+}
+
+// Queued audio the transport will never play (it was told to stop) leaves the far end.
+func TestDropUnplayedFarEndEcho(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "hi"}
+	llm := &MockLLMProvider{completeResult: "ok"}
+	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
+	orch := NewWithVAD(stt, llm, tts, NewRMSVAD(0.05, 50*time.Millisecond), DefaultConfig())
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("far-drop"))
+	defer stream.Close()
+
+	t0 := time.Now()
+	stream.advanceFarEndEcho(t0)
+	stream.noteFarEndEchoScheduled(1, tone(16000, 0.3, 8000), t0)
+	stream.dropUnplayedFarEndEcho(t0.Add(200 * time.Millisecond))
+	stream.advanceFarEndEcho(t0.Add(time.Second))
+
+	stream.echoMu.Lock()
+	buf := append([]byte(nil), stream.echoFarEndBuf...)
+	stream.echoMu.Unlock()
+	env := rmsEnvelope(buf, echoFrameBytes)
+	loud := 0
+	for _, v := range env {
+		if v > 0.05 {
+			loud++
+		}
+	}
+	if loud < 8 || loud > 12 {
+		t.Fatalf("expected ~10 frames (200 ms) of played audio before the stop, got %d", loud)
+	}
+}

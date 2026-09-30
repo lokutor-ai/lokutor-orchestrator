@@ -353,6 +353,7 @@ func (ms *ManagedStream) snapshotHeardAtOnsetLocked(now time.Time) {
 		if !ms.pausesOnBargeIn && !ms.playsThroughBargeIn {
 			// The transport discards its queue: nothing scheduled after now will ever play.
 			ms.playout.cutAt(now)
+			ms.dropUnplayedFarEndEcho(now)
 		}
 	}
 	ms.onset = s
@@ -393,6 +394,20 @@ func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
 		ms.mu.Unlock()
 		return
 	}
+	// Speech that is the agent's own voice coming back through the caller's microphone is not the
+	// caller talking over it: keep playing. Stopping here cannot be undone — the transport discards
+	// its queue — and the echo check after transcription used to run only once this had already
+	// cut the reply. Checked on every frame until the barge-in resolves, so real speech mixed in
+	// with the echo (which breaks the match) still stops playback.
+	if echo, score, lagMs, _ := ms.isLikelyAcousticEcho(gen); echo {
+		if !ms.echoHeldPlayThroughAt.Equal(ms.onset.at) {
+			ms.echoHeldPlayThroughAt = ms.onset.at
+			ms.logger.Info("Speech over playout matches the agent's own audio: playing through",
+				"score", score, "lag_ms", lagMs, "talked_ms", now.Sub(ms.onset.at).Milliseconds())
+		}
+		ms.mu.Unlock()
+		return
+	}
 	talkedMs := now.Sub(ms.onset.at).Milliseconds()
 	ms.onset.stopped = true
 	var tr TruncatedResponse
@@ -400,6 +415,7 @@ func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
 	if ms.playout.gen == gen {
 		ms.onset.text, ms.onset.dur, ms.onset.complete = ms.playout.heard(now)
 		ms.playout.cutAt(now)
+		ms.dropUnplayedFarEndEcho(now)
 		// With no turn in flight the reply was over and only playing out: settle what was heard now,
 		// as noteSpeechOverPlayout does. A turn still in flight settles on its own interrupt.
 		if ms.truthAppliedGen != gen && (ms.pipelineCtx == nil || ms.pipelineCtx.Err() != nil) {
