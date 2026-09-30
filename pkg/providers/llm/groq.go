@@ -21,6 +21,8 @@ type GroqLLM struct {
 	// applyReasoningEffort for why this is the single biggest latency lever
 	// on the current production model.
 	reasoningEffort string
+	// toolHistory is where a gpt-oss model is sent earlier tool exchanges; see forGptOss.
+	toolHistory GptOssToolHistory
 }
 
 func NewGroqLLM(apiKey string, model string) *GroqLLM {
@@ -42,7 +44,7 @@ func (l *GroqLLM) applyReasoningEffort(payload map[string]interface{}) {
 func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": forGptOss(l.model, messages),
+		"messages": forGptOss(l.model, messages, l.toolHistory),
 	}
 	l.applyReasoningEffort(payload)
 	if len(tools) > 0 {
@@ -98,7 +100,7 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": forGptOss(l.model, messages),
+		"messages": forGptOss(l.model, messages, l.toolHistory),
 		"stream":   true,
 	}
 	// Streaming omits token counts unless asked; see requestStreamUsage in usage.go.

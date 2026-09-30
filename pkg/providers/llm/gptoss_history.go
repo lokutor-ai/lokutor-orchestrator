@@ -8,9 +8,55 @@ import (
 	orchestrator "github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
 
+// GptOssToolHistory is where forGptOss puts the tool exchanges from before the caller's latest
+// message.
+type GptOssToolHistory string
+
+const (
+	// GptOssToolHistoryNotes sends each earlier exchange as a system message where it happened.
+	GptOssToolHistoryNotes GptOssToolHistory = "notes"
+	// GptOssToolHistoryInPrompt sends them together as one section at the end of the first system
+	// message.
+	GptOssToolHistoryInPrompt GptOssToolHistory = "prompt"
+)
+
+// defaultGptOssToolHistory is what a provider uses when nothing was set.
+const defaultGptOssToolHistory = GptOssToolHistoryNotes
+
+// earlierToolsHeading opens the section GptOssToolHistoryInPrompt adds to the system prompt.
+const earlierToolsHeading = "# Tools called earlier in this call"
+
+// ParseGptOssToolHistory reads a GptOssToolHistory by name; ok is false for anything else.
+func ParseGptOssToolHistory(s string) (h GptOssToolHistory, ok bool) {
+	switch h := GptOssToolHistory(strings.ToLower(strings.TrimSpace(s))); h {
+	case GptOssToolHistoryNotes, GptOssToolHistoryInPrompt:
+		return h, true
+	}
+	return "", false
+}
+
+// SetGptOssToolHistory sets where p, a provider or a chain of them, puts a gpt-oss model's earlier
+// tool exchanges. Call it before the provider is used. Providers that never send a gpt-oss model
+// ignore it.
+func SetGptOssToolHistory(p orchestrator.LLMProvider, h GptOssToolHistory) {
+	switch v := p.(type) {
+	case *ChainLLM:
+		for _, c := range v.providers {
+			SetGptOssToolHistory(c, h)
+		}
+	case *CerebrasLLM:
+		v.toolHistory = h
+	case *GroqLLM:
+		v.toolHistory = h
+	case *OpenRouterLLM:
+		v.toolHistory = h
+	}
+}
+
 // forGptOss returns the history as a gpt-oss model should be sent it: every tool exchange from
-// before the caller's latest message becomes a system note of what was called and what it
-// returned. The current turn's exchanges, which the model is answering, are left as they are.
+// before the caller's latest message becomes a line saying what was called and what it returned,
+// placed as where says. The current turn's exchanges, which the model is answering, are left as
+// they are.
 //
 // gpt-oss writes a second call to a tool it has already called in the conversation as text instead
 // of making it: the arguments as JSON, "to=functions.add_to_cart", an invented result, all of which
@@ -19,9 +65,12 @@ import (
 // clean history, a second add_to_cart was made 2 times in 12 (10 written out); with the earlier
 // exchange as a note, 12 in 12 (none written out). reasoning_effort "medium" also fixes it, but
 // doubles the time to the first spoken token on every turn.
-func forGptOss(model string, messages []orchestrator.Message) []orchestrator.Message {
+func forGptOss(model string, messages []orchestrator.Message, where GptOssToolHistory) []orchestrator.Message {
 	if !strings.Contains(strings.ToLower(model), "gpt-oss") {
 		return messages
+	}
+	if where == "" {
+		where = defaultGptOssToolHistory
 	}
 	lastUser := -1
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -43,7 +92,8 @@ func forGptOss(model string, messages []orchestrator.Message) []orchestrator.Mes
 
 	type call struct{ name, args string }
 	calls := map[string]call{}
-	out := make([]orchestrator.Message, 0, len(messages))
+	var folded []string
+	out := make([]orchestrator.Message, 0, len(messages)+1)
 	for i, m := range messages {
 		switch {
 		case i >= lastUser:
@@ -60,10 +110,23 @@ func forGptOss(model string, messages []orchestrator.Message) []orchestrator.Mes
 			if c.name == "" {
 				c.name = m.Name
 			}
-			out = append(out, orchestrator.Message{Role: "system",
-				Content: fmt.Sprintf("Tool %s was called with %s and returned %s", c.name, c.args, m.Content)})
+			note := fmt.Sprintf("Tool %s was called with %s and returned %s", c.name, c.args, m.Content)
+			if where == GptOssToolHistoryInPrompt {
+				folded = append(folded, note)
+			} else {
+				out = append(out, orchestrator.Message{Role: "system", Content: note})
+			}
 		default:
 			out = append(out, m)
+		}
+	}
+	if len(folded) > 0 {
+		section := earlierToolsHeading + "\n" + strings.Join(folded, "\n")
+		if len(out) > 0 && out[0].Role == "system" {
+			// out[0] is a copy: the session's own system prompt is not touched.
+			out[0].Content = strings.TrimRight(out[0].Content, "\n") + "\n\n" + section
+		} else {
+			out = append([]orchestrator.Message{{Role: "system", Content: section}}, out...)
 		}
 	}
 	return out

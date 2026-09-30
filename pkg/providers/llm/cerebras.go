@@ -27,6 +27,8 @@ type CerebrasLLM struct {
 	// default model here is gpt-oss-120b, a reasoning model — see
 	// defaultReasoningEffort for what that costs a voice agent by default.
 	reasoningEffort string
+	// toolHistory is where a gpt-oss model is sent earlier tool exchanges; see forGptOss.
+	toolHistory GptOssToolHistory
 }
 
 func NewCerebrasLLM(apiKey string, model string) *CerebrasLLM {
@@ -50,7 +52,7 @@ func (l *CerebrasLLM) Name() string { return "cerebras-llm" }
 func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": forGptOss(l.model, messages),
+		"messages": forGptOss(l.model, messages, l.toolHistory),
 	}
 	l.applyReasoningEffort(payload)
 	if len(tools) > 0 {
@@ -103,7 +105,7 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
 	payload := map[string]interface{}{
 		"model":    l.model,
-		"messages": forGptOss(l.model, messages),
+		"messages": forGptOss(l.model, messages, l.toolHistory),
 		"stream":   true,
 	}
 	// Streaming omits token counts unless asked; see requestStreamUsage in usage.go.

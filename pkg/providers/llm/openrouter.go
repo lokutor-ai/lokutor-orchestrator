@@ -34,6 +34,8 @@ type OpenRouterLLM struct {
 	// reasoning is "none" to turn the model's thinking off, an effort ("low", "medium", "high"), or ""
 	// for the model's default.
 	reasoning string
+	// toolHistory is where a gpt-oss model is sent earlier tool exchanges; see forGptOss.
+	toolHistory GptOssToolHistory
 }
 
 func NewOpenRouterLLM(apiKey, model string, providers []string, reasoning string) *OpenRouterLLM {
@@ -54,7 +56,7 @@ func (l *OpenRouterLLM) Name() string { return "openrouter-llm" }
 func (l *OpenRouterLLM) payload(messages []orchestrator.Message, tools []orchestrator.Tool, stream bool) map[string]interface{} {
 	p := map[string]interface{}{
 		"model":    l.model,
-		"messages": forGptOss(l.model, messages),
+		"messages": forGptOss(l.model, messages, l.toolHistory),
 	}
 	if stream {
 		p["stream"] = true
