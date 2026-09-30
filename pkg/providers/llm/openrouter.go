@@ -140,10 +140,17 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	// Closed here unless a cut reply hands the rest of the stream to drainAfterCut.
+	drained := false
+	defer func() {
+		if !drained {
+			resp.Body.Close()
+		}
+	}()
 
 	reader := bufio.NewReader(resp.Body)
 	var fullContent strings.Builder
+	turn := oneTurnFor(ctx, l.model)
 	type toolCallState struct {
 		id        string
 		name      string
@@ -174,6 +181,7 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 			Choices []struct {
 				Delta struct {
 					Content   string `json:"content"`
+					Reasoning string `json:"reasoning"`
 					ToolCalls []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
@@ -198,13 +206,18 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 			continue
 		}
 		delta := chunk.Choices[0].Delta
-		if delta.Content != "" {
-			fullContent.WriteString(delta.Content)
+		if text := turn.Chunk(delta.Reasoning, delta.Content); text != "" {
+			fullContent.WriteString(text)
 			if onChunk != nil {
-				if err := onChunk(delta.Content); err != nil {
+				if err := onChunk(text); err != nil {
 					return "", err
 				}
 			}
+		}
+		if turn.Ended() {
+			drained = true
+			drainAfterCut(ctx, reader, resp.Body, turn.Cut())
+			break
 		}
 		for _, tc := range delta.ToolCalls {
 			state, ok := toolCalls[tc.Index]

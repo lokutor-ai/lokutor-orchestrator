@@ -507,6 +507,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	flushSentence()
 	close(ttsQueue)
 	ttsWg.Wait()
+	ms.logRunOns(gen, turnTokens)
 
 	if unspeakable != "" && !hasToolCalls && err == nil {
 		// Both tries came back unspeakable: the caller hears nothing for this turn, and says so here.
@@ -555,6 +556,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 			rCtx, rCancel := context.WithCancel(freshCtx)
 			defer rCancel()
+			// The turn's sink, so these rounds' tokens count toward the turn and a cut reply is noted.
+			rCtx = WithTokenUsage(rCtx, turnTokens)
 
 			ms.mu.Lock()
 			if ms.pipelineCancel != nil {
@@ -633,6 +636,28 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				return
 			}
 			text := strings.TrimSpace(responseText)
+			// The reply after a tool call is spoken whole, so it gets the check round one gives each
+			// sentence (unspeakableReply): this path had none, and a tool call written out here, or
+			// the model's reasoning, went straight to the caller.
+			if reason := unspeakableReply(text, tools); reason != "" {
+				ms.logger.Warn("Not speaking after tool calls: the model wrote a tool call or its reasoning as the reply",
+					"reason", reason, "gen", gen, "text", text)
+				retry, rerr := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), tools)
+				retry, _ = OneTurn(rCtx, retry)
+				if rerr != nil || unspeakableReply(retry, tools) != "" || strings.TrimSpace(retry) == "" {
+					ms.logger.Warn("Turn abandoned after tool calls: the model's reply was not speech twice in a row",
+						"reason", reason, "gen", gen, "retry", retry, "error", rerr)
+					ms.logRunOns(gen, turnTokens)
+					ms.mu.Lock()
+					if ms.state != StateInterrupted {
+						ms.state = StateIdle
+					}
+					ms.mu.Unlock()
+					return
+				}
+				text = strings.TrimSpace(retry)
+			}
+			ms.logRunOns(gen, turnTokens)
 			if text == "" {
 				text = "Got it."
 			}

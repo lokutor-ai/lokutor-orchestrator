@@ -155,6 +155,13 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.speculator.Cancel()
 
 	if ok {
+		// The guess came from a whole, non-streamed reply, which the provider does not cut: only the
+		// messages glued after it show there, and they go (ReplyTurn).
+		if kept, cut := OneTurn(ctx, response); cut != nil {
+			ms.logger.Info("Reply cut: the model went on past its turn", "gen", "speculative",
+				"reason", cut.Reason(), "kept", clipForLog(kept), "dropped", clipForLog(cut.Dropped()))
+			response = kept
+		}
 		// The guess is spoken as it stands, so it gets the check the streamed path gives each
 		// sentence: a tool call written out, or leaked reasoning, becomes a miss and the turn is
 		// generated again instead (unspeakableReply).

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"sync"
 )
 
@@ -32,6 +33,62 @@ type TokenUsage struct {
 	// answeredBy is the provider a chain's turn came from. Since 2026-09-29 the second provider is a
 	// different model at a different price, so which one answered is part of what a turn cost and said.
 	answeredBy string
+	// runOns are the replies a provider cut short because the model went on past its turn (see
+	// providers/llm oneTurn): what it said and did not get to say is part of what the turn said.
+	runOns []*RunOnCut
+}
+
+// RunOnCut is one reply cut where the model's next message began. Dropped grows after the cut, as
+// the provider reads the rest of the stream in the background.
+type RunOnCut struct {
+	mu      sync.Mutex
+	reason  string
+	kept    string
+	dropped strings.Builder
+}
+
+// NoteRunOn records a cut and returns it for the provider to add the dropped text to. It never
+// returns nil, so the provider need not check for a sink.
+func (u *TokenUsage) NoteRunOn(reason, kept string) *RunOnCut {
+	c := &RunOnCut{reason: reason, kept: kept}
+	if u == nil {
+		return c
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.runOns = append(u.runOns, c)
+	return c
+}
+
+// TakeRunOns returns the cuts recorded since the last call.
+func (u *TokenUsage) TakeRunOns() []*RunOnCut {
+	if u == nil {
+		return nil
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	out := u.runOns
+	u.runOns = nil
+	return out
+}
+
+// Drop adds text the reply did not keep.
+func (c *RunOnCut) Drop(s string) {
+	if c == nil || s == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dropped.WriteString(s)
+}
+
+// Reason, Kept and Dropped describe the cut for the log.
+func (c *RunOnCut) Reason() string { return c.reason }
+func (c *RunOnCut) Kept() string   { return c.kept }
+func (c *RunOnCut) Dropped() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropped.String()
 }
 
 // SetAnsweredBy records the provider that produced the output. A tool round is a second call, and the
