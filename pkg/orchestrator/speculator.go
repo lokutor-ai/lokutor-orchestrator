@@ -28,13 +28,17 @@ type SpeculativeResult struct {
 	// the previous turn's tokens on every hit), and either way the run's cost is logged when it
 	// finishes (SpeculativeRun), so speculation's share of the language-model bill is measured.
 	Tokens *TokenUsage
+	// RunID is the run that produced it (SpeculativeRun.ID).
+	RunID int
 }
 
 // SpeculativeRun is one finished speculative run, for the cost log: the transcript it guessed on,
 // what it cost and how it ended. Outcome is "responded", "no_response", "failed", "cancelled" or
 // "no_transcript". A run is paid for whether or not its reply is used; "Speculative reply used"
-// says which were.
+// says which were. ID numbers the executor's runs: the seed line, this run's cost line and
+// "Speculative reply used" carry the same one, so each paid run ties to whether its reply was used.
 type SpeculativeRun struct {
+	ID         int
 	Source     string // "audio" (Start) or "transcript" (StartFromTranscript)
 	Transcript string
 	Tokens     *TokenUsage
@@ -115,6 +119,23 @@ func (se *SpeculativeExecutor) SetOnFinish(cb func(SpeculativeRun)) {
 	se.mu.Lock()
 	defer se.mu.Unlock()
 	se.onFinish = cb
+}
+
+// RunID is the number of the latest run started (0 before any), for the line that logs a seed.
+func (se *SpeculativeExecutor) RunID() int {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	return se.runID
+}
+
+// ResultRunID is the run that produced the current result, if any; read it before Cancel.
+func (se *SpeculativeExecutor) ResultRunID() int {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if se.result == nil {
+		return 0
+	}
+	return se.result.RunID
 }
 
 // ResultTokens is the token sink of the current result, if any; read it before Cancel.
@@ -203,6 +224,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 		}
 		if result != nil {
 			result.Tokens = tokens
+			result.RunID = id
 		}
 		se.mu.Lock()
 		if se.state == SpecRunning && se.runID == id {
@@ -217,7 +239,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 		se.mu.Unlock()
 		close(done)
 		if onFinish != nil {
-			onFinish(SpeculativeRun{Source: "audio", Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
+			onFinish(SpeculativeRun{ID: id, Source: "audio", Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
 		}
 	}
 
@@ -341,6 +363,7 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 		}
 		if result != nil {
 			result.Tokens = tokens
+			result.RunID = id
 		}
 		se.mu.Lock()
 		if se.state == SpecRunning && se.runID == id {
@@ -355,7 +378,7 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 		se.mu.Unlock()
 		close(done)
 		if onFinish != nil {
-			onFinish(SpeculativeRun{Source: "transcript", Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
+			onFinish(SpeculativeRun{ID: id, Source: "transcript", Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
 		}
 	}
 

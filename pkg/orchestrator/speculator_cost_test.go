@@ -144,3 +144,38 @@ func TestPauseMakesNoModelCallWhenTheSeedIsActive(t *testing.T) {
 		t.Fatalf("a mid-sentence pause called the model %d times", got)
 	}
 }
+
+// The seed, the run's cost line and a hit carry one run number, so each paid run ties to its outcome.
+func TestRunIDTiesRunToResult(t *testing.T) {
+	llm := &gatedLLM{release: make(chan struct{})}
+	orch := newSpecOrch(llm)
+	se := NewSpeculativeExecutor(400)
+	var finished []SpeculativeRun
+	var mu sync.Mutex
+	se.SetOnFinish(func(r SpeculativeRun) { mu.Lock(); finished = append(finished, r); mu.Unlock() })
+
+	se.StartFromTranscript(context.Background(), orch, "primera", nil, nil)
+	first := se.RunID()
+	se.StartFromTranscript(context.Background(), orch, "segunda", nil, nil)
+	second := se.RunID()
+	close(llm.release)
+	if first == 0 || second != first+1 {
+		t.Fatalf("run numbers: %d then %d", first, second)
+	}
+	if _, ok := se.Await(context.Background(), "segunda"); !ok {
+		t.Fatalf("expected the second run to answer")
+	}
+	if got := se.ResultRunID(); got != second {
+		t.Fatalf("result run %d, want %d", got, second)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	ids := map[int]string{}
+	for _, r := range finished {
+		ids[r.ID] = r.Outcome
+	}
+	if ids[first] != "cancelled" || ids[second] != "responded" {
+		t.Fatalf("cost lines by run: %v", ids)
+	}
+}

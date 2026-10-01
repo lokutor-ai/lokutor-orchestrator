@@ -151,6 +151,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	// On a hit the turn's tokens are the run's: without this the turn-latency line reported the
 	// previous turn's sink, since runLLMAndTTS (which installs a fresh one) never runs.
 	specTokens := ms.speculator.ResultTokens()
+	specRun := ms.speculator.ResultRunID()
 	ms.mu.Lock()
 	ms.specAwaitMs = time.Since(awaitStart).Milliseconds()
 	ms.mu.Unlock()
@@ -208,7 +209,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.turnTokens = specTokens
 	ms.mu.Unlock()
 	defer rCancel()
-	ms.logger.Info("Speculative reply used", "gen", gen, "transcript_chars", len(transcript))
+	ms.logger.Info("Speculative reply used", "run", specRun, "gen", gen, "transcript_chars", len(transcript))
 
 	// BotThinking is emitted from inside speakText (via speakResponse below), not here — see the
 	// comment on that emission for why: the client SDK stops currently-playing audio the instant

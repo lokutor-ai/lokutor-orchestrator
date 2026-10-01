@@ -556,7 +556,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			if !ok {
 				p, c = -1, -1
 			}
-			ms.logger.Info("Speculative LLM run", "source", r.Source, "outcome", r.Outcome, "ms", r.Ms,
+			ms.logger.Info("Speculative LLM run", "run", r.ID, "source", r.Source, "outcome", r.Outcome, "ms", r.Ms,
 				"prompt_tokens", p, "completion_tokens", c, "answered_by", r.Tokens.AnsweredBy(), "transcript_chars", len(r.Transcript))
 		})
 		if cfg.SpeculativePrerender {
