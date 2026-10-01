@@ -127,7 +127,55 @@ func parseToolCallMarker(response string) ([]ToolCallEventData, bool) {
 // Shared by the streaming tool-call path (invoked per-call as they arrive)
 // and the non-streaming path (invoked for a batch parsed from a
 // [TOOL_CALLS] marker), so both dispatch and time out identically.
+//
+// Every call's outcome is logged ("Tool call", or "Tool call failed" with the error). A failed tool
+// used to reach the model and nothing else: handlers report failure as an {"error": ...} result, so a
+// calendar that could not be reached on every booking left no trace until a caller noticed nothing
+// had been booked (2026-09-30).
 func (ms *ManagedStream) dispatchToolCall(ctx context.Context, tcData ToolCallEventData) string {
+	start := time.Now()
+	res := ms.runToolCall(ctx, tcData)
+	ms.mu.Lock()
+	gen := ms.payloadGen
+	ms.mu.Unlock()
+	switch msg := toolResultError(res); {
+	case msg == "":
+		ms.logger.Info("Tool call", "tool", tcData.Name, "ms", time.Since(start).Milliseconds(), "gen", gen)
+	case msg == "cancelled" && ms.ctx.Err() != nil:
+		ms.logger.Info("Tool call cancelled: the call ended", "tool", tcData.Name, "ms", time.Since(start).Milliseconds())
+	default:
+		ms.logger.Warn("Tool call failed", "tool", tcData.Name, "ms", time.Since(start).Milliseconds(), "gen", gen,
+			"error", clipForLog(msg))
+	}
+	return res
+}
+
+// toolResultError is the error a tool result reports: its top-level "error" field, if it is a JSON
+// object with a non-empty one.
+func toolResultError(res string) string {
+	s := strings.TrimSpace(res)
+	if !strings.HasPrefix(s, "{") {
+		return ""
+	}
+	var v struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(s), &v) != nil {
+		return ""
+	}
+	switch raw := strings.TrimSpace(string(v.Error)); raw {
+	case "", "null", `""`, "false":
+		return ""
+	default:
+		var msg string
+		if json.Unmarshal(v.Error, &msg) == nil {
+			return msg
+		}
+		return raw
+	}
+}
+
+func (ms *ManagedStream) runToolCall(ctx context.Context, tcData ToolCallEventData) string {
 	if handler, ok := ms.orch.toolHandlers[tcData.Name]; ok {
 		hrCh := make(chan toolHandlerResult, 1)
 		go func() {
