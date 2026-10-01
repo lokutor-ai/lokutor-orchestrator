@@ -619,6 +619,19 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			})
 
 			ms.mu.Lock()
+			// A newer turn has the floor: the caller spoke again while the tools ran. The exchange is
+			// in the context already (recordToolExchange above), so the newer turn's reply can say
+			// what was done; this one must not be spoken too, nor cancel the newer turn's pipeline as
+			// it takes the floor. On 2026-10-01 a booking made for "la parejo" finished after the
+			// caller's "sí, venga" had started its own turn, and both turns' replies were spoken
+			// ("Genial, te dejo la demo…", then "Listo, te confirmo la cita…").
+			if ms.payloadGen != gen {
+				current := ms.payloadGen
+				ms.mu.Unlock()
+				ms.logger.Info("Reply after tool calls not spoken: a newer turn has the floor",
+					"gen", gen, "current_gen", current)
+				return
+			}
 			if ms.pipelineCancel != nil {
 				ms.pipelineCancel()
 			}

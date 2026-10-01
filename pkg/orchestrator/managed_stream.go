@@ -3023,7 +3023,7 @@ func (ms *ManagedStream) isLikelyNoise(result TranscriptionResult, audioDuration
 // here carry none of their own.
 var recogniserFillers = map[string]fillerKind{
 	"thank you": fillerReply, "thanks": fillerReply, "you": fillerReply,
-	"bye": fillerReply, "okay": fillerReply, "ok": fillerReply,
+	"bye": fillerReply, "okay": fillerEveryLanguage, "ok": fillerEveryLanguage,
 	"uh": fillerHesitation, "um": fillerHesitation, "hmm": fillerHesitation, "mm": fillerHesitation,
 	"thanks for watching": fillerCaption, "thank you for watching": fillerCaption,
 	"subtitles by the amara.org community": fillerCaption,
@@ -3044,6 +3044,10 @@ const (
 	fillerHesitation
 	// fillerCaption: subtitle-corpus boilerplate nobody says in under a second.
 	fillerCaption
+	// fillerEveryLanguage: a reply that is a word in every language served ("okay"). Asking a
+	// Spanish caller to repeat their "okay" threw a real answer back at them twice in one call
+	// (2026-10-01: "Perdona, no te he oído bien" / "He dicho okay").
+	fillerEveryLanguage
 )
 
 // fillerVerdict is what processUtterance does with a transcript.
@@ -3098,6 +3102,8 @@ func recogniserFillerVerdict(transcript string, lang Language, audioDuration tim
 	switch {
 	case overAgent, kind == fillerHesitation:
 		return fillerDiscard
+	case kind == fillerEveryLanguage:
+		return fillerTurn
 	case !english:
 		return fillerAskRepeat
 	case kind == fillerCaption && audioDuration < 700*time.Millisecond:

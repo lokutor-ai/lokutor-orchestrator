@@ -45,7 +45,12 @@ func TestRecogniserFillerVerdict(t *testing.T) {
 		// ...and 2026-09-24, verbatim: a caller's name alone, with the floor, came back as these and
 		// was dropped both times, so the agent never answered. Silence is not an answer.
 		{"spanish name heard as yeah", "Yeah.", "es", 439 * time.Millisecond, false, fillerAskRepeat},
-		{"spanish name heard as okay", "Okay.", "es", 419 * time.Millisecond, false, fillerAskRepeat},
+		// "Okay" is the exception: it is a word in Spanish too, and asking to repeat it threw real
+		// answers back (2026-10-01, twice in one call). A name misheard as "Okay." is now answered
+		// as a turn, and the agent asks for the name again in its own words.
+		{"spanish okay with the floor", "Okay.", "es", 419 * time.Millisecond, false, fillerTurn},
+		{"catalan ok with the floor", "OK", "ca", short, false, fillerTurn},
+		{"spanish okay over the agent", "Okay.", "es", short, true, fillerDiscard},
 		// Hesitations stay silent in every language.
 		{"spanish call hesitation", "Mm.", "es", short, false, fillerDiscard},
 

@@ -143,3 +143,63 @@ loop:
 		t.Error("Final assistant response not found in session context")
 	}
 }
+
+// A tool turn the caller has talked over must not speak its reply once the tool finishes: a newer
+// turn has the floor and answers with the exchange in its context. On 2026-10-01 a booking for one
+// turn finished while the next turn was answering, and both replies were spoken.
+func TestReplyAfterToolsIsNotSpokenOnceANewerTurnHasTheFloor(t *testing.T) {
+	llm := &MockStreamingLLM{responses: []struct {
+		content   string
+		toolCalls []ToolCallEventData
+	}{
+		{toolCalls: []ToolCallEventData{{Name: "book_appointment", Arguments: `{}`, CallID: "c1"}}},
+		{content: "Listo, reservado."},
+	}}
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, &MockTTSProvider{synthesizeResult: []byte{1, 2, 3}}, nil, DefaultConfig(), &NoOpLogger{})
+	release := make(chan struct{})
+	orch.RegisterTool("book_appointment", func(args string) (string, error) {
+		<-release
+		return `{"booked": true}`, nil
+	})
+	session := NewConversationSession("u")
+	ms := orch.NewManagedStream(context.Background(), session)
+	defer ms.Close()
+
+	go ms.runLLMAndTTS(context.Background(), "sí, resérvalo")
+	timeout := time.After(2 * time.Second)
+	for waiting := true; waiting; {
+		select {
+		case ev := <-ms.Events():
+			waiting = ev.Type != ToolCall
+		case <-timeout:
+			t.Fatal("no tool call")
+		}
+	}
+	// The caller speaks again and a newer turn takes the floor while the booking runs.
+	ms.mu.Lock()
+	ms.payloadGen++
+	ms.mu.Unlock()
+	close(release)
+
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case ev := <-ms.Events():
+			if ev.Type == BotResponse {
+				t.Fatalf("the superseded turn spoke its reply: %v", ev.Data)
+			}
+		case <-deadline:
+			if llm.callCount != 1 {
+				t.Fatalf("the reply round should not run for a superseded turn, LLM called %d times", llm.callCount)
+			}
+			hasTool := false
+			for _, m := range session.GetContextCopy() {
+				hasTool = hasTool || m.Role == "tool"
+			}
+			if !hasTool {
+				t.Fatal("the tool exchange must stay in the context for the newer turn")
+			}
+			return
+		}
+	}
+}

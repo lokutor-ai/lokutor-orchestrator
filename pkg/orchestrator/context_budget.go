@@ -215,9 +215,12 @@ func (s *ConversationSession) runFold(summarize HistorySummarizer, logger Logger
 			"turns", len(turns))
 		return
 	}
+	// The record itself is logged: when an agent re-asked something after a fold (2026-10-01) there was
+	// no way to tell whether the record had dropped it or the model had ignored it.
 	logger.Info("History folded into the call summary",
 		"turns_folded", len(turns), "summary_tokens", estimateTokens(summary),
-		"conversation_tokens_after", convTokens, "elapsed_ms", time.Since(started).Milliseconds())
+		"conversation_tokens_after", convTokens, "elapsed_ms", time.Since(started).Milliseconds(),
+		"summary", clipForLog(summary))
 }
 
 // applyFoldLocked replaces the call summary and removes exactly the turns it now covers. It
@@ -328,9 +331,18 @@ func (s *ConversationSession) ContextTokens() int {
 // historySummaryInstructions is the summariser's system prompt. The record replaces the turns it
 // covers, so anything it leaves out is gone for the rest of the call — hence "every concrete
 // detail", values as said, and no word limit that would force one out.
+//
+// The record lists the questions already answered, each with the caller's own words, in the call's
+// language. Written as English facts ("Calls per day: between one and two") it was read and still
+// lost: after a fold on 2026-10-01 the agent asked the caller's call volume again, and again after
+// "you already asked me that", in 3-4 of 12 replays of the exact prompt; with the question and the
+// answer quoted, 0 of 12. A model does not re-ask what it can see it asked.
 const historySummaryInstructions = `You keep the running record of a live phone conversation between a caller and a voice agent. The agent reads your record instead of the turns it replaces, so anything you leave out is forgotten for the rest of the call.
 
-Write the updated record as short plain lines, no headings or markdown. Keep every concrete detail either side gave, asked for or agreed: names and how they are spelled, phone numbers, emails, addresses, dates, times, numbers of people, prices, booking or order details, preferences, problems, what the caller still wants, and anything the agent promised, asked, or could not answer. Write each value exactly as it was said. Leave out greetings, small talk and repetition. Aim for under 150 words, but never drop a detail to get there. Write in English and keep names and values in the words used on the call.`
+Write the updated record in the language the call is in, as short plain lines, no markdown, in two parts:
+1. A line saying, in that language, "Already asked and answered on this call (do not ask again):", then one line for each question the agent asked that the caller answered: the question as the agent asked it, then the caller's answer in their own words, in quotes.
+2. A line saying, in that language, "Facts:", then every other concrete detail either side gave, asked for or agreed: names and how they are spelled, phone numbers, emails, addresses, dates, times, numbers of people, prices, booking or order details and their results, preferences, problems, what the caller still wants, and anything the agent promised or could not answer.
+Keep everything already in the record unless the call has changed it. Write each value exactly as it was said. Leave out greetings, small talk and repetition. Aim for under 200 words, but never drop a detail to get there.`
 
 // summarizeHistory is the Orchestrator's HistorySummarizer: one completion on the call's own model.
 func (o *Orchestrator) summarizeHistory(ctx context.Context, prior string, turns []Message) (string, error) {
