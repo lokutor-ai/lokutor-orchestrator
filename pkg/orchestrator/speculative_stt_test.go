@@ -191,3 +191,28 @@ func TestAwaitRejectsMismatchedTranscript(t *testing.T) {
 		t.Errorf("an equivalent transcript must match (case/space-insensitive): got %q ok=%v", got, ok)
 	}
 }
+
+// A pass orphaned by the caller carrying on cannot land on the next pause's attempt: its transcript
+// is short of the words said in between, and the end-of-turn length check measures the new snapshot.
+func TestOrphanedPassCannotLandOnTheNextAttempt(t *testing.T) {
+	var s specSTT
+	a, ok := s.start(1000, 3)
+	if !ok {
+		t.Fatal("first pause should start")
+	}
+	s.invalidate() // the caller carried on
+	b, ok := s.start(2000, 3)
+	if !ok || b == a {
+		t.Fatalf("second pause should start its own attempt: %d %d %v", a, b, ok)
+	}
+	if ok, displaced := s.finishAttempt(a, TranscriptionResult{Text: "quiero reservar"}, nil); ok || !displaced {
+		t.Fatalf("the orphaned pass must not be taken (and is the displaced case): %v %v", ok, displaced)
+	}
+	if ok, _ := s.finishAttempt(b, TranscriptionResult{Text: "quiero reservar para el viernes"}, nil); !ok {
+		t.Fatal("the current pass must be taken")
+	}
+	res, ok, _ := s.awaitUsable(context.Background(), 3, 2000, 32, 700)
+	if !ok || res.Text != "quiero reservar para el viernes" {
+		t.Fatalf("the turn must get the second pause's transcript, got %q %v", res.Text, ok)
+	}
+}

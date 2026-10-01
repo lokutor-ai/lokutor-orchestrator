@@ -89,6 +89,14 @@ type specSTT struct {
 	// startedAt is when the speculative pass began, for logging how much of
 	// the hangover it actually managed to use.
 	startedAt time.Time
+
+	// attempt numbers the passes begun. A pass finishes only its own attempt: invalidate() lets the
+	// next pause begin another while the old pass is still transcribing, and the old pass landing
+	// then was taken as the new attempt's result. That transcript is short of the words said between
+	// the two pauses, and the length check at end of turn measures the new snapshot, so it was
+	// accepted and the turn answered without them. The old pass also seeded the model with its stale
+	// words, a paid run that could only be thrown away.
+	attempt int
 }
 
 func specSTTEnabled() bool {
@@ -214,7 +222,8 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 	if speechLen < defaultSpecSTTMinBytes {
 		return
 	}
-	if !ms.specSTT.begin(len(snapshot), seq) {
+	attempt, ok := ms.specSTT.start(len(snapshot), seq)
+	if !ok {
 		return // already running (or already finished) for this pause
 	}
 
@@ -225,7 +234,16 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		ctx, cancel := context.WithTimeout(ms.ctx, 10*time.Second)
 		defer cancel()
 		res, err := ms.orch.Transcribe(ctx, snapshot, lang)
-		ms.specSTT.finish(res, err)
+		if ok, displaced := ms.specSTT.finishAttempt(attempt, res, err); !ok {
+			// The caller carried on after this pause: the transcript is short of what they said
+			// since, and neither the turn nor a guess may use it. Logged when a later pause's pass
+			// was running, the case that used to take this transcript for the turn's.
+			if displaced {
+				ms.logger.Info("Speculative STT: an earlier pause's transcript finished during a later pause's pass and was discarded",
+					"attempt", attempt, "text", res.Text)
+			}
+			return
+		}
 
 		// Hand the transcript straight to the speculative LLM rather than
 		// letting it transcribe the same audio again.
@@ -306,11 +324,18 @@ func (ms *ManagedStream) speculationSeed(text string, seq int) (seed string, his
 // begin claims the attempt. Returns false if one is already in flight or a
 // result is already waiting for this pause.
 func (s *specSTT) begin(snapshotLen, seq int) bool {
+	_, ok := s.start(snapshotLen, seq)
+	return ok
+}
+
+// start is begin, also returning the attempt's number for finishAttempt.
+func (s *specSTT) start(snapshotLen, seq int) (int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.inFlight || s.done != nil {
-		return false
+		return 0, false
 	}
+	s.attempt++
 	s.inFlight = true
 	s.done = make(chan struct{})
 	s.snapshotLen = snapshotLen
@@ -318,14 +343,25 @@ func (s *specSTT) begin(snapshotLen, seq int) bool {
 	s.result = TranscriptionResult{}
 	s.err = nil
 	s.startedAt = time.Now()
-	return true
+	return s.attempt, true
 }
 
+// finish records the result of the attempt in flight.
 func (s *specSTT) finish(res TranscriptionResult, err error) {
 	s.mu.Lock()
+	attempt := s.attempt
+	s.mu.Unlock()
+	s.finishAttempt(attempt, res, err)
+}
+
+// finishAttempt records attempt's result if it is still the attempt in flight, and reports whether it
+// was. An orphaned pass (invalidated, and perhaps replaced by a later pause's) changes nothing;
+// displaced says a later attempt was in flight, the case that used to take the orphan's result.
+func (s *specSTT) finishAttempt(attempt int, res TranscriptionResult, err error) (ok, displaced bool) {
+	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.inFlight {
-		return
+	if !s.inFlight || s.attempt != attempt {
+		return false, s.inFlight && s.attempt != attempt
 	}
 	s.inFlight = false
 	s.result = res
@@ -333,6 +369,7 @@ func (s *specSTT) finish(res TranscriptionResult, err error) {
 	if s.done != nil {
 		close(s.done)
 	}
+	return true, false
 }
 
 // invalidate drops any attempt. The in-flight goroutine is left to complete
