@@ -294,3 +294,44 @@ func TestDropUnplayedFarEndEcho(t *testing.T) {
 		t.Fatalf("expected ~10 frames (200 ms) of played audio before the stop, got %d", loud)
 	}
 }
+
+// The echo check copies only the far end's tail that can align with the near end. Against a full
+// 12 s far end with a partial trailing frame, it must agree with correlating the whole buffer.
+func TestIsLikelyAcousticEcho_TailCopyMatchesWholeBuffer(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "hi"}
+	llm := &MockLLMProvider{completeResult: "ok"}
+	tts := &MockTTSProvider{synthesizeResult: []byte("audio")}
+	vad := NewRMSVAD(0.05, 50*time.Millisecond)
+	orch := NewWithVAD(stt, llm, tts, vad, DefaultConfig())
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("tail-copy"))
+	defer stream.Close()
+
+	// Speech-like far end: a tone whose loudness changes every 20 ms frame, plus half a frame.
+	samples := 12*16000 + 160
+	far := make([]byte, samples*2)
+	for i := 0; i < samples; i++ {
+		amp := 2000 + 6000*math.Abs(math.Sin(float64(i/320)*0.7)*math.Cos(float64(i/320)*0.13))
+		v := int16(amp * math.Sin(float64(i)*0.3))
+		far[i*2], far[i*2+1] = byte(v), byte(v>>8)
+	}
+	// The microphone hears the last second the speaker played, 300 ms late and quieter.
+	lagBytes, nearBytes := 300*32, 16000*2
+	end := (len(far) / echoFrameBytes) * echoFrameBytes
+	near := attenuate(far[end-lagBytes-nearBytes:end-lagBytes], 0.3)
+
+	stream.echoMu.Lock()
+	stream.echoFarEndBuf, stream.echoNearEndBuf, stream.echoNearEndGen = far, near, 1
+	stream.echoMu.Unlock()
+	echo, score, lagMs, _ := stream.isLikelyAcousticEcho(1)
+
+	nearEnv, farEnv := rmsEnvelope(near, echoFrameBytes), rmsEnvelope(far, echoFrameBytes)
+	farEnv = farEnv[len(farEnv)-(len(nearEnv)+echoMaxLagFrames):]
+	wantScore, at := correlateEnvelopes(nearEnv, farEnv)
+	wantLag := ((len(farEnv) - len(nearEnv)) - at) * 20
+	if !echo || score != wantScore || lagMs != wantLag {
+		t.Fatalf("echo=%v score=%.4f lag=%dms, whole buffer gives score=%.4f lag=%dms", echo, score, lagMs, wantScore, wantLag)
+	}
+	if lagMs != 300 {
+		t.Errorf("lag %d ms, want 300", lagMs)
+	}
+}

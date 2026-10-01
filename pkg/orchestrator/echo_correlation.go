@@ -284,8 +284,16 @@ func (ms *ManagedStream) isLikelyAcousticEcho(gen int) (echo bool, score float64
 	}
 	near := make([]byte, len(ms.echoNearEndBuf))
 	copy(near, ms.echoNearEndBuf)
-	far := make([]byte, len(ms.echoFarEndBuf))
-	copy(far, ms.echoFarEndBuf)
+	// Only the far end's last len(near)+echoMaxLagFrames frames can align with the near end (see
+	// below), so only they are copied: this runs on every microphone frame of a pending barge-in,
+	// under the stream lock when stopPlayThroughIfDue asks, and the far end holds 12 s. The cut is
+	// a whole number of frames from the start, so the frames kept are the same ones.
+	farSrc := ms.echoFarEndBuf
+	if skip := len(farSrc)/echoFrameBytes - (len(near)/echoFrameBytes + echoMaxLagFrames); skip > 0 {
+		farSrc = farSrc[skip*echoFrameBytes:]
+	}
+	far := make([]byte, len(farSrc))
+	copy(far, farSrc)
 	ms.echoMu.Unlock()
 
 	nearEnv := rmsEnvelope(near, echoFrameBytes)
