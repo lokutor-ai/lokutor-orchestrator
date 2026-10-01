@@ -132,6 +132,18 @@ func (ms *ManagedStream) specLLMFromTranscriptEnabled() bool {
 	return v != "false" && v != "0" && v != "off"
 }
 
+// hangoverSeedActive reports whether guesses come from the hangover seed: speculative STT on, chained
+// into the LLM, and a VAD that can say how long the silence has been (the seed's trigger). When it is,
+// the audio-triggered guesses stay off; when it is not (an RMS VAD, or the chain disabled), they are
+// still the only speculation there is.
+func (ms *ManagedStream) hangoverSeedActive() bool {
+	if !specSTTEnabled() || !ms.specLLMFromTranscriptEnabled() || ms.vad == nil {
+		return false
+	}
+	_, ok := ms.vad.(silenceFramesProvider)
+	return ok
+}
+
 // silenceFramesProvider is implemented by SileroVAD. Asserted rather than added
 // to VADProvider so the RMS fallback and any test double keep working — they
 // simply never speculate.
@@ -166,6 +178,11 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		// however much they have said since.
 		if silent == 0 {
 			ms.specSTT.invalidate()
+			// The caller carried on talking, so any guess seeded from the pause is for words they
+			// have since added to: stop paying for it (the next pause seeds a fresh one).
+			if ms.speculator != nil && ms.speculator.State() != SpecIdle {
+				ms.speculator.Cancel()
+			}
 		}
 		return
 	}

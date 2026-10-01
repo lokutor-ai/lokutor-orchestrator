@@ -24,6 +24,22 @@ const (
 type SpeculativeResult struct {
 	PartialTranscript string
 	Response          string
+	// Tokens is the run's own sink: on a hit it becomes the turn's (the turn-latency line reported
+	// the previous turn's tokens on every hit), and either way the run's cost is logged when it
+	// finishes (SpeculativeRun), so speculation's share of the language-model bill is measured.
+	Tokens *TokenUsage
+}
+
+// SpeculativeRun is one finished speculative run, for the cost log: the transcript it guessed on,
+// what it cost and how it ended. Outcome is "responded", "no_response", "failed", "cancelled" or
+// "no_transcript". A run is paid for whether or not its reply is used; "Speculative reply used"
+// says which were.
+type SpeculativeRun struct {
+	Source     string // "audio" (Start) or "transcript" (StartFromTranscript)
+	Transcript string
+	Tokens     *TokenUsage
+	Ms         int64
+	Outcome    string
 }
 
 // SpeculativeExecutor runs STT, and optionally LLM completion, on a guess
@@ -50,6 +66,13 @@ type SpeculativeExecutor struct {
 	// the VAD hangover instead of after it. Nothing here commits to anything: a run whose
 	// transcript turns out not to match is discarded exactly as before.
 	onResponse func(response string)
+
+	// onFinish is told about every run as it ends (see SpeculativeRun).
+	onFinish func(SpeculativeRun)
+	// runID numbers runs so a superseded or cancelled run finishing late cannot overwrite the state
+	// of the run that replaced it; runTranscript is what the current run is guessing on.
+	runID         int
+	runTranscript string
 }
 
 func NewSpeculativeExecutor(intervalMs int) *SpeculativeExecutor {
@@ -84,6 +107,24 @@ func (se *SpeculativeExecutor) SetOnResponse(cb func(response string)) {
 	se.mu.Lock()
 	defer se.mu.Unlock()
 	se.onResponse = cb
+}
+
+// SetOnFinish registers a callback told about every run as it ends, for cost logging. Called on the
+// speculation goroutine.
+func (se *SpeculativeExecutor) SetOnFinish(cb func(SpeculativeRun)) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	se.onFinish = cb
+}
+
+// ResultTokens is the token sink of the current result, if any; read it before Cancel.
+func (se *SpeculativeExecutor) ResultTokens() *TokenUsage {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if se.result == nil {
+		return nil
+	}
+	return se.result.Tokens
 }
 
 // ShouldSpeculate is the original continuous-speech trigger: re-speculate
@@ -141,46 +182,62 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 	}
 	se.state = SpecRunning
 	se.result = nil
+	se.runID++
+	id := se.runID
+	se.runTranscript = ""
+	tokens := &TokenUsage{}
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
+	sCtx = WithTokenUsage(sCtx, tokens)
 	se.cancel = sCancel
 	done := make(chan struct{})
 	se.done = done
 	onPartial := se.onPartial
 	onResponse := se.onResponse
+	onFinish := se.onFinish
 	se.mu.Unlock()
+	started := time.Now()
 
-	finish := func(result *SpeculativeResult) {
+	finish := func(result *SpeculativeResult, transcript, outcome string) {
+		if sCtx.Err() == context.Canceled {
+			outcome = "cancelled"
+		}
+		if result != nil {
+			result.Tokens = tokens
+		}
 		se.mu.Lock()
-		if se.state == SpecRunning {
+		if se.state == SpecRunning && se.runID == id {
 			se.result = result
 			if result != nil {
 				se.state = SpecReady
 			} else {
 				se.state = SpecIdle
 			}
+			se.cancel = nil
 		}
-		se.cancel = nil
 		se.mu.Unlock()
 		close(done)
+		if onFinish != nil {
+			onFinish(SpeculativeRun{Source: "audio", Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
+		}
 	}
 
 	go func() {
 		defer sCancel()
 		defer func() {
 			if r := recover(); r != nil {
-				finish(nil)
+				finish(nil, "", "failed")
 			}
 		}()
 
 		sttResult, err := orch.TranscribeRaw(sCtx, audio, lang)
 		if err != nil || sCtx.Err() != nil {
-			finish(nil)
+			finish(nil, "", "no_transcript")
 			return
 		}
 
 		partial := strings.TrimSpace(sttResult.Text)
 		if partial == "" || len(partial) < 2 {
-			finish(nil)
+			finish(nil, partial, "no_transcript")
 			return
 		}
 
@@ -191,7 +248,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 		if orch.llm == nil {
 			// STT-only speculation (SpeculativeLLM disabled) — still useful
 			// to callers that only want the early partial transcript.
-			finish(&SpeculativeResult{PartialTranscript: partial})
+			finish(&SpeculativeResult{PartialTranscript: partial}, partial, "no_response")
 			return
 		}
 
@@ -201,14 +258,18 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 			// STT succeeded but generation didn't — still record the
 			// transcript so Await's caller at least knows speculation ran,
 			// even though there's no response to use.
-			finish(&SpeculativeResult{PartialTranscript: partial})
+			outcome := "no_response"
+			if err != nil {
+				outcome = "failed"
+			}
+			finish(&SpeculativeResult{PartialTranscript: partial}, partial, outcome)
 			return
 		}
 
 		if onResponse != nil {
 			onResponse(response)
 		}
-		finish(&SpeculativeResult{PartialTranscript: partial, Response: response})
+		finish(&SpeculativeResult{PartialTranscript: partial, Response: response}, partial, "responded")
 	}()
 }
 
@@ -242,39 +303,67 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 
 	se.mu.Lock()
 	if se.state != SpecIdle {
-		se.mu.Unlock()
-		return
+		// Already guessing on these words: nothing new to ask.
+		if sameUtterance(se.runTranscript, transcript) {
+			se.mu.Unlock()
+			return
+		}
+		// A guess on other words is stale: the caller has said more since, or it was left over from
+		// an earlier utterance. It used to keep the executor, refusing this seed (the transcript the
+		// turn will actually use) on 87% of turns while its own guess almost never matched.
+		if se.cancel != nil {
+			se.cancel()
+			se.cancel = nil
+		}
+		se.state = SpecIdle
+		se.result = nil
 	}
 	se.state = SpecRunning
 	se.result = nil
+	se.runID++
+	id := se.runID
+	se.runTranscript = transcript
+	tokens := &TokenUsage{}
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
+	sCtx = WithTokenUsage(sCtx, tokens)
 	se.cancel = sCancel
 	done := make(chan struct{})
 	se.done = done
 	onPartial := se.onPartial
 	onResponse := se.onResponse
+	onFinish := se.onFinish
 	se.mu.Unlock()
+	started := time.Now()
 
-	finish := func(result *SpeculativeResult) {
+	finish := func(result *SpeculativeResult, transcript, outcome string) {
+		if sCtx.Err() == context.Canceled {
+			outcome = "cancelled"
+		}
+		if result != nil {
+			result.Tokens = tokens
+		}
 		se.mu.Lock()
-		if se.state == SpecRunning {
+		if se.state == SpecRunning && se.runID == id {
 			se.result = result
 			if result != nil {
 				se.state = SpecReady
 			} else {
 				se.state = SpecIdle
 			}
+			se.cancel = nil
 		}
-		se.cancel = nil
 		se.mu.Unlock()
 		close(done)
+		if onFinish != nil {
+			onFinish(SpeculativeRun{Source: "transcript", Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
+		}
 	}
 
 	go func() {
 		defer sCancel()
 		defer func() {
 			if r := recover(); r != nil {
-				finish(nil)
+				finish(nil, transcript, "failed")
 			}
 		}()
 
@@ -287,13 +376,17 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 		if err != nil || sCtx.Err() != nil || strings.TrimSpace(response) == "" {
 			// Record the transcript even without a response, so Await's caller
 			// can tell speculation ran rather than never having been attempted.
-			finish(&SpeculativeResult{PartialTranscript: transcript})
+			outcome := "no_response"
+			if err != nil {
+				outcome = "failed"
+			}
+			finish(&SpeculativeResult{PartialTranscript: transcript}, transcript, outcome)
 			return
 		}
 		if onResponse != nil {
 			onResponse(response)
 		}
-		finish(&SpeculativeResult{PartialTranscript: transcript, Response: response})
+		finish(&SpeculativeResult{PartialTranscript: transcript, Response: response}, transcript, "responded")
 	}()
 }
 
@@ -388,4 +481,5 @@ func (se *SpeculativeExecutor) Cancel() {
 	}
 	se.state = SpecIdle
 	se.result = nil
+	se.runTranscript = ""
 }

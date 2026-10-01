@@ -549,6 +549,16 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		ms.speculator.SetOnPartial(func(partial string) {
 			ms.emit(TranscriptPartial, partial)
 		})
+		// Every run is paid for, used or not: log what each cost so speculation's share of the
+		// language-model bill is measured (it was neither counted nor priced until 2026-10-01).
+		ms.speculator.SetOnFinish(func(r SpeculativeRun) {
+			p, c, _, ok := r.Tokens.Snapshot()
+			if !ok {
+				p, c = -1, -1
+			}
+			ms.logger.Info("Speculative LLM run", "source", r.Source, "outcome", r.Outcome, "ms", r.Ms,
+				"prompt_tokens", p, "completion_tokens", c, "answered_by", r.Tokens.AnsweredBy(), "transcript_chars", len(r.Transcript))
+		})
 		if cfg.SpeculativePrerender {
 			// Render the opening segment's audio as soon as the speculative reply exists, which is
 			// inside the VAD hangover — so on a hit there is nothing left to synthesise when the
@@ -845,7 +855,10 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		// buffer — see speculative_stt.go.
 		ms.maybeSpeculateSTT()
 
-		if ms.speculator != nil && ms.orch.config.SpeculativeLLM {
+		// The audio-triggered guesses (this one and the pause trigger) only run when the hangover seed
+		// is off: they transcribe a fragment mid-sentence, rarely match the confirmed words (5-10% of
+		// turns used one), and held the executor so the seed was refused (2026-10-01 audit).
+		if ms.speculator != nil && ms.orch.config.SpeculativeLLM && !ms.hangoverSeedActive() {
 			speechDuration := time.Since(ms.userSpeakingSince)
 			if ms.speculator.ShouldSpeculate(speechDuration, ms.lastSpecAt) {
 				ms.startSpeculation()

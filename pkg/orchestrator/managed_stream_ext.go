@@ -558,6 +558,17 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			defer rCancel()
 			// The turn's sink, so these rounds' tokens count toward the turn and a cut reply is noted.
 			rCtx = WithTokenUsage(rCtx, turnTokens)
+			// The turn-latency line is written at the turn's first audio, which in a tool turn is the
+			// filler, before these rounds run: their tokens were in no log line (2026-10-01 audit). This
+			// line carries the whole turn's total once they are done.
+			defer whenTokensSettled(turnTokens, func() {
+				p, c, t, ok := turnTokens.Snapshot()
+				if !ok {
+					p, c, t = -1, -1, -1
+				}
+				ms.logger.Info("Turn tokens after tools", "gen", gen, "prompt_tokens", p, "completion_tokens", c,
+					"total_tokens", t, "answered_by", turnTokens.AnsweredBy())
+			})
 
 			ms.mu.Lock()
 			if ms.pipelineCancel != nil {

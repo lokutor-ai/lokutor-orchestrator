@@ -55,6 +55,10 @@ func (ms *ManagedStream) updatePauseSpeculationTrigger(chunk []byte) {
 	if ms.speculator == nil || ms.orch == nil || !ms.orch.config.SpeculativeLLM {
 		return
 	}
+	// Off while the hangover seed is on: see the continuous trigger in managed_stream.go.
+	if ms.hangoverSeedActive() {
+		return
+	}
 
 	threshold := ms.orch.config.BargeInVADThreshold
 	if threshold <= 0 {
@@ -144,6 +148,9 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	awaitStart := time.Now()
 	response, ok := ms.speculator.Await(awaitCtx, transcript)
 	cancel()
+	// On a hit the turn's tokens are the run's: without this the turn-latency line reported the
+	// previous turn's sink, since runLLMAndTTS (which installs a fresh one) never runs.
+	specTokens := ms.speculator.ResultTokens()
 	ms.mu.Lock()
 	ms.specAwaitMs = time.Since(awaitStart).Milliseconds()
 	ms.mu.Unlock()
@@ -187,6 +194,9 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	}
 
 	rCtx, rCancel := context.WithCancel(ctx)
+	if specTokens == nil {
+		specTokens = &TokenUsage{}
+	}
 	ms.mu.Lock()
 	if ms.pipelineCancel != nil {
 		ms.pipelineCancel()
@@ -195,8 +205,10 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.pipelineCtx = rCtx
 	ms.payloadGen++
 	gen := ms.payloadGen
+	ms.turnTokens = specTokens
 	ms.mu.Unlock()
 	defer rCancel()
+	ms.logger.Info("Speculative reply used", "gen", gen, "transcript_chars", len(transcript))
 
 	// BotThinking is emitted from inside speakText (via speakResponse below), not here — see the
 	// comment on that emission for why: the client SDK stops currently-playing audio the instant
