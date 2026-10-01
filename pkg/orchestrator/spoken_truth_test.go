@@ -268,6 +268,77 @@ func TestContinuationBase(t *testing.T) {
 	}
 }
 
+// The hangover seed asks the turn processUtterance will build: a continuation's guess is for the joined
+// words, against the context the joined turn is answered in, so Await can match it.
+func TestSpeculationSeedIsTheJoinedTurn(t *testing.T) {
+	const fragment = "¿Qué hora abre la oficina mañana?"
+	now := time.Now()
+
+	// No continuation: the fragment, the context as it is.
+	ms := newTruthStream(t)
+	ms.session.AddMessage("user", "Hola.")
+	ms.session.AddMessage("assistant", "¡Hola! ¿En qué te ayudo?")
+	if seed, history, cont := ms.speculationSeed(fragment, 2); seed != fragment || cont != "" || len(history) != len(ms.session.GetContextCopy()) {
+		t.Fatalf("plain turn: %q %q %d", seed, cont, len(history))
+	}
+
+	// A carried fragment: the text join, which is what mergeCarry makes of a settled fragment. The
+	// fragment never reached the context, and the carry is left for processUtterance to take.
+	ms = newTruthStream(t)
+	before := len(ms.session.GetContextCopy())
+	ms.mu.Lock()
+	ms.carry = &committedUtterance{transcript: "Hola.", endedAt: now.Add(-time.Second)}
+	ms.mu.Unlock()
+	seed, history, cont := ms.speculationSeed(fragment, 2)
+	if seed != "Hola. "+fragment || cont != "Hola." || len(history) != before {
+		t.Fatalf("carry: %q %q %d", seed, cont, len(history))
+	}
+	if ms.carry == nil {
+		t.Fatalf("the seed must not consume the carry")
+	}
+
+	// Spoken over the reply to a settled utterance: joined, and asked without that utterance or its reply.
+	overReply := func(previous string) *ManagedStream {
+		ms := newTruthStream(t)
+		ms.session.AddMessage("user", "Buenas.")
+		ms.session.AddMessage("assistant", "Buenas, dime.")
+		ms.session.AddMessage("user", previous)
+		ms.session.AddMessage("assistant", "¡Hola! ¿En qué te ayudo?")
+		ms.mu.Lock()
+		ms.lastUtt = &committedUtterance{transcript: previous, endedAt: now.Add(-2 * time.Second), gen: 5}
+		ms.payloadGen = 6
+		ms.onset = heardSnapshot{gen: 6, seq: 2, at: now.Add(-time.Second), dur: 400 * time.Millisecond}
+		ms.mu.Unlock()
+		return ms
+	}
+	ms = overReply("Hola.")
+	seed, history, cont = ms.speculationSeed(fragment, 2)
+	if seed != "Hola. "+fragment || cont != "Hola." {
+		t.Fatalf("over a reply: %q %q", seed, cont)
+	}
+	if last := history[len(history)-1]; last.Role != "assistant" || last.Content != "Buenas, dime." {
+		t.Fatalf("the merged utterance and its reply must leave the context: %+v", history)
+	}
+	// The turn processUtterance builds is that context plus the joined words.
+	want, _ := replaceLastUserTurn(ms.session.GetContextCopy(), seed)
+	if got := append(history, Message{Role: "user", Content: seed}); len(got) != len(want) {
+		t.Fatalf("seeded context %d messages, the turn has %d", len(got), len(want))
+	}
+
+	// An unsettled utterance joins only through a joint transcription: the fragment, as before.
+	ms = overReply("Quiero reservar para")
+	if seed, _, cont := ms.speculationSeed(fragment, 2); seed != fragment || cont != "" {
+		t.Fatalf("unsettled: %q %q", seed, cont)
+	}
+
+	// A note after the utterance: the joined turn would keep it after the words, so the fragment.
+	ms = overReply("Hola.")
+	ms.session.AddMessage("system", "Retrieved: horario 9-18.")
+	if seed, _, cont := ms.speculationSeed(fragment, 2); seed != fragment || cont != "" {
+		t.Fatalf("note in the tail: %q %q", seed, cont)
+	}
+}
+
 // fixedAudioTTS delivers one second of 16 kHz audio per text, in ten chunks, immediately.
 type fixedAudioTTS struct{}
 

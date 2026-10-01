@@ -251,11 +251,56 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		// or starts and is never matched at end-of-turn, llm_ms simply stays at
 		// its normal value and nothing says why.
 		before := ms.speculator.State()
-		ms.speculator.StartFromTranscript(ms.ctx, ms.orch, text,
-			ms.session.GetContextCopy(), ms.session.GetTools())
+		seed, history, continues := ms.speculationSeed(text, seq)
+		ms.speculator.StartFromTranscript(ms.ctx, ms.orch, seed, history, ms.session.GetTools())
 		ms.logger.Info("Speculative LLM seeded from hangover transcript",
-			"transcript", text, "state_before", before, "state_after", ms.speculator.State())
+			"transcript", seed, "continues", continues, "state_before", before, "state_after", ms.speculator.State())
 	}()
+}
+
+// speculationSeed is what the hangover seed asks the model: the words, and the context, that this
+// utterance's turn will carry once processUtterance has joined it to the utterance it continues
+// (spoken_truth.go). continues is that earlier utterance's transcript, or "".
+//
+// Seeded with the fragment alone, a joined turn never matched its guess (Await compares the run's
+// transcript with the turn's) and paid a whole completion for nothing: 15% of turns were joined, and
+// they used a speculative reply on 2.2% against 11.8% for the rest (14 days of /lokutor/system to
+// 2026-10-01).
+//
+//   - A carried fragment is joined as text unless a joint transcription lands in time and is accepted,
+//     usually as the same words. It never reached the context, so the context is unchanged.
+//   - Over a reply, a previous utterance that settled on its own ("Hola.") is joined as text and the
+//     reply it got leaves the context, so the guess is asked against the context without either. When
+//     anything other than replies follows that utterance (a note, a tool call) the turn would be
+//     built differently, and the fragment is asked as before.
+//   - Over a reply, an unsettled utterance joins only through a joint transcription (unknowable here)
+//     or stays a turn of its own; the fragment is the guess for the second.
+func (ms *ManagedStream) speculationSeed(text string, seq int) (seed string, history []Message, continues string) {
+	history = ms.session.GetContextCopy()
+	now := time.Now()
+	ms.mu.Lock()
+	carry := ms.carry
+	if carry != nil && now.Sub(carry.endedAt) > continuationMergeWindow {
+		carry = nil
+	}
+	var barge *committedUtterance
+	if carry == nil {
+		barge = ms.bargeBaseLocked(now, seq, ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen)
+	}
+	ms.mu.Unlock()
+
+	switch {
+	case carry != nil:
+		return spaceSentences(strings.TrimSpace(carry.transcript + " " + text)), history, carry.transcript
+	case barge != nil && !needsJointPass(barge.transcript):
+		merged := spaceSentences(strings.TrimSpace(barge.transcript + " " + text))
+		if revised, ok := replaceLastUserTurn(history, merged); ok {
+			if last := revised[len(revised)-1]; last.Role == "user" && last.Content == merged {
+				return merged, revised[:len(revised)-1], barge.transcript
+			}
+		}
+	}
+	return text, history, ""
 }
 
 // begin claims the attempt. Returns false if one is already in flight or a
