@@ -37,8 +37,8 @@ func NewGroqLLM(apiKey string, model string) *GroqLLM {
 	}
 }
 
-func (l *GroqLLM) applyReasoningEffort(payload map[string]interface{}) {
-	setReasoningEffort(payload, l.reasoningEffort)
+func (l *GroqLLM) applyReasoningEffort(ctx context.Context, payload map[string]interface{}) {
+	setReasoningEffort(payload, effortFor(ctx, l.reasoningEffort))
 }
 
 func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
@@ -46,7 +46,7 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 		"model":    l.model,
 		"messages": forGptOss(l.model, messages, l.toolHistory),
 	}
-	l.applyReasoningEffort(payload)
+	l.applyReasoningEffort(ctx, payload)
 	if len(tools) > 0 {
 		payload["tools"] = tools
 		payload["tool_choice"] = "auto"
@@ -105,7 +105,7 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 	}
 	// Streaming omits token counts unless asked; see requestStreamUsage in usage.go.
 	requestStreamUsage(payload)
-	l.applyReasoningEffort(payload)
+	l.applyReasoningEffort(ctx, payload)
 	if len(tools) > 0 {
 		payload["tools"] = tools
 		payload["tool_choice"] = "auto"

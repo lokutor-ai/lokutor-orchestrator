@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -194,6 +195,68 @@ func TestManagedStream_WrittenOutReplyAfterToolIsAskedAgain(t *testing.T) {
 	defer session.mu.RUnlock()
 	for _, m := range session.Context {
 		assert.NotContains(t, m.Content, "book_appointment", "the written-out call is neither spoken nor recorded")
+	}
+}
+
+// The retry has to be able to MAKE the call. It was Complete, which reads the reply's text and drops
+// any tool call, so a model that did what was asked on the second try (called the tool) came back as
+// an empty reply and the turn was abandoned: a computer-control agent whose every step is a call
+// heard nothing 4 turns in 5 on 2026-10-05 (Not speaking after tool calls -> Turn abandoned).
+func TestManagedStream_RetryAfterWrittenOutCallCanMakeTheCall(t *testing.T) {
+	llm := &recordingStreamingLLM{script: []struct {
+		text  string
+		calls []ToolCallEventData
+	}{
+		{calls: []ToolCallEventData{{Name: "observe", Arguments: `{}`, CallID: "c1"}}},
+		{text: `I'll click the Applications row.{"id":22} to=functions.click`},              // written out
+		{calls: []ToolCallEventData{{Name: "click", Arguments: `{"id":22}`, CallID: "c2"}}}, // the retry makes it
+		{text: "Done, Applications is open."},
+	}}
+	stt := &MockSTTProvider{transcribeResult: "open applications"}
+	tts := &MockTTSProvider{synthesizeResult: []byte{1, 2, 3}}
+	log := &recordingLogger{}
+	orch := NewWithAllLayers(stt, llm, tts, nil, DefaultConfig(), log)
+	var clicked atomic.Int32
+	orch.RegisterTool("observe", func(string) (string, error) { return `app: Finder [22] row Applications`, nil })
+	orch.RegisterTool("click", func(string) (string, error) { clicked.Add(1); return `clicked "Applications"`, nil })
+
+	session := NewConversationSession("retry-makes-the-call")
+	session.SetTools([]Tool{
+		{Type: "function", Function: map[string]interface{}{"name": "observe"}},
+		{Type: "function", Function: map[string]interface{}{"name": "click"}},
+	})
+	ms := orch.NewManagedStream(context.Background(), session)
+	defer ms.Close()
+
+	go ms.runLLMAndTTS(context.Background(), "open applications")
+
+	var spoken string
+	timeout := time.After(3 * time.Second)
+	for spoken == "" {
+		select {
+		case ev := <-ms.Events():
+			switch ev.Type {
+			case BotResponse:
+				spoken, _ = ev.Data.(string)
+			case ErrorEvent:
+				t.Fatalf("turn failed: %v", ev.Data)
+			}
+		case <-timeout:
+			t.Fatalf("timed out: the turn was abandoned after the written-out call: %v", log.lines)
+		}
+	}
+	assert.Equal(t, "Done, Applications is open.", spoken)
+	llm.mu.Lock()
+	assert.Equal(t, []string{"", "", "medium", "medium"}, llm.efforts, "only the second try asks for more reasoning")
+	llm.mu.Unlock()
+	assert.EqualValues(t, 1, clicked.Load(), "the call the retry made was dispatched")
+	assert.Equal(t, 1, log.count("WARN Not speaking after tool calls"))
+	assert.Equal(t, 0, log.count("WARN Turn abandoned"), "%v", log.lines)
+	assert.Equal(t, 1, log.count("INFO Reply after tool calls recovered on the second try"), "%v", log.lines)
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	for _, m := range session.Context {
+		assert.NotContains(t, m.Content, "to=functions", "the written-out call is neither spoken nor recorded")
 	}
 }
 

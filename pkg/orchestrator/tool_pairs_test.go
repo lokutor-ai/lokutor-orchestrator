@@ -58,6 +58,8 @@ type recordingStreamingLLM struct {
 		calls []ToolCallEventData
 	}
 	requests [][]Message
+	// efforts is the reasoning effort each request's context asked for (WithReasoningEffort), "" for none.
+	efforts []string
 }
 
 func (m *recordingStreamingLLM) next(messages []Message) (string, []ToolCallEventData) {
@@ -77,6 +79,9 @@ func (m *recordingStreamingLLM) Complete(ctx context.Context, messages []Message
 }
 
 func (m *recordingStreamingLLM) StreamComplete(ctx context.Context, messages []Message, tools []Tool, onChunk func(string) error, onToolCall func(ToolCallEventData) error) (string, error) {
+	m.mu.Lock()
+	m.efforts = append(m.efforts, ReasoningEffortFrom(ctx))
+	m.mu.Unlock()
 	text, calls := m.next(messages)
 	if text != "" {
 		if err := onChunk(text); err != nil {
