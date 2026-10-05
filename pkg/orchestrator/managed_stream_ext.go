@@ -661,41 +661,49 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			// of the call failed too and the caller heard nothing for the rest of it — and never asked
 			// again, so a chained call was answered "Got it." (Full-Duplex-Bench v3, 2026-09-29).
 			tools := ms.session.GetTools()
-			responseText := ""
 			sProv, streaming := ms.orch.llm.(StreamingLLMProvider)
-			for round := 1; ; round++ {
-				if !streaming || len(tools) == 0 {
-					responseText, err = ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), tools)
-					break
-				}
-				var calls []toolExchange
-				responseText, err = sProv.StreamComplete(rCtx, ms.session.GetContextCopy(), tools,
-					func(chunk string) error { return nil }, // text handled below
-					func(tc ToolCallEventData) error {
-						// The same dispatchToolCall as round one: a server handler (15 s timeout) or
-						// the client's answer (10 s). Past the per-tool cap the model is told so,
-						// rather than the turn failing: an error here would leave the caller silent.
-						ms.emit(ToolCall, tc)
-						res := `{"error": "this tool has already been called three times for this request; answer the caller with what you have"}`
-						if ms.session.RecordToolCall(tc.Name) {
-							res = ms.dispatchToolCall(rCtx, tc)
-						}
-						calls = append(calls, toolExchange{TC: tc, Result: res})
-						ms.emit(ToolResult, map[string]interface{}{
-							"tool_call": tc,
-							"result":    res,
+			// chain asks the model, makes the calls it asks for and asks again, until it answers in
+			// words or maxChainedToolRounds runs out. It is run a second time when the first reply
+			// is a tool call written out as text (below), so the second try can make the call too:
+			// it used to be Complete, which reads the reply's text and drops any tool call, so a
+			// retry that did what was asked came back empty and the turn was abandoned, 4 times in 5
+			// on 2026-10-05.
+			chain := func(ctx context.Context) (responseText string, made int, err error) {
+				for round := 1; ; round++ {
+					if !streaming || len(tools) == 0 {
+						responseText, err = ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), tools)
+						return responseText, made, err
+					}
+					var calls []toolExchange
+					responseText, err = sProv.StreamComplete(ctx, ms.session.GetContextCopy(), tools,
+						func(chunk string) error { return nil }, // text handled below
+						func(tc ToolCallEventData) error {
+							// The same dispatchToolCall as round one: a server handler (15 s timeout) or
+							// the client's answer (10 s). Past the per-tool cap the model is told so,
+							// rather than the turn failing: an error here would leave the caller silent.
+							ms.emit(ToolCall, tc)
+							res := `{"error": "this tool has already been called three times for this request; answer the caller with what you have"}`
+							if ms.session.RecordToolCall(tc.Name) {
+								res = ms.dispatchToolCall(ctx, tc)
+							}
+							calls = append(calls, toolExchange{TC: tc, Result: res})
+							ms.emit(ToolResult, map[string]interface{}{
+								"tool_call": tc,
+								"result":    res,
+							})
+							return nil
 						})
-						return nil
-					})
-				ms.recordToolExchange("", calls)
-				if err != nil {
-					responseText = ""
-					break
-				}
-				if len(calls) == 0 || round >= maxChainedToolRounds {
-					break
+					ms.recordToolExchange("", calls)
+					made += len(calls)
+					if err != nil {
+						return "", made, err
+					}
+					if len(calls) == 0 || round >= maxChainedToolRounds {
+						return responseText, made, nil
+					}
 				}
 			}
+			responseText, _, err := chain(rCtx)
 			if err != nil {
 				if rCtx.Err() == nil {
 					ms.emit(ErrorEvent, fmt.Sprintf("LLM error after tool calls: %v", err))
@@ -724,11 +732,15 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			if reason := unspeakableReply(text, tools); reason != "" {
 				ms.logger.Warn("Not speaking after tool calls: the model wrote a tool call or its reasoning as the reply",
 					"reason", reason, "gen", gen, "text", text)
-				retry, rerr := ms.orch.GetLLMProvider().Complete(rCtx, ms.session.GetContextCopy(), tools)
+				// At "medium": asked again as it was, the same model writes the call out again 7 times in 9
+				// (low), and at medium 1 in 9 (a replay of a computer-control agent's calls against Cerebras,
+				// 2026-10-05, finance/measurements/tool_call_written_out_2026-10-05.json). It costs about twice
+				// the time to the first token, on a path that is already a second try.
+				retry, made, rerr := chain(WithReasoningEffort(rCtx, "medium"))
 				retry, _ = OneTurn(rCtx, retry)
-				if rerr != nil || unspeakableReply(retry, tools) != "" || strings.TrimSpace(retry) == "" {
+				if rerr != nil || unspeakableReply(retry, tools) != "" || (strings.TrimSpace(retry) == "" && made == 0) {
 					ms.logger.Warn("Turn abandoned after tool calls: the model's reply was not speech twice in a row",
-						"reason", reason, "gen", gen, "retry", retry, "error", rerr)
+						"reason", reason, "gen", gen, "retry", retry, "calls_made", made, "error", rerr)
 					ms.logRunOns(gen, turnTokens)
 					ms.mu.Lock()
 					if ms.state != StateInterrupted {
@@ -737,6 +749,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					ms.mu.Unlock()
 					return
 				}
+				ms.logger.Info("Reply after tool calls recovered on the second try", "gen", gen, "calls_made", made)
 				text = strings.TrimSpace(retry)
 			}
 			ms.logRunOns(gen, turnTokens)

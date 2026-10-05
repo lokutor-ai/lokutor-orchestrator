@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	orchestrator "github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
 
 // sharedLLMClient is a process-wide HTTP client reused by all LLM providers.
@@ -78,6 +80,20 @@ func defaultReasoningEffort(model string) string {
 		return "low"
 	}
 	return ""
+}
+
+// effortFor is the effort to send: the configured one, or the one a caller asked for on ctx
+// (orchestrator.WithReasoningEffort). A provider with none configured (a model that does not take
+// the parameter, or GROQ_REASONING_EFFORT=off) stays without one: asking for "medium" must never
+// become a 400.
+func effortFor(ctx context.Context, configured string) string {
+	if configured == "" {
+		return ""
+	}
+	if e := orchestrator.ReasoningEffortFrom(ctx); e != "" {
+		return e
+	}
+	return configured
 }
 
 // setReasoningEffort adds the parameter only when one is configured. An

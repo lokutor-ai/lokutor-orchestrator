@@ -43,8 +43,8 @@ func NewCerebrasLLM(apiKey string, model string) *CerebrasLLM {
 	}
 }
 
-func (l *CerebrasLLM) applyReasoningEffort(payload map[string]interface{}) {
-	setReasoningEffort(payload, l.reasoningEffort)
+func (l *CerebrasLLM) applyReasoningEffort(ctx context.Context, payload map[string]interface{}) {
+	setReasoningEffort(payload, effortFor(ctx, l.reasoningEffort))
 }
 
 func (l *CerebrasLLM) Name() string { return "cerebras-llm" }
@@ -54,7 +54,7 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 		"model":    l.model,
 		"messages": forGptOss(l.model, messages, l.toolHistory),
 	}
-	l.applyReasoningEffort(payload)
+	l.applyReasoningEffort(ctx, payload)
 	if len(tools) > 0 {
 		payload["tools"] = tools
 		payload["tool_choice"] = "auto"
@@ -110,7 +110,7 @@ func (l *CerebrasLLM) StreamComplete(ctx context.Context, messages []orchestrato
 	}
 	// Streaming omits token counts unless asked; see requestStreamUsage in usage.go.
 	requestStreamUsage(payload)
-	l.applyReasoningEffort(payload)
+	l.applyReasoningEffort(ctx, payload)
 	if len(tools) > 0 {
 		payload["tools"] = tools
 		payload["tool_choice"] = "auto"

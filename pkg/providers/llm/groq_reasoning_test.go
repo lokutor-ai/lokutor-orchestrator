@@ -1,6 +1,11 @@
 package llm
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	orchestrator "github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
+)
 
 // reasoning_effort is not a universally accepted parameter: Groq returns 400
 // for models outside the gpt-oss family. Getting the gating wrong therefore
@@ -52,15 +57,50 @@ func TestReasoningEffortEnvOverride(t *testing.T) {
 func TestApplyReasoningEffortOmitsWhenUnset(t *testing.T) {
 	l := &GroqLLM{reasoningEffort: ""}
 	p := map[string]interface{}{"model": "x"}
-	l.applyReasoningEffort(p)
+	l.applyReasoningEffort(context.Background(), p)
 	if _, ok := p["reasoning_effort"]; ok {
 		t.Error("reasoning_effort present in payload when unset")
 	}
 
 	l = &GroqLLM{reasoningEffort: "low"}
 	p = map[string]interface{}{"model": "x"}
-	l.applyReasoningEffort(p)
+	l.applyReasoningEffort(context.Background(), p)
 	if p["reasoning_effort"] != "low" {
 		t.Errorf("reasoning_effort = %v, want low", p["reasoning_effort"])
+	}
+}
+
+// Asking again after a tool call written out as text is done at "medium" (orchestrator.WithReasoningEffort):
+// the first try stays at "low" for the first spoken word. The request's effort replaces the configured
+// one only where one is configured: a provider that sends none must still send none, which is what
+// keeps a retry from becoming a 400 on a model that does not take the parameter.
+func TestReasoningEffortOverrideOnTheRequest(t *testing.T) {
+	asked := orchestrator.WithReasoningEffort(context.Background(), "medium")
+
+	for name, apply := range map[string]func(context.Context, map[string]interface{}){
+		"groq":     (&GroqLLM{reasoningEffort: "low"}).applyReasoningEffort,
+		"cerebras": (&CerebrasLLM{reasoningEffort: "low"}).applyReasoningEffort,
+	} {
+		p := map[string]interface{}{}
+		apply(context.Background(), p)
+		if p["reasoning_effort"] != "low" {
+			t.Errorf("%s: without an override %v, want low", name, p["reasoning_effort"])
+		}
+		p = map[string]interface{}{}
+		apply(asked, p)
+		if p["reasoning_effort"] != "medium" {
+			t.Errorf("%s: with the override %v, want medium", name, p["reasoning_effort"])
+		}
+	}
+
+	for name, apply := range map[string]func(context.Context, map[string]interface{}){
+		"groq":     (&GroqLLM{}).applyReasoningEffort,
+		"cerebras": (&CerebrasLLM{}).applyReasoningEffort,
+	} {
+		p := map[string]interface{}{}
+		apply(asked, p)
+		if _, ok := p["reasoning_effort"]; ok {
+			t.Errorf("%s: sent an effort to a provider configured with none: %v", name, p)
+		}
 	}
 }
