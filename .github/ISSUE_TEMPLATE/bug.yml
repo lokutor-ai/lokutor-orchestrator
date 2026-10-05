@@ -1,0 +1,39 @@
+name: Bug
+description: Something does not do what it should.
+labels: ["type:bug", "status:triage"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: The wrong behaviour, as observed. Who or what is affected (customers, calls, money)?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should happen
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps, inputs, account/agent/call ids, the environment (production, local).
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Logs (from the Running pod), screenshots, recordings, commit or deploy where it started. No secrets or customer personal data.
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - Production down / money leaking / data at risk (p0)
+        - Customers affected, workaround exists
+        - Internal or cosmetic
+    validations:
+      required: true
