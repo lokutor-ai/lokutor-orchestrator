@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How we work (labels, agent contract, commits, PRs)
+    url: https://github.com/lokutor-ai/lokutor-orchestrator/blob/main/AGENTS.md
+    about: Read before opening or taking an issue.
