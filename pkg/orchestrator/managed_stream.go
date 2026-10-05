@@ -445,6 +445,9 @@ type ManagedStream struct {
 	clientToolResults   map[string]chan string
 	clientToolResultsMu sync.Mutex
 
+	// fillers rotates the line spoken while a tool runs (tool_filler.go).
+	fillers fillerRotation
+
 	mu sync.Mutex
 }
 

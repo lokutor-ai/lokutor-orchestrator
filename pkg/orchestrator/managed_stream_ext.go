@@ -143,6 +143,8 @@ func (ms *ManagedStream) dispatchToolCall(ctx context.Context, tcData ToolCallEv
 		ms.logger.Info("Tool call", "tool", tcData.Name, "ms", time.Since(start).Milliseconds(), "gen", gen)
 	case msg == "cancelled" && ms.ctx.Err() != nil:
 		ms.logger.Info("Tool call cancelled: the call ended", "tool", tcData.Name, "ms", time.Since(start).Milliseconds())
+	case msg == "cancelled":
+		ms.logger.Info("Tool call cancelled: the turn was superseded", "tool", tcData.Name, "ms", time.Since(start).Milliseconds(), "gen", gen)
 	default:
 		ms.logger.Warn("Tool call failed", "tool", tcData.Name, "ms", time.Since(start).Milliseconds(), "gen", gen,
 			"error", clipForLog(msg))
@@ -213,6 +215,13 @@ func (ms *ManagedStream) runToolCall(ctx context.Context, tcData ToolCallEventDa
 	case res := <-ch:
 		return res
 	case <-resultCtx.Done():
+		if ctx.Err() != nil {
+			// resultCtx is a child of the turn's context: it also ends when the caller speaks over
+			// the agent and the turn is superseded, after a few hundred milliseconds. That is a
+			// cancellation, not a client that never answered; it was reported as a 10-second
+			// timeout and counted by the tool-calls-failing alarm (five barge-ins in an hour).
+			return `{"error": "cancelled"}`
+		}
 		return `{"error": "client tool request timed out after 10 seconds"}`
 	case <-ms.ctx.Done():
 		return `{"error": "cancelled"}`
@@ -245,8 +254,7 @@ var errUnspeakableReply = errors.New("reply is not speech")
 const maxChainedToolRounds = 4
 
 func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen int, userTranscript string, calls []ToolCallEventData) {
-	fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
-	if fillerPhrase != "" {
+	if fillerPhrase := ms.toolFiller(); fillerPhrase != "" {
 		go func(t string) {
 			sCtx, sCancel := context.WithCancel(ctx)
 			defer sCancel()
@@ -494,6 +502,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					return fmt.Errorf("tool loop detected: %s", tc.Name)
 				}
 
+				firstCall := !hasToolCalls
 				hasToolCalls = true
 				ms.emit(ToolCall, tc)
 
@@ -505,11 +514,12 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 						ms.speakText(sCtx, t, gen)
 					}(filler)
 					fullText.Reset()
-				} else {
-					// No pending text — speak a deterministic filler so there's no dead air
-					// while the tool executes (Vapi/Pipecat pattern: platform speaks the
-					// acknowledgment, not the LLM).
-					fillerPhrase := toolFillerForLang(ms.session.GetCurrentLanguage())
+				} else if firstCall {
+					// No pending text — speak a filler so there's no dead air while the tool
+					// executes (Vapi/Pipecat pattern: platform speaks the acknowledgment, not
+					// the LLM). Once per round: parallel calls in one round used to each speak
+					// one, back to back.
+					fillerPhrase := ms.toolFiller()
 					if fillerPhrase != "" {
 						go func(t string) {
 							sCtx, sCancel := context.WithCancel(ctx)
@@ -784,10 +794,9 @@ func (ms *ManagedStream) SetClientVAD(enabled bool) {
 	ms.logger.Info("Client VAD mode", "enabled", enabled)
 }
 
-// toolFillerForLang returns a short, deterministic verbal acknowledgment to speak
-// while a tool is executing. This avoids dead air without an LLM round-trip.
 // thinkingFillerForLang is what the agent says when the model has produced nothing after three
-// seconds, so the caller does not sit in silence.
+// seconds, so the caller does not sit in silence. (The line spoken while a tool runs is
+// ms.toolFiller, tool_filler.go.)
 func thinkingFillerForLang(lang Language) string {
 	switch lang {
 	case LanguageEs:
@@ -808,23 +817,6 @@ func thinkingFillerForLang(lang Language) string {
 		return "Hmm, deixa-me pensar um momento."
 	default:
 		return "Hmm, let me think about that for a second."
-	}
-}
-
-func toolFillerForLang(lang Language) string {
-	switch lang {
-	case LanguageEs:
-		return "Un momento, déjame buscarlo."
-	case LanguageFr:
-		return "Un instant, je vérifie ça."
-	case LanguageDe:
-		return "Einen Moment, ich schaue das nach."
-	case LanguageIt:
-		return "Un momento, lo controllo."
-	case LanguagePt:
-		return "Um momento, deixa eu verificar."
-	default:
-		return "Let me look that up for you."
 	}
 }
 
