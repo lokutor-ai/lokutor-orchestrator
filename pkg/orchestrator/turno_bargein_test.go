@@ -3,15 +3,21 @@ package orchestrator
 import (
 	"context"
 	"math"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/turno"
 )
 
-// turnoTestModelPath must match where the integration copied
-// turn-taking/checkpoints_v3_aec/gateturn.onnx for production use.
-const turnoTestModelPath = "../../assets/onnx/turno/model.onnx"
+// turnoTestModelPath is where the Turno weights are for these tests. They are private and NOT in this
+// repository: set TURNO_TEST_MODEL to a copy (the lokutor_tts deploy gate does). Without one the tests skip.
+var turnoTestModelPath = func() string {
+	if p := os.Getenv("TURNO_TEST_MODEL"); p != "" {
+		return p
+	}
+	return "../../assets/onnx/turno/model.onnx"
+}()
 
 // requireTurnoModel skips (not fails) unless a Turno runtime can
 // actually be constructed here — covers both the model file being absent
@@ -70,7 +76,7 @@ func TestTurnoBargein_AssistTracksPeakScore(t *testing.T) {
 	defer stream.Close()
 
 	if stream.turno == nil {
-		t.Fatal("Turno runtime did not load — check assets/onnx/turno/model.onnx")
+		t.Fatal("Turno runtime did not load — check TURNO_TEST_MODEL")
 	}
 
 	// Simulate the bot mid-speech with a tentative barge-in already open,

@@ -18,3 +18,9 @@ coverage.out
 coverage.html
 .env
 .env.local
+
+# Model weights are private (Turno, and anything like it) and never belong in this public repository: the
+# host provides them at run time. Tests that need Turno read TURNO_TEST_MODEL.
+assets/
+*.onnx
+*.onnx.data
