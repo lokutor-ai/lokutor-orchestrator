@@ -2,10 +2,18 @@ package turno
 
 import (
 	"math"
+	"os"
 	"testing"
 )
 
-const testModelPath = "../../assets/onnx/turno/model.onnx"
+// testModelPath is where the Turno weights are for these tests. They are private and NOT in this repository:
+// set TURNO_TEST_MODEL to a copy (the lokutor_tts deploy gate does). Without one the tests skip.
+var testModelPath = func() string {
+	if p := os.Getenv("TURNO_TEST_MODEL"); p != "" {
+		return p
+	}
+	return "../../assets/onnx/turno/model.onnx"
+}()
 
 // newTestRuntime skips (not fails) when the ONNX runtime shared library
 // itself isn't installed in this environment — that's a CI/host gap (no
