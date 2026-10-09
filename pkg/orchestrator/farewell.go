@@ -1,27 +1,29 @@
 package orchestrator
 
-import (
-	"encoding/json"
-	"time"
-)
+import "time"
 
-// Farewell ends the call from the agent's side, gracefully: once the agent has finished what it is
-// saying, the model is told why the call must end (note), says a short goodbye in the conversation's
-// language, and is offered only end_call, so the host's normal end_call handling hangs up after the
-// goodbye has played. The host uses it when the account behind the call can no longer pay for it.
+// Farewell ends the call from the agent's side, gracefully: once the agent is between turns, the model is
+// told why the call must end (note) and says a short goodbye in the conversation's language. It is offered
+// no tools, so the goodbye cannot turn into an action, or into a tool call written out as text and
+// dropped (which is what happened when it was offered end_call on a session that had none). The host
+// hangs up itself: the returned channel closes when the goodbye has been generated and handed to the
+// voice, and the host waits for it to be heard before ending the call. The host uses it when the account
+// behind the call can no longer pay for it.
 //
-// It waits up to wait for the stream to be between turns (not thinking, not speaking) so it never cuts
-// the agent off; past that it goes ahead anyway. It returns false if the stream is already closed. The
-// host must still hang up on its own after a grace period: a model that does not call end_call, or an
-// agent with no end_call tool, would otherwise keep the line open.
-func (ms *ManagedStream) Farewell(note string, wait time.Duration) bool {
+// It waits up to wait for the stream to be between turns (not thinking, not speaking) so it never cuts the
+// agent off; past that it goes ahead anyway. It returns nil if the stream is already closed. The host must
+// still hang up after a grace period whatever happens: a goodbye that never comes must not keep the line
+// open.
+func (ms *ManagedStream) Farewell(note string, wait time.Duration) <-chan struct{} {
 	if ms == nil || ms.ctx.Err() != nil {
-		return false
+		return nil
 	}
 	ms.mu.Lock()
 	ms.farewellNote = note
 	ms.mu.Unlock()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		deadline := time.Now().Add(wait)
 		for time.Now().Before(deadline) {
 			if ms.ctx.Err() != nil {
@@ -41,23 +43,5 @@ func (ms *ManagedStream) Farewell(note string, wait time.Duration) bool {
 		ms.logger.Info("Host is ending the call: agent saying goodbye", "note", note)
 		ms.runLLMAndTTS(ms.ctx, farewellTrigger)
 	}()
-	return true
-}
-
-// toolFunctionName is a tool's function name, whatever shape its Function field was built with (a
-// map from JSON, or a struct with a Name field).
-func toolFunctionName(t Tool) string {
-	if m, ok := t.Function.(map[string]interface{}); ok {
-		name, _ := m["name"].(string)
-		return name
-	}
-	raw, err := json.Marshal(t.Function)
-	if err != nil {
-		return ""
-	}
-	var f struct {
-		Name string `json:"name"`
-	}
-	_ = json.Unmarshal(raw, &f)
-	return f.Name
+	return done
 }
