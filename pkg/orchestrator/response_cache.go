@@ -84,6 +84,9 @@ func CacheKeyFor(text, lastUserText string) string {
 	if text == silenceTimeoutTrigger {
 		return "silence_timeout"
 	}
+	if text == farewellTrigger {
+		return "farewell"
+	}
 	if len(text) > 64 {
 		text = text[:64]
 	}

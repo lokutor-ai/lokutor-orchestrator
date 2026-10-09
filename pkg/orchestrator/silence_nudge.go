@@ -10,6 +10,9 @@ import (
 // conversation history: it names why the bot is about to speak unprompted.
 const silenceTimeoutTrigger = "[USER_SILENCE_TIMEOUT]"
 
+// farewellTrigger is the pseudo-transcript Farewell hands runLLMAndTTS: the host is ending the call.
+const farewellTrigger = "[HOST_ENDS_CALL]"
+
 // responseTriggerFor names what started a response, from the transcript runLLMAndTTS was given:
 // "" for a caller's turn, otherwise the reason the bot spoke unprompted. The opening line is the
 // only caller of runLLMAndTTS with an empty transcript — processUtterance never gets that far with
@@ -20,6 +23,8 @@ func responseTriggerFor(transcript string) string {
 		return "opening"
 	case silenceTimeoutTrigger:
 		return "silence_timeout"
+	case farewellTrigger:
+		return "farewell"
 	}
 	return ""
 }
@@ -84,6 +89,12 @@ func callerAwaitingReply(msgs []Message) bool {
 // unanswered twice.
 func (ms *ManagedStream) llmMessages(transcript string) []Message {
 	msgs := ms.session.GetContextCopy()
+	if transcript == farewellTrigger {
+		ms.mu.Lock()
+		note := ms.farewellNote
+		ms.mu.Unlock()
+		return append(msgs, Message{Role: "user", Content: note})
+	}
 	if transcript == silenceTimeoutTrigger && !callerAwaitingReply(msgs) {
 		timeout := 10 * time.Second
 		if ms.orch != nil && ms.orch.config.SilenceTimeout > 0 {
@@ -145,6 +156,14 @@ func (ms *ManagedStream) logBotInitiatedLatency(trigger string) {
 // that, whatever it writes, nothing is done on the caller's behalf while they are silent.
 func (ms *ManagedStream) toolsOffered(transcript string) []Tool {
 	if transcript == silenceTimeoutTrigger {
+		return nil
+	}
+	if transcript == farewellTrigger { // say goodbye and hang up: nothing else may be done now
+		for _, t := range ms.session.GetTools() {
+			if toolFunctionName(t) == "end_call" {
+				return []Tool{t}
+			}
+		}
 		return nil
 	}
 	return ms.session.GetTools()
