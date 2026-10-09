@@ -266,6 +266,8 @@ type ManagedStream struct {
 	// scheduling (GC pause, CPU throttling) rather than anything this package's own logic is doing
 	// — a different class of problem with a different fix.
 	ckEnterSpecMs int64
+	// farewellNote is what Farewell told the model (the reason the call is ending).
+	farewellNote string
 	// responseTrigger is what started the response now being generated: "" for a caller's turn,
 	// or the bot-initiated reason ("opening", "silence_timeout"). A bot-initiated response has no
 	// caller turn behind it, so every caller-anchored clock above still holds the LAST caller turn's
