@@ -158,12 +158,7 @@ func (ms *ManagedStream) toolsOffered(transcript string) []Tool {
 	if transcript == silenceTimeoutTrigger {
 		return nil
 	}
-	if transcript == farewellTrigger { // say goodbye and hang up: nothing else may be done now
-		for _, t := range ms.session.GetTools() {
-			if toolFunctionName(t) == "end_call" {
-				return []Tool{t}
-			}
-		}
+	if transcript == farewellTrigger { // a goodbye, and nothing else: the host hangs up itself
 		return nil
 	}
 	return ms.session.GetTools()
