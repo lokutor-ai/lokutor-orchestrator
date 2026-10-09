@@ -208,7 +208,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 	se.runTranscript = ""
 	tokens := &TokenUsage{}
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
-	sCtx = WithTokenUsage(sCtx, tokens)
+	sCtx = WithTokenUsage(WithTokenCategory(sCtx, TokensSpeculative), tokens)
 	se.cancel = sCancel
 	done := make(chan struct{})
 	se.done = done
@@ -347,7 +347,7 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 	se.runTranscript = transcript
 	tokens := &TokenUsage{}
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
-	sCtx = WithTokenUsage(sCtx, tokens)
+	sCtx = WithTokenUsage(WithTokenCategory(sCtx, TokensSpeculative), tokens)
 	se.cancel = sCancel
 	done := make(chan struct{})
 	se.done = done

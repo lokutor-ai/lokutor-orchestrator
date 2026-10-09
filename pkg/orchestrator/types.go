@@ -632,8 +632,10 @@ type ConversationSession struct {
 	// foldedMessages counts conversation folded into the call summary (context_folded_msgs).
 	foldedMessages int
 	// summarizer writes the call summary; without one nothing folds and nothing is dropped.
-	summarizer      HistorySummarizer
-	foldLogger      Logger
+	summarizer HistorySummarizer
+	foldLogger Logger
+	// tokenMeter bills the folds' model calls to the conversation (they run on a context of their own).
+	tokenMeter      *SessionMeter
 	folding         bool
 	nextFoldAttempt time.Time
 	// unpairedLogged is how many unpaired tool messages GetContextCopy last reported, so an orphan

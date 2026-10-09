@@ -178,13 +178,14 @@ func (s *ConversationSession) maybeStartFoldLocked() func() {
 	}
 	turns := append([]Message(nil), conv[:k]...)
 	prior := s.summaryLocked()
-	summarize, logger := s.summarizer, s.foldLogger
+	summarize, logger, meter := s.summarizer, s.foldLogger, s.tokenMeter
 	s.folding = true
-	return func() { s.runFold(summarize, logger, prior, turns) }
+	return func() { s.runFold(summarize, logger, meter, prior, turns) }
 }
 
-func (s *ConversationSession) runFold(summarize HistorySummarizer, logger Logger, prior string, turns []Message) {
-	ctx, cancel := context.WithTimeout(context.Background(), foldTimeout)
+func (s *ConversationSession) runFold(summarize HistorySummarizer, logger Logger, meter *SessionMeter, prior string, turns []Message) {
+	// Its own context, so a fold outlives the turn that started it; the conversation still pays for it.
+	ctx, cancel := context.WithTimeout(WithTokenCategory(WithSessionMeter(context.Background(), meter), TokensSummary), foldTimeout)
 	started := time.Now()
 	summary, err := summarize(ctx, prior, turns)
 	cancel()

@@ -36,12 +36,14 @@ func recordUsage(ctx context.Context, u usagePayload) {
 		return
 	}
 	orchestrator.TokenUsageFrom(ctx).Record(u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	// And into the conversation's bill (orchestrator.SessionMeter), under the category the call site set.
+	orchestrator.SessionMeterFrom(ctx).Add(orchestrator.TokenCategoryFrom(ctx), u.PromptTokens, u.CompletionTokens)
 }
 
 // recordUsageFromChunk pulls `usage` out of one streaming chunk. Call it for EVERY chunk, before
 // any choices-based early return.
 func recordUsageFromChunk(ctx context.Context, data []byte) {
-	if orchestrator.TokenUsageFrom(ctx) == nil {
+	if orchestrator.TokenUsageFrom(ctx) == nil && orchestrator.SessionMeterFrom(ctx) == nil {
 		return
 	}
 	var envelope struct {

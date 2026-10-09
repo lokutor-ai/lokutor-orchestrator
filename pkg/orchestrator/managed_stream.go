@@ -452,6 +452,13 @@ type ManagedStream struct {
 }
 
 func NewManagedStream(ctx context.Context, o *Orchestrator, session *ConversationSession) *ManagedStream {
+	// The conversation's token meter (session_meter.go): the host's, when it installed one on ctx to
+	// read the bill from, or a new one.
+	meter := SessionMeterFrom(ctx)
+	if meter == nil {
+		meter = NewSessionMeter()
+		ctx = WithSessionMeter(ctx, meter)
+	}
 	mCtx, mCancel := context.WithCancel(ctx)
 
 	cfg := DefaultConfig()
@@ -476,6 +483,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		if session.summarizer == nil {
 			session.summarizer, session.foldLogger = o.summarizeHistory, o.logger
 		}
+		session.tokenMeter = meter
 		session.mu.Unlock()
 	}
 	ms := &ManagedStream{
