@@ -1,91 +1,112 @@
 # Lokutor Orchestrator
 
-**High-performance voice orchestration engine for building AI-driven voice agents.**
+**The open-source Go engine behind Lokutor's voice agents: turn-taking, barge-in, tool calls and streaming between the speech-to-text, language model and text-to-speech you choose.**
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/lokutor-ai/lokutor-orchestrator.svg)](https://pkg.go.dev/github.com/lokutor-ai/lokutor-orchestrator)
 [![Go Report Card](https://goreportcard.com/badge/github.com/lokutor-ai/lokutor-orchestrator)](https://goreportcard.com/report/github.com/lokutor-ai/lokutor-orchestrator)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Lokutor Orchestrator is a production-grade Go library for building voice-powered applications. It handles the complex lifecycle of voice interactions—bridging Speech-to-Text (STT), Large Language Models (LLM), and Text-to-Speech (TTS) into a seamless, low-latency experience.
+This is the orchestration layer that runs Lokutor's production voice agents, published as a Go library. It ties speech recognition, a language model and a voice into one low-latency conversation, and handles the parts that are hard to get right: knowing when the caller has finished, letting them interrupt, calling tools mid-sentence and keeping the audio clean.
+
+It works with any provider that implements its three small interfaces. Lokutor's own models and cloud are one option, not a requirement.
+
+## Part of Lokutor
+
+[Lokutor](https://lokutor.com) is a Madrid company that designs and trains its own speech models and runs voice agents on them: **Versa** (voice), **Turno** (turn-taking), **Psst** (noise suppression) and **Conv** (recognition). A voice agent costs about 5¢ a minute with the language model included, in the cloud, on your own servers or on a device.
+
+- Try the voice demo, no sign-up: [lokutor.com](https://lokutor.com)
+- The models and how they were measured: [lokutor.com/models](https://lokutor.com/models/) and [lokutor.com/benchmarks](https://lokutor.com/benchmarks/)
+- API, SDKs and the rate card: [docs.lokutor.com](https://docs.lokutor.com)
+- On-premise (the full models on your servers): [lokutor.com/on-premise-voice-ai](https://lokutor.com/on-premise-voice-ai/)
+- For devices: [Oído](https://github.com/lokutor-ai/oido) (speech recognition for a $5 ESP32-S3) and [Ito](https://github.com/lokutor-ai/ito) (a voice for it), both open source
+
+The models and the hosted platform are separate from this repository. This repository is only the orchestrator, and it is MIT licensed.
 
 ---
 
-## Features
+## What it does
 
-- Full-duplex voice orchestration (v1.3): real-time capture and playback with native 44.1kHz 16-bit PCM.
-- Barge-in support: interrupts the agent promptly when the user begins speaking.
-- Predictive audio buffering: prevents clipping of the start of user speech.
-- High-performance echo suppression: correlation filters reduce self-interruption.
-- Pluggable architecture: swap STT, LLM, and TTS implementations with minimal changes.
-- **Tool Calling (v1.4)**: Native support for function calling with automatic TTS suppression and recursive LLM triggers.
-- Instrumentation: stage-by-stage latency tracking (STT, LLM, TTS, end-to-end).
+- **Full-duplex managed streams:** microphone audio in, agent audio out, one event stream for everything in between.
+- **Barge-in:** the agent stops when the caller starts speaking, and can resume after an interruption that was not real.
+- **Layered end-of-turn detection:** voice-activity detection, lexical checks on the transcript and, when you provide it, the Turno turn-taking model. Turno's weights are not distributed in this repository; without them the orchestrator uses its VAD and lexical checks.
+- **Echo guard:** a correlation search over what was played to the speaker keeps the agent from hearing itself.
+- **Tool calling:** native function calling with narration around the call, and a graceful end-of-call (`end_call`) that waits for the goodbye to be spoken.
+- **Speculative replies:** the model starts answering before the caller has fully finished, and the reply is kept or dropped depending on what the caller says next (on by default, `Config.SpeculativeLLM`).
+- **Provider chains with hedging:** `NewChainLLM` falls through a list of language-model providers on an error or a slow first token.
+- **Context budget:** long conversations fold into a pinned summary instead of losing their beginning.
+- **Instrumentation:** per-turn latency by stage, and a session meter that counts every token a conversation used, by category, for per-token billing.
+
+## Providers
+
+| | Included |
+|---|---|
+| Language model | OpenAI, Anthropic, Google, Groq, Cerebras, OpenRouter, and chains of them |
+| Speech to text | Deepgram, Groq (Whisper), OpenAI (Whisper), AssemblyAI |
+| Text to speech | Lokutor (Versa), streaming, with a connection pool |
+
+Anything else is one interface away (`STTProvider`, `LLMProvider`, `TTSProvider` in `pkg/orchestrator`).
 
 ---
 
-## Quick Start
-
-### 1. Installation
+## Quick start
 
 ```bash
 go get github.com/lokutor-ai/lokutor-orchestrator
 ```
 
-### 2. Run the Example Agent (CLI Demo)
-
-1.  **Configure environment:** Create a `.env` file in the root:
-    ```env
-    STT_PROVIDER=groq|openai|deepgram|assemblyai
-    LLM_PROVIDER=groq|openai|anthropic|google
-    
-    GROQ_API_KEY=your_key
-    OPENAI_API_KEY=your_key
-    LOKUTOR_API_KEY=your_key
-    AGENT_LANGUAGE=es # en, fr, de, etc.
-    ```
-
-2.  **Run the agent:**
-    ```bash
-    go run cmd/agent/main.go
-    ```
-
-### 3. Basic Library Usage (`ManagedStream`)
-
 ```go
+package main
+
+import (
+	"context"
+	"os"
+	"time"
+
+	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
+	llmProvider "github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/llm"
+	sttProvider "github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/stt"
+	ttsProvider "github.com/lokutor-ai/lokutor-orchestrator/pkg/providers/tts"
+)
+
 func main() {
-    // Initialize High-Performance Providers
-    stt := sttProvider.NewDeepgramSTT(apiKey)
-    llm := llmProvider.NewGroqLLM(apiKey, "meta-llama/llama-4-scout-17b-16e-instruct")
-    tts := ttsProvider.NewLokutorTTS(apiKey)
-    
-    // Configure VAD & Orchestrator
-    vad := orchestrator.NewRMSVAD(0.02, 150*time.Millisecond)
-    orch := orchestrator.NewWithVAD(stt, llm, tts, vad, orchestrator.DefaultConfig())
-    
-    // Start a duplex managed stream
-    session := orch.NewSessionWithDefaults("session_01")
-    stream := orch.NewManagedStream(context.Background(), session)
-    
-    // Listen for events
-    for event := range stream.Events() {
-        switch event.Type {
-        case orchestrator.UserSpeaking:
-            stopSpeaker() // Fast barge-in
-        case orchestrator.AudioChunk:
-            playChunk(event.Data.([]byte))
-        }
-    }
+	stt := sttProvider.NewDeepgramSTT(os.Getenv("DEEPGRAM_API_KEY"))
+	llm := llmProvider.NewGroqLLM(os.Getenv("GROQ_API_KEY"), "meta-llama/llama-4-scout-17b-16e-instruct")
+	tts := ttsProvider.NewLokutorTTS(os.Getenv("LOKUTOR_API_KEY"))
+
+	config := orchestrator.DefaultConfig()
+	vad := orchestrator.NewImprovedRMSVAD(config.BargeInVADThreshold, 200*time.Millisecond, 44100)
+	orch := orchestrator.NewWithVAD(stt, llm, tts, vad, config)
+
+	session := orch.NewSessionWithDefaults("session_01")
+	stream := orch.NewManagedStream(context.Background(), session)
+	defer stream.Close()
+
+	// Feed 44.1 kHz 16-bit PCM from your microphone with stream.Write(chunk).
+	for event := range stream.Events() {
+		switch event.Type {
+		case orchestrator.UserSpeaking:
+			stopPlayback() // fast barge-in on your side too
+		case orchestrator.AudioChunk:
+			play(event.Data.([]byte))
+		}
+	}
 }
 ```
 
----
+To run the example agent from this repository (microphone and speakers, no code to write), put your keys in a `.env` and start it:
 
-## Provider Ecosystem
+```env
+STT_PROVIDER=deepgram        # groq | openai | deepgram | assemblyai
+LLM_PROVIDER=groq            # groq | openai | anthropic | google
+DEEPGRAM_API_KEY=...
+GROQ_API_KEY=...
+LOKUTOR_API_KEY=...          # free credit at https://app.lokutor.com
+AGENT_LANGUAGE=en
+```
 
-Lokutor supports all major infrastructure providers out of the box:
-
-- **LLM**: Groq (Llama), OpenAI (GPT-4), Anthropic (Claude), Google (Gemini)
-- **STT**: Groq (Whisper), OpenAI (Whisper), Deepgram (Nova-2), AssemblyAI
-- **TTS**: Lokutor (Versa - optimized for minimal Time-To-First-Byte)
+```bash
+go run ./cmd/agent
+```
 
 ---
 
@@ -120,38 +141,28 @@ Lokutor supports all major infrastructure providers out of the box:
                └───────────────────┘
 ```
 
+### Latency breakdown
+
+Every turn is instrumented and available through `stream.GetLatencyBreakdown()`:
+
+- `User-to-STT`: from the caller stopping to the final transcript.
+- `TTFB`: from the caller stopping to the first audio sample.
+- `E2E`: the full turn-around to the speaker.
+
+On Lokutor's production calls the median from the end of the caller's sentence to the first word of the reply is 596 ms (30 calls, measured 10 October 2026; [how it was measured](https://lokutor.com/benchmarks/)). Your number depends on the providers you plug in.
+
+### Echo suppression
+
+The orchestrator tracks every sample sent to the speaker and runs a sliding-window correlation search on the microphone input, so it can tell when the microphone is hearing the agent's own voice instead of the caller.
+
 ---
-
-## Strategies for High-Quality Interactions
-
-Recommendations to improve conversational quality:
-
-1. Use short filler utterances when model latency exceeds a threshold to maintain user engagement.
-2. Include prosody markers in system prompts to enable dynamic TTS adjustments.
-3. Use brief backchannel confirmations during extended user turns to indicate attention.
-4. Acknowledge interruptions gracefully to preserve conversational continuity.
-
----
-
-## Technical Details
-
-### Echo Suppression
-The orchestrator tracks every sample sent to the speaker and uses sliding-window correlation search on mic input. This prevents "self-interruption" by identifying when the mic hears the agent's own voice.
-
-### Latency Breakdown
-Every turn includes detailed instrumentation available via `stream.GetLatencyBreakdown()`:
-*   `User-to-STT`: Time from user stop to final transcript.
-*   `TTFB`: User stop to first audio sample.
-*   `E2E`: Full user-to-speaker turn-around.
 
 ## Documentation
 
-For more detailed guides, check out:
 - [Voice Agent API](docs/VOICE_AGENT_API.md)
 - [Tool Calling Guide](docs/TOOL_CALLING_GUIDE.md)
-
----
+- [Changelog](docs/CHANGELOG.md) · [Contributing](docs/CONTRIBUTING.md) · [Testing](docs/TESTING.md)
 
 ## License
 
-MIT. Built with ❤️ by the Lokutor AI team.
+MIT. Built by the [Lokutor](https://lokutor.com) team in Madrid.
