@@ -24,3 +24,8 @@ coverage.html
 assets/
 *.onnx
 *.onnx.data
+
+# Local builds of cmd/agent (were committed by mistake)
+/agent
+/main
+/lokutor_orchestrator
