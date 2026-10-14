@@ -254,11 +254,7 @@ var errUnspeakableReply = errors.New("reply is not speech")
 const maxChainedToolRounds = 4
 
 func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen int, userTranscript string, calls []ToolCallEventData) {
-	// What the caller heard before the tools ran goes into the context with the calls (recordToolExchange), so the
-	// model knows it has already said it.
-	saidBeforeTools := ""
 	if fillerPhrase := ms.toolFiller(); fillerPhrase != "" {
-		saidBeforeTools = fillerPhrase
 		go func(t string) {
 			sCtx, sCancel := context.WithCancel(ctx)
 			defer sCancel()
@@ -300,8 +296,7 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 		for _, r := range results {
 			ms.emit(ToolResult, map[string]interface{}{"tool_call": r.TC, "result": r.Result})
 		}
-		ms.recordToolExchange(saidBeforeTools, results)
-		saidBeforeTools = ""
+		ms.recordToolExchange("", results)
 
 		final, err := ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), ms.session.GetTools())
 		if err != nil {
@@ -361,11 +356,11 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	var toolResults []toolExchange
 	var toolMu sync.Mutex
-	// What the agent says while its tools run (the model's own words before the call, or the platform's filler). It
-	// is recorded in the context with the calls: it used to be spoken and then dropped, so the context said the agent
-	// had called the tools in silence, and the reply after them opened with the same line again ("Un momento, lo
-	// miro." three times in one turn, 2026-10-15).
-	var saidBeforeTools []string
+	// What the agent says before its tool calls is NOT recorded with them. Recording it as the content of the
+	// assistant message that carries the calls (lokutor-orchestrator 5b351fb, 2026-10-15) brought back gpt-oss's
+	// garbled replies after a tool: scripted clinic calls on Cerebras through this code, 5 of 23 replies after a tool
+	// garbled (runs of ellipses, "Oops", its own reasoning) against 2 of 22 without it
+	// (lokutor_tts pkg/api/gptoss_history_live_test.go, LIVE_SAID=on/off). Reverted the same night.
 
 	ttsQueue := make(chan string, 16)
 	ttsWg := sync.WaitGroup{}
@@ -446,9 +441,18 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	tools := ms.session.GetTools()
 	unspeakable := ""
 	var err error
+	// alreadySaid is what a stopped try had spoken before the sentence that stopped it. The caller has heard it, so
+	// the next try is told (as the agent's words, at the end of its request) and continues from it instead of starting
+	// the reply again: on 2026-10-15 a goodbye written with a tool call after it was spoken, stopped, and asked again
+	// from scratch, so the caller heard the goodbye twice, and on another turn a goodbye and then a new appointment
+	// offer. It is also part of what the reply records (below), since it was said.
+	alreadySaid := ""
+	var spokenThisTry []string
+	tryCtx := ctx
 	for attempt := 1; ; attempt++ {
 		unspeakable = ""
-		_, err = provider.StreamComplete(ctx, messages, ms.toolsOffered(userTranscript),
+		spokenThisTry = nil
+		_, err = provider.StreamComplete(tryCtx, messages, ms.toolsOffered(userTranscript),
 			func(chunk string) error {
 				fullText.WriteString(chunk)
 				pendingSentence.WriteString(chunk)
@@ -496,6 +500,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					}
 					if seg != "" {
 						ttsQueue <- seg
+						spokenThisTry = append(spokenThisTry, seg)
 						firstChunkDone = true
 					}
 					rest := strings.TrimSpace(buf[flushEnd:])
@@ -518,7 +523,6 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 				filler := strings.TrimSpace(fullText.String())
 				if filler != "" {
-					saidBeforeTools = append(saidBeforeTools, filler)
 					go func(t string) {
 						sCtx, sCancel := context.WithCancel(ctx)
 						defer sCancel()
@@ -532,7 +536,6 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					// one, back to back.
 					fillerPhrase := ms.toolFiller()
 					if fillerPhrase != "" {
-						saidBeforeTools = append(saidBeforeTools, fillerPhrase)
 						go func(t string) {
 							sCtx, sCancel := context.WithCancel(ctx)
 							defer sCancel()
@@ -564,9 +567,16 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			"reason", unspeakable, "attempt", attempt, "gen", gen, "text", fullText.String())
 		fullText.Reset()
 		pendingSentence.Reset()
+		if said := strings.TrimSpace(strings.Join(spokenThisTry, " ")); said != "" {
+			alreadySaid = strings.TrimSpace(alreadySaid + " " + said)
+			messages = append(append([]Message(nil), messages...), Message{Role: "assistant", Content: said})
+		}
 		if attempt == 2 {
 			break
 		}
+		// The second try reasons at "medium", as the retry after tool calls does: asked again as it was, the model
+		// writes the call out again 7 times in 9, at medium 1 in 9 (2026-10-05, tool_call_written_out_2026-10-05.json).
+		tryCtx = WithReasoningEffort(ctx, "medium")
 	}
 	if errors.Is(err, errUnspeakableReply) {
 		err = nil
@@ -603,6 +613,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	}
 
 	response := strings.TrimSpace(fullText.String())
+	if alreadySaid != "" && !hasToolCalls {
+		response = strings.TrimSpace(alreadySaid + " " + response)
+	}
 
 	if !hasToolCalls {
 		// If the turn was interrupted before StreamComplete unblocked (e.g. in the gap between two
@@ -618,7 +631,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		for _, tr := range toolResults {
 			ms.emit(ToolResult, tr)
 		}
-		ms.recordToolExchange(strings.TrimSpace(strings.Join(append(saidBeforeTools, response), " ")), toolResults)
+		ms.recordToolExchange(response, toolResults)
 
 		go func() {
 			freshCtx, c := context.WithCancel(ms.ctx)
