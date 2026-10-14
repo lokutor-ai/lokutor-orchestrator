@@ -254,7 +254,11 @@ var errUnspeakableReply = errors.New("reply is not speech")
 const maxChainedToolRounds = 4
 
 func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen int, userTranscript string, calls []ToolCallEventData) {
+	// What the caller heard before the tools ran goes into the context with the calls (recordToolExchange), so the
+	// model knows it has already said it.
+	saidBeforeTools := ""
 	if fillerPhrase := ms.toolFiller(); fillerPhrase != "" {
+		saidBeforeTools = fillerPhrase
 		go func(t string) {
 			sCtx, sCancel := context.WithCancel(ctx)
 			defer sCancel()
@@ -296,7 +300,8 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 		for _, r := range results {
 			ms.emit(ToolResult, map[string]interface{}{"tool_call": r.TC, "result": r.Result})
 		}
-		ms.recordToolExchange("", results)
+		ms.recordToolExchange(saidBeforeTools, results)
+		saidBeforeTools = ""
 
 		final, err := ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), ms.session.GetTools())
 		if err != nil {
@@ -356,6 +361,11 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	var toolResults []toolExchange
 	var toolMu sync.Mutex
+	// What the agent says while its tools run (the model's own words before the call, or the platform's filler). It
+	// is recorded in the context with the calls: it used to be spoken and then dropped, so the context said the agent
+	// had called the tools in silence, and the reply after them opened with the same line again ("Un momento, lo
+	// miro." three times in one turn, 2026-10-15).
+	var saidBeforeTools []string
 
 	ttsQueue := make(chan string, 16)
 	ttsWg := sync.WaitGroup{}
@@ -508,6 +518,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 				filler := strings.TrimSpace(fullText.String())
 				if filler != "" {
+					saidBeforeTools = append(saidBeforeTools, filler)
 					go func(t string) {
 						sCtx, sCancel := context.WithCancel(ctx)
 						defer sCancel()
@@ -521,6 +532,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					// one, back to back.
 					fillerPhrase := ms.toolFiller()
 					if fillerPhrase != "" {
+						saidBeforeTools = append(saidBeforeTools, fillerPhrase)
 						go func(t string) {
 							sCtx, sCancel := context.WithCancel(ctx)
 							defer sCancel()
@@ -606,7 +618,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		for _, tr := range toolResults {
 			ms.emit(ToolResult, tr)
 		}
-		ms.recordToolExchange(response, toolResults)
+		ms.recordToolExchange(strings.TrimSpace(strings.Join(append(saidBeforeTools, response), " ")), toolResults)
 
 		go func() {
 			freshCtx, c := context.WithCancel(ms.ctx)
