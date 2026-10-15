@@ -1,0 +1,22 @@
+name: Infra / ops
+description: Deploy, CI, cluster, tooling or environment work.
+labels: ["type:infra", "status:triage"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What and why
+    validations:
+      required: true
+  - type: textarea
+    id: plan
+    attributes:
+      label: Plan and rollback
+      description: Steps, what changes in production and when, how to undo it.
+    validations:
+      required: true
+  - type: textarea
+    id: cost
+    attributes:
+      label: Cost and capacity impact
+      description: Does any running cost or capacity number change? Which document must be updated with it?
