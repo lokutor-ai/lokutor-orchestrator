@@ -274,7 +274,8 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		// its normal value and nothing says why.
 		before := ms.speculator.State()
 		seed, history, continues := ms.speculationSeed(text, seq)
-		ms.speculator.StartFromTranscript(ms.ctx, ms.orch, seed, history, ms.session.GetTools())
+		history, tail := ms.seedKnowledgeRequest(ms.ctx, seed, history)
+		ms.speculator.StartFromTranscriptWithTail(ms.ctx, ms.orch, seed, history, tail, ms.session.GetTools())
 		ms.logger.Info("Speculative LLM seeded from hangover transcript", "run", ms.speculator.RunID(),
 			"transcript", seed, "continues", continues, "state_before", before, "state_after", ms.speculator.State())
 	}()

@@ -288,7 +288,12 @@ type ManagedStream struct {
 	turnTokens *TokenUsage
 	// specToolRound is a speculative reply that called tools, matched to the confirmed transcript and handed to
 	// runLLMAndTTS to replay as the turn's first round (trySpeculativeResponse, replayedRound).
-	specToolRound     *specToolRound
+	specToolRound *specToolRound
+	// specKnowledge is the knowledge-base retrieval the speculative seed made for its words (seedKnowledge), reused
+	// by injectRagContext when the turn's transcript is the same.
+	specKnowledge *seedKnowledge
+	// knowledgeFromSeed says this turn's passage is the speculative seed's, so a guess made on it may be used.
+	knowledgeFromSeed bool
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -2922,7 +2927,25 @@ func (ms *ManagedStream) injectRagContext(ctx context.Context, transcript string
 	if ms.orch == nil || ms.orch.rag == nil {
 		return
 	}
+	ms.mu.Lock()
+	ms.knowledgeFromSeed = false
+	ms.mu.Unlock()
 	started := time.Now()
+	// The speculative seed retrieved for these words already (seedKnowledge): reuse it, off the critical path.
+	ms.mu.Lock()
+	sk := ms.specKnowledge
+	ms.specKnowledge = nil
+	ms.mu.Unlock()
+	if sk != nil && sameUtterance(sk.seed, transcript) {
+		if sk.content != "" {
+			ms.session.SetKnowledgeContext(knowledgeMessage(sk.content))
+		}
+		ms.mu.Lock()
+		ms.knowledgeFromSeed = true
+		ms.mu.Unlock()
+		ms.logger.Info("RAG context from the speculative seed", "context_len", len(sk.content), "retrieved_ms_before", time.Since(sk.at).Milliseconds())
+		return
+	}
 	contextText, err := ms.orch.rag.Retrieve(ctx, transcript)
 	elapsed := time.Since(started).Milliseconds()
 	if err != nil {
@@ -2938,7 +2961,7 @@ func (ms *ManagedStream) injectRagContext(ctx context.Context, transcript string
 	}
 	// A system message, not a user one: this is reference material the model
 	// may use, not something the caller said.
-	ms.session.SetKnowledgeContext(knowledgeContextPrefix + " Use it if relevant; do not mention that you looked it up.]\n" + contextText)
+	ms.session.SetKnowledgeContext(knowledgeMessage(contextText))
 	ms.logger.Info("RAG context injected",
 		"query_len", len(transcript), "context_len", len(contextText), "elapsed_ms", elapsed)
 }

@@ -102,3 +102,65 @@ func TestTurnReplaysTheSpeculativeToolRound(t *testing.T) {
 		t.Errorf("model asked %d streamed / %d whole times, want 1 / 0 (only the round after the tool)", llm.streams, llm.completes)
 	}
 }
+
+// countingRAG answers every query with one passage, or fails, counting calls.
+type countingRAG struct {
+	mu      sync.Mutex
+	calls   []string
+	content string
+	err     error
+}
+
+func (r *countingRAG) Retrieve(ctx context.Context, query string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, query)
+	return r.content, r.err
+}
+
+// The seed is asked with the passage its turn will have, arranged as injectRagContext arranges it, and the turn
+// reuses that retrieval instead of fetching again; a guess made with any other passage is not used.
+func TestSpeculativeSeedCarriesThisTurnsKnowledge(t *testing.T) {
+	rag := &countingRAG{content: "Abrimos de 9 a 18."}
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, &roundLLM{}, &countingTTS{}, nil, DefaultConfig(), &NoOpLogger{})
+	orch.SetRAGProvider(rag)
+	session := NewConversationSession("rag-seed")
+	ms := orch.NewManagedStream(context.Background(), session)
+	defer ms.Close()
+
+	old := Message{Role: "system", Content: knowledgeMessage("Aparcamiento gratuito.")}
+	history := []Message{{Role: "system", Content: "Eres Sofía."}, {Role: "user", Content: "¿Hay parking?"}, old, {Role: "assistant", Content: "Sí."}}
+	kept, tail := ms.seedKnowledgeRequest(context.Background(), "¿a qué hora abrís?", history)
+	if len(kept) != 3 || kept[2].Content != "Sí." || len(tail) != 1 || tail[0].Content != knowledgeMessage("Abrimos de 9 a 18.") {
+		t.Fatalf("history %+v tail %+v", kept, tail)
+	}
+
+	// The turn on the same words reuses it: no second retrieval, and a guess may be used.
+	ms.injectRagContext(context.Background(), "¿A qué hora abrís?")
+	rag.mu.Lock()
+	n := len(rag.calls)
+	rag.mu.Unlock()
+	if n != 1 || !ms.knowledgeFromSeed {
+		t.Fatalf("retrievals %d, fromSeed %v", n, ms.knowledgeFromSeed)
+	}
+	ctxMsgs := session.GetContextCopy()
+	if last := ctxMsgs[len(ctxMsgs)-1]; last.Content != knowledgeMessage("Abrimos de 9 a 18.") {
+		t.Fatalf("knowledge not set: %+v", last)
+	}
+
+	// Other words: retrieved again, and no guess is used.
+	ms.injectRagContext(context.Background(), "¿y los sábados?")
+	if len(rag.calls) != 2 || ms.knowledgeFromSeed {
+		t.Fatalf("retrievals %d, fromSeed %v", len(rag.calls), ms.knowledgeFromSeed)
+	}
+	if ms.trySpeculativeResponse(context.Background(), "¿y los sábados?") {
+		t.Fatal("a guess made with another passage was used")
+	}
+
+	// Nothing matched: the conversation is left as it is (the turn keeps its earlier passage too).
+	rag.content = ""
+	kept, tail = ms.seedKnowledgeRequest(context.Background(), "gracias", history)
+	if len(kept) != len(history) || tail != nil {
+		t.Fatalf("nothing matched changed the request: %+v %+v", kept, tail)
+	}
+}
