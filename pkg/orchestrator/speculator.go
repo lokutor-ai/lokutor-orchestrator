@@ -24,6 +24,10 @@ const (
 type SpeculativeResult struct {
 	PartialTranscript string
 	Response          string
+	// ToolCalls are the calls the reply made, with Response as the words said before them. Complete returned the
+	// words alone until 2026-10-16: a reply that called a tool came back as "" (a miss, the whole request paid
+	// again) or as its preamble, which was then spoken as the turn's reply and the call never made.
+	ToolCalls []ToolCallEventData
 	// Tokens is the run's own sink: on a hit it becomes the turn's (the turn-latency line reported
 	// the previous turn's tokens on every hit), and either way the run's cost is logged when it
 	// finishes (SpeculativeRun), so speculation's share of the language-model bill is measured.
@@ -33,8 +37,8 @@ type SpeculativeResult struct {
 }
 
 // SpeculativeRun is one finished speculative run, for the cost log: the transcript it guessed on,
-// what it cost and how it ended. Outcome is "responded", "no_response", "failed", "cancelled" or
-// "no_transcript". A run is paid for whether or not its reply is used; "Speculative reply used"
+// what it cost and how it ended. Outcome is "responded", "tool_calls" (a reply that called tools), "no_response",
+// "failed", "cancelled" or "no_transcript". A run is paid for whether or not its reply is used; "Speculative reply used"
 // says which were. ID numbers the executor's runs: the seed line, this run's cost line and
 // "Speculative reply used" carry the same one, so each paid run ties to whether its reply was used.
 type SpeculativeRun struct {
@@ -275,8 +279,10 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 		}
 
 		messages := append(append([]Message{}, historySnapshot...), Message{Role: "user", Content: partial})
-		response, err := orch.llm.Complete(sCtx, messages, tools)
-		if err != nil || sCtx.Err() != nil || strings.TrimSpace(response) == "" {
+		capCtx, capture := WithToolCallCapture(sCtx)
+		response, err := orch.llm.Complete(capCtx, messages, tools)
+		calls := capture.Calls()
+		if err != nil || sCtx.Err() != nil || (strings.TrimSpace(response) == "" && len(calls) == 0) {
 			// STT succeeded but generation didn't — still record the
 			// transcript so Await's caller at least knows speculation ran,
 			// even though there's no response to use.
@@ -288,6 +294,10 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 			return
 		}
 
+		if len(calls) > 0 {
+			finish(&SpeculativeResult{PartialTranscript: partial, Response: response, ToolCalls: calls}, partial, "tool_calls")
+			return
+		}
 		if onResponse != nil {
 			onResponse(response)
 		}
@@ -395,8 +405,10 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 		}
 
 		messages := append(append([]Message{}, historySnapshot...), Message{Role: "user", Content: transcript})
-		response, err := orch.llm.Complete(sCtx, messages, tools)
-		if err != nil || sCtx.Err() != nil || strings.TrimSpace(response) == "" {
+		capCtx, capture := WithToolCallCapture(sCtx)
+		response, err := orch.llm.Complete(capCtx, messages, tools)
+		calls := capture.Calls()
+		if err != nil || sCtx.Err() != nil || (strings.TrimSpace(response) == "" && len(calls) == 0) {
 			// Record the transcript even without a response, so Await's caller
 			// can tell speculation ran rather than never having been attempted.
 			outcome := "no_response"
@@ -404,6 +416,12 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 				outcome = "failed"
 			}
 			finish(&SpeculativeResult{PartialTranscript: transcript}, transcript, outcome)
+			return
+		}
+		if len(calls) > 0 {
+			// Not rendered ahead (onResponse): the words are the preamble of a tool round, which the turn replays
+			// through its own pipeline.
+			finish(&SpeculativeResult{PartialTranscript: transcript, Response: response, ToolCalls: calls}, transcript, "tool_calls")
 			return
 		}
 		if onResponse != nil {
@@ -422,19 +440,30 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 // never been attempted; Await never blocks a caller with no speculation
 // in flight (state==SpecIdle returns immediately).
 func (se *SpeculativeExecutor) Await(ctx context.Context, finalTranscript string) (string, bool) {
+	text, calls, ok := se.AwaitRound(ctx, finalTranscript)
+	if !ok || len(calls) > 0 {
+		return "", false
+	}
+	return text, true
+}
+
+// AwaitRound is Await for a reply that may have called tools: ok with the words and the calls when the run's
+// transcript matches finalTranscript. A round with calls is not a finished reply: the turn replays it (replayedRound)
+// so the tools run, and the rounds after them are asked as usual.
+func (se *SpeculativeExecutor) AwaitRound(ctx context.Context, finalTranscript string) (string, []ToolCallEventData, bool) {
 	se.mu.Lock()
 	state := se.state
 	done := se.done
 	se.mu.Unlock()
 
 	if state == SpecIdle {
-		return "", false
+		return "", nil, false
 	}
 	if state == SpecRunning {
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return "", false
+			return "", nil, false
 		}
 	}
 
@@ -442,13 +471,13 @@ func (se *SpeculativeExecutor) Await(ctx context.Context, finalTranscript string
 	result := se.result
 	se.mu.Unlock()
 
-	if result == nil || result.Response == "" {
-		return "", false
+	if result == nil || (result.Response == "" && len(result.ToolCalls) == 0) {
+		return "", nil, false
 	}
 	if !sameUtterance(result.PartialTranscript, finalTranscript) {
-		return "", false
+		return "", nil, false
 	}
-	return result.Response, true
+	return result.Response, result.ToolCalls, true
 }
 
 // sameUtterance reports whether two transcripts are the same thing said, for the purpose of

@@ -87,7 +87,8 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string           `json:"content"`
+				ToolCalls []openAIToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 		Usage usagePayload `json:"usage"`
@@ -99,6 +100,7 @@ func (l *CerebrasLLM) Complete(ctx context.Context, messages []orchestrator.Mess
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no response from cerebras")
 	}
+	captureToolCalls(ctx, result.Choices[0].Message.ToolCalls)
 	return result.Choices[0].Message.Content, nil
 }
 

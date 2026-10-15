@@ -285,7 +285,10 @@ type ManagedStream struct {
 	// Token counts for the turn in flight, accumulated across every provider call the turn makes
 	// (a tool chain is more than one). Read by the turn-latency logger; see token_usage.go for why
 	// this is a per-turn sink rather than a field on the provider.
-	turnTokens        *TokenUsage
+	turnTokens *TokenUsage
+	// specToolRound is a speculative reply that called tools, matched to the confirmed transcript and handed to
+	// runLLMAndTTS to replay as the turn's first round (trySpeculativeResponse, replayedRound).
+	specToolRound     *specToolRound
 	llmStartTime      time.Time
 	llmEndTime        time.Time
 	ttsStartTime      time.Time
@@ -2482,6 +2485,13 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.turnAudioBytes = 0
 
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
+		ms.mu.Lock()
+		round := ms.specToolRound
+		ms.specToolRound = nil
+		ms.mu.Unlock()
+		if round != nil && round.transcript == transcript {
+			sProvider = &replayedRound{real: sProvider, text: round.text, calls: round.calls, tokens: round.tokens}
+		}
 		ms.runStreamingLLM(rCtx, sProvider, gen, transcript)
 		return
 	}

@@ -146,7 +146,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	// hit, which is exactly what this prevents.
 	awaitCtx, cancel := context.WithTimeout(ctx, speculativeAwaitBudget())
 	awaitStart := time.Now()
-	response, ok := ms.speculator.Await(awaitCtx, transcript)
+	response, calls, ok := ms.speculator.AwaitRound(awaitCtx, transcript)
 	cancel()
 	// On a hit the turn's tokens are the run's: without this the turn-latency line reported the
 	// previous turn's sink, since runLLMAndTTS (which installs a fresh one) never runs.
@@ -170,6 +170,20 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 				"reason", cut.Reason(), "kept", clipForLog(kept), "dropped", clipForLog(cut.Dropped()))
 			response = kept
 		}
+	}
+	if ok && len(calls) > 0 {
+		// A reply that called tools: the turn runs it as its first round (runLLMAndTTS, replayedRound), so the words
+		// before the calls are spoken, the tools run now that the turn is confirmed, and the rounds after them are asked
+		// as usual. It used to be spoken as the whole reply with the calls dropped (Complete returned the words alone),
+		// or, with no words, missed and the same request paid again.
+		ms.prerender.discard()
+		ms.mu.Lock()
+		ms.specToolRound = &specToolRound{transcript: transcript, text: response, calls: calls, tokens: specTokens}
+		ms.mu.Unlock()
+		ms.logger.Info("Speculative tool round used", "run", specRun, "calls", len(calls), "transcript_chars", len(transcript))
+		return false
+	}
+	if ok {
 		// The guess is spoken as it stands, so it gets the check the streamed path gives each
 		// sentence: a tool call written out, or leaked reasoning, becomes a miss and the turn is
 		// generated again instead (unspeakableReply).
