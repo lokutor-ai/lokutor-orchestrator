@@ -216,3 +216,43 @@ func TestOrphanedPassCannotLandOnTheNextAttempt(t *testing.T) {
 		t.Fatalf("the turn must get the second pause's transcript, got %q %v", res.Text, ok)
 	}
 }
+
+// A pass whose result can no longer be used is stopped: invalidate cancels it, and an attempt invalidated before its
+// cancel was registered is cancelled on registration.
+func TestInvalidateCancelsThePassInFlight(t *testing.T) {
+	var s specSTT
+	s.seq = -1
+	attempt, ok := s.start(100, 1)
+	if !ok {
+		t.Fatal("start refused")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.setCancel(attempt, cancel)
+	s.invalidate()
+	if ctx.Err() == nil {
+		t.Fatal("invalidate did not cancel the pass in flight")
+	}
+
+	attempt, ok = s.start(100, 2)
+	if !ok {
+		t.Fatal("start refused after invalidate")
+	}
+	s.invalidate()
+	late, lateCancel := context.WithCancel(context.Background())
+	s.setCancel(attempt, lateCancel)
+	if late.Err() == nil {
+		t.Fatal("an attempt invalidated before registering its cancel was not cancelled")
+	}
+
+	attempt, _ = s.start(100, 3)
+	kept, keptCancel := context.WithCancel(context.Background())
+	defer keptCancel()
+	s.setCancel(attempt, keptCancel)
+	if ok, _ := s.finishAttempt(attempt, TranscriptionResult{Text: "hola"}, nil); !ok {
+		t.Fatal("finishAttempt refused the attempt in flight")
+	}
+	s.invalidate()
+	if kept.Err() != nil {
+		t.Fatal("a finished pass was cancelled")
+	}
+}
