@@ -108,3 +108,42 @@ func TestRetryAfterWrittenOutCallContinuesFromWhatWasSaid(t *testing.T) {
 		t.Errorf("the goodbye was spoken %d times: %s", n, joined)
 	}
 }
+
+// Words before a tool call are the acknowledgment and are said once, whether their sentence was already flushed to TTS
+// when the call arrived or is still an unfinished tail. On 2026-10-16 both were said twice: the whole reply was spoken
+// again as the filler, and the tail once more at the end of the turn.
+func TestPreToolWordsSpokenOnce(t *testing.T) {
+	for _, pre := range []string{"Un momento, lo miro.", "Un momento, lo miro"} {
+		llm := &MockStreamingLLM{responses: []struct {
+			content   string
+			toolCalls []ToolCallEventData
+		}{
+			{content: pre, toolCalls: []ToolCallEventData{{Name: "lookup", Arguments: `{}`, CallID: "c1"}}},
+			{content: "Ya está.", toolCalls: nil},
+		}}
+		tts := &countingTTS{}
+		orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+		orch.RegisterTool("lookup", func(args string) (string, error) { return `{"ok":true}`, nil })
+		session := NewConversationSession("pre-tool-once")
+		session.SetTools([]Tool{{Type: "function", Function: map[string]interface{}{"name": "lookup"}}})
+		ms := orch.NewManagedStream(context.Background(), session)
+		ms.runLLMAndTTS(context.Background(), "mira mi cita")
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			tts.mu.Lock()
+			joined := strings.Join(tts.said, " | ")
+			tts.mu.Unlock()
+			if strings.Contains(joined, "Ya está") || time.Now().After(deadline) {
+				if n := strings.Count(joined, "lo miro"); n != 1 {
+					t.Errorf("%q: the words before the call were said %d times: %s", pre, n, joined)
+				}
+				if !strings.Contains(joined, "Ya está") {
+					t.Errorf("%q: the reply after the call was not said: %s", pre, joined)
+				}
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		ms.Close()
+	}
+}

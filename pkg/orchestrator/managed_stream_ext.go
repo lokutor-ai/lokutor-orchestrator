@@ -521,13 +521,13 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				hasToolCalls = true
 				ms.emit(ToolCall, tc)
 
-				filler := strings.TrimSpace(fullText.String())
-				if filler != "" {
-					go func(t string) {
-						sCtx, sCancel := context.WithCancel(ctx)
-						defer sCancel()
-						ms.speakText(sCtx, t, gen)
-					}(filler)
+				if strings.TrimSpace(fullText.String()) != "" {
+					// What the model said before the call is the acknowledgment. Its finished sentences are in the
+					// TTS queue already; only the unfinished tail is left to say, through the same queue so it
+					// keeps its place. This used to speak the whole of fullText again from its own goroutine, and
+					// the tail a third way at the end of the turn: "Un momento, lo miro." was heard twice, a
+					// goodbye before end_call twice (2026-10-16, TestPreToolWordsSpokenOnce).
+					flushSentence()
 					fullText.Reset()
 				} else if firstCall {
 					// No pending text — speak a filler so there's no dead air while the tool
