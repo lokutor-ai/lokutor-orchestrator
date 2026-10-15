@@ -147,3 +147,36 @@ func TestPreToolWordsSpokenOnce(t *testing.T) {
 		ms.Close()
 	}
 }
+
+// openerTTS records, per sentence, whether its synthesis was marked as the turn's first sentence.
+type openerTTS struct {
+	countingTTS
+	opener []bool
+}
+
+func (o *openerTTS) StreamSynthesize(ctx context.Context, text string, voice Voice, lang Language, onChunk func([]byte) error) error {
+	o.mu.Lock()
+	o.opener = append(o.opener, TurnOpener(ctx))
+	o.mu.Unlock()
+	return o.countingTTS.StreamSynthesize(ctx, text, voice, lang, onChunk)
+}
+
+// Only a turn's first sentence is marked TurnOpener: the caller waits on it, the rest synthesize while it plays.
+func TestOnlyTheTurnsFirstSentenceIsTheOpener(t *testing.T) {
+	llm := &chunkedLLM{script: [][]string{{"Claro, te ayudo. ", "Dime tu nombre. ", "Y tu teléfono."}}}
+	tts := &openerTTS{}
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+	ms := orch.NewManagedStream(context.Background(), NewConversationSession("opener"))
+	defer ms.Close()
+	ms.runLLMAndTTS(context.Background(), "quiero una cita")
+	tts.mu.Lock()
+	defer tts.mu.Unlock()
+	if len(tts.opener) < 2 || !tts.opener[0] {
+		t.Fatalf("first sentence not marked as the opener: %v (%v)", tts.opener, tts.said)
+	}
+	for i, o := range tts.opener[1:] {
+		if o {
+			t.Errorf("sentence %d marked as the opener: %v (%v)", i+2, tts.opener, tts.said)
+		}
+	}
+}
