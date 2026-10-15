@@ -90,6 +90,10 @@ type specSTT struct {
 	// the hangover it actually managed to use.
 	startedAt time.Time
 
+	// cancel stops the pass in flight. invalidate() calls it: the result would be discarded anyway, and a pass
+	// still denoising skips its recognition request (2026-10-16).
+	cancel context.CancelFunc
+
 	// attempt numbers the passes begun. A pass finishes only its own attempt: invalidate() lets the
 	// next pause begin another while the old pass is still transcribing, and the old pass landing
 	// then was taken as the new attempt's result. That transcript is short of the words said between
@@ -228,17 +232,17 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 	}
 
 	go func() {
-		// Deliberately not tied to the utterance context: a speculative pass
-		// that outlives its usefulness must still finish and release the
-		// Parakeet worker slot rather than being abandoned mid-call.
+		// Not tied to the utterance context: the pass belongs to this pause, and invalidate() (the caller
+		// carried on, or a new utterance began) is what stops it, through setCancel.
 		ctx, cancel := context.WithTimeout(ms.ctx, 10*time.Second)
 		defer cancel()
+		ms.specSTT.setCancel(attempt, cancel)
 		res, err := ms.orch.Transcribe(ctx, snapshot, lang)
 		if ok, displaced := ms.specSTT.finishAttempt(attempt, res, err); !ok {
 			// The caller carried on after this pause: the transcript is short of what they said
 			// since, and neither the turn nor a guess may use it. Logged when a later pause's pass
 			// was running, the case that used to take this transcript for the turn's.
-			if displaced {
+			if displaced && err == nil {
 				ms.logger.Info("Speculative STT: an earlier pause's transcript finished during a later pause's pass and was discarded",
 					"attempt", attempt, "text", res.Text)
 			}
@@ -343,7 +347,19 @@ func (s *specSTT) start(snapshotLen, seq int) (int, bool) {
 	s.result = TranscriptionResult{}
 	s.err = nil
 	s.startedAt = time.Now()
+	s.cancel = nil
 	return s.attempt, true
+}
+
+// setCancel registers how to stop attempt's pass. An attempt already invalidated is stopped at once.
+func (s *specSTT) setCancel(attempt int, cancel context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inFlight && s.attempt == attempt {
+		s.cancel = cancel
+		return
+	}
+	cancel()
 }
 
 // finish records the result of the attempt in flight.
@@ -364,6 +380,7 @@ func (s *specSTT) finishAttempt(attempt int, res TranscriptionResult, err error)
 		return false, s.inFlight && s.attempt != attempt
 	}
 	s.inFlight = false
+	s.cancel = nil
 	s.result = res
 	s.err = err
 	if s.done != nil {
@@ -372,12 +389,17 @@ func (s *specSTT) finishAttempt(attempt int, res TranscriptionResult, err error)
 	return true, false
 }
 
-// invalidate drops any attempt. The in-flight goroutine is left to complete
-// and its result discarded — cancelling it would not return the CPU any sooner
-// and would complicate the Parakeet worker's single-flight accounting.
+// invalidate drops any attempt, and cancels the pass in flight: its result would be discarded. It used to be left
+// to finish ("cancelling would not return the CPU any sooner and would complicate the Parakeet worker's single-flight
+// accounting"); since 09-29 the denoiser honours cancellation, so a pass still denoising stops there and never sends
+// its recognition request, and the recognition client returns on cancellation without tripping its breaker.
 func (s *specSTT) invalidate() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
 	if s.inFlight {
 		// Mark it orphaned: finish() will no-op, and the waiter sees no done
 		// channel. Clearing `done` here is what makes a later begin() legal.
