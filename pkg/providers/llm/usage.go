@@ -54,3 +54,31 @@ func recordUsageFromChunk(ctx context.Context, data []byte) {
 	}
 	recordUsage(ctx, *envelope.Usage)
 }
+
+// openAIToolCall is one tool call of a non-streaming OpenAI-format reply (choices[0].message.tool_calls).
+// Arguments is kept raw: it is a JSON string in the format, and an object from a provider that differs must not fail
+// the whole decode, as a field Complete never read until 2026-10-16 could not.
+type openAIToolCall struct {
+	ID       string `json:"id"`
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
+}
+
+// captureToolCalls hands a Complete reply's tool calls to the caller's capture (orchestrator.WithToolCallCapture),
+// if it installed one: Complete returns only the text.
+func captureToolCalls(ctx context.Context, calls []openAIToolCall) {
+	c := orchestrator.ToolCallCaptureFrom(ctx)
+	if c == nil {
+		return
+	}
+	for _, tc := range calls {
+		args := string(tc.Function.Arguments)
+		var s string
+		if json.Unmarshal(tc.Function.Arguments, &s) == nil {
+			args = s
+		}
+		c.Add(orchestrator.ToolCallEventData{Name: tc.Function.Name, Arguments: args, CallID: tc.ID})
+	}
+}

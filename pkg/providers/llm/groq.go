@@ -80,7 +80,8 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string           `json:"content"`
+				ToolCalls []openAIToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 		Usage usagePayload `json:"usage"`
@@ -94,6 +95,7 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 		return "", fmt.Errorf("no response from groq")
 	}
 
+	captureToolCalls(ctx, result.Choices[0].Message.ToolCalls)
 	return result.Choices[0].Message.Content, nil
 }
 
