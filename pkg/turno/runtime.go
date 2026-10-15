@@ -181,13 +181,31 @@ func NewRuntime(modelPath string) (*Runtime, error) {
 		return nil, fmt.Errorf("diff_new output tensor: %w", err)
 	}
 
+	// One thread, no spin-waiting, as Silero (pkg/vad/silero.go). With nil options ORT gives every session a pool of
+	// one thread per core that spins between runs: two Turno sessions a call (model + shadow) stepping every 20 ms
+	// held 120% of a core on a 4-core machine, against 0.7% bounded, with bit-identical outputs and each step faster
+	// (115 -> 95 us), measured 2026-10-16. ORT_SPINNING=1 brings spinning back, as for Silero.
+	opt, optErr := ort.NewSessionOptions()
+	if optErr == nil {
+		defer opt.Destroy()
+		spinning := os.Getenv("ORT_SPINNING")
+		if spinning == "" {
+			spinning = "0"
+		}
+		_ = opt.SetIntraOpNumThreads(1)
+		_ = opt.SetInterOpNumThreads(1)
+		_ = opt.AddSessionConfigEntry("session.intra_op.allow_spinning", spinning)
+		_ = opt.AddSessionConfigEntry("session.inter_op.allow_spinning", spinning)
+	} else {
+		opt = nil
+	}
 	r.session, err = ort.NewAdvancedSession(
 		modelPath,
 		[]string{"feat_window", "energy_delta", "h_prev", "d_prev", "diff_prev"},
 		[]string{"vad", "turn_state", "bargein", "horizon", "h_new", "gate", "d_new", "diff_new"},
 		[]ort.ArbitraryTensor{r.featWindow, r.energyDelta, r.hPrev, r.dPrev, r.diffPrev},
 		[]ort.ArbitraryTensor{r.vadOut, r.turnStateOut, r.bargeinOut, r.horizonOut, r.hNewOut, r.gateOut, r.dNewOut, r.diffNewOut},
-		nil,
+		opt,
 	)
 	if err != nil {
 		r.destroyTensors()

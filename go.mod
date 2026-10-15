@@ -16,7 +16,7 @@ require (
 	github.com/coder/websocket v1.8.14
 	github.com/gen2brain/malgo v0.11.24
 	github.com/stretchr/testify v1.12.1
-	github.com/yalue/onnxruntime_go v1.12.0
+	github.com/yalue/onnxruntime_go v1.25.0
 	gonum.org/v1/gonum v0.15.0
 )
 
