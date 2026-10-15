@@ -2657,6 +2657,9 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// this turn's first sentence".
 	if ms.ttsStartTime.IsZero() {
 		ms.ttsStartTime = ms.botSpeakStart
+		// The turn's first sentence is the one the caller is waiting on; later ones synthesize while it plays.
+		// The TTS provider may let it skip waiting for a batch to form (TurnOpener).
+		sCtx = WithTurnOpener(sCtx)
 	}
 	ms.state = StateSpeaking
 	// Tracks whatever's actively coming out of the speaker right now — used
