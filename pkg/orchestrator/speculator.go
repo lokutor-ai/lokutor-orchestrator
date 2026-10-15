@@ -328,6 +328,19 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 	historySnapshot []Message,
 	tools []Tool,
 ) {
+	se.StartFromTranscriptWithTail(ctx, orch, transcript, historySnapshot, nil, tools)
+}
+
+// StartFromTranscriptWithTail is StartFromTranscript with messages that follow the caller's words, as the turn's own
+// request has them: a knowledge-base passage is added after the user message (injectRagContext).
+func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
+	ctx context.Context,
+	orch *Orchestrator,
+	transcript string,
+	historySnapshot []Message,
+	tail []Message,
+	tools []Tool,
+) {
 	transcript = strings.TrimSpace(transcript)
 	if orch == nil || orch.llm == nil || len(transcript) < 2 {
 		return
@@ -405,6 +418,7 @@ func (se *SpeculativeExecutor) StartFromTranscript(
 		}
 
 		messages := append(append([]Message{}, historySnapshot...), Message{Role: "user", Content: transcript})
+		messages = append(messages, tail...)
 		capCtx, capture := WithToolCallCapture(sCtx)
 		response, err := orch.llm.Complete(capCtx, messages, tools)
 		calls := capture.Calls()

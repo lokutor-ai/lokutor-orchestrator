@@ -128,6 +128,19 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	if ms.speculator == nil || ms.orch == nil || !ms.orch.config.SpeculativeLLM {
 		return false
 	}
+	// A knowledge-base agent's guess may answer only from this turn's passage: the one its seed retrieved for these
+	// words (seedKnowledgeRequest). Any other guess was asked with an earlier question's passage.
+	ms.mu.Lock()
+	staleKnowledge := ms.orch.rag != nil && !ms.knowledgeFromSeed
+	ms.mu.Unlock()
+	if staleKnowledge {
+		if ms.speculator.State() != SpecIdle {
+			ms.logger.Info("Speculative reply not used: its knowledge-base passage is not this turn's")
+		}
+		ms.speculator.Cancel()
+		ms.prerender.discard()
+		return false
+	}
 
 	// Bounded wait for an in-flight run. The bound has to be smaller than the
 	// thing it is an optimisation of, and at 4 seconds it was ten times larger.
