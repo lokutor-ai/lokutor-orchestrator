@@ -81,6 +81,11 @@ type SpeculativeExecutor struct {
 	// of the run that replaced it; runTranscript is what the current run is guessing on.
 	runID         int
 	runTranscript string
+	// stream is the current run's reply as it streams (spec_stream.go), with the run's token sink; taken is the run whose
+	// stream a turn took over (TakeStream), so its end is logged as such.
+	stream       *specStream
+	streamTokens *TokenUsage
+	taken        int
 }
 
 func NewSpeculativeExecutor(intervalMs int) *SpeculativeExecutor {
@@ -362,6 +367,7 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 		}
 		se.state = SpecIdle
 		se.result = nil
+		se.stream = nil
 	}
 	se.state = SpecRunning
 	se.result = nil
@@ -372,6 +378,15 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
 	sCtx = WithTokenUsage(WithTokenCategory(sCtx, TokensSpeculative), tokens)
 	se.cancel = sCancel
+	streamer, streams := orch.llm.(StreamingLLMProvider)
+	streams = streams && speculativeStreamEnabled()
+	var tee *specStream
+	if streams {
+		tee = newSpecStream()
+		se.stream, se.streamTokens = tee, tokens
+	} else {
+		se.stream, se.streamTokens = nil, nil
+	}
 	done := make(chan struct{})
 	se.done = done
 	onPartial := se.onPartial
@@ -381,7 +396,12 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 	started := time.Now()
 
 	finish := func(result *SpeculativeResult, transcript, outcome string) {
-		if sCtx.Err() == context.Canceled {
+		se.mu.Lock()
+		taken := se.taken == id
+		se.mu.Unlock()
+		if taken {
+			outcome = "taken_over"
+		} else if sCtx.Err() == context.Canceled {
 			outcome = "cancelled"
 		}
 		if result != nil {
@@ -419,9 +439,26 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 
 		messages := append(append([]Message{}, historySnapshot...), Message{Role: "user", Content: transcript})
 		messages = append(messages, tail...)
-		capCtx, capture := WithToolCallCapture(sCtx)
-		response, err := orch.llm.Complete(capCtx, messages, tools)
-		calls := capture.Calls()
+		var response string
+		var err error
+		var calls []ToolCallEventData
+		if streams {
+			// Streamed, into tee, for a turn to take over (spec_stream.go). The run still finishes as a Complete run
+			// did, so Await and the cost log see the same outcomes when no turn takes it.
+			response, err = streamer.StreamComplete(sCtx, messages, tools,
+				func(c string) error { tee.push(specItem{chunk: c}); return nil },
+				func(tc ToolCallEventData) error {
+					tc2 := tc
+					calls = append(calls, tc2)
+					tee.push(specItem{call: &tc2})
+					return nil
+				})
+			tee.end(err)
+		} else {
+			capCtx, capture := WithToolCallCapture(sCtx)
+			response, err = orch.llm.Complete(capCtx, messages, tools)
+			calls = capture.Calls()
+		}
 		if err != nil || sCtx.Err() != nil || (strings.TrimSpace(response) == "" && len(calls) == 0) {
 			// Record the transcript even without a response, so Await's caller
 			// can tell speculation ran rather than never having been attempted.
@@ -548,4 +585,6 @@ func (se *SpeculativeExecutor) Cancel() {
 	se.state = SpecIdle
 	se.result = nil
 	se.runTranscript = ""
+	se.stream = nil
+	se.streamTokens = nil
 }

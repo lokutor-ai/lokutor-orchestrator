@@ -44,6 +44,7 @@ func (m *roundLLM) StreamComplete(ctx context.Context, messages []Message, tools
 // A speculative reply that called a tool is a round, not a reply: Await reads it as no reply, AwaitRound returns the
 // words and the call.
 func TestSpeculativeToolRoundIsKept(t *testing.T) {
+	t.Setenv("SPECULATIVE_STREAM", "0") // the Complete path; the streamed one is spec_stream_test.go
 	llm := &roundLLM{}
 	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, &countingTTS{}, nil, DefaultConfig(), &NoOpLogger{})
 	se := NewSpeculativeExecutor(0)
