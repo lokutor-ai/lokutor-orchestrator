@@ -12,13 +12,17 @@ import (
 // Why (2026-10-16): the denoiser in front of recognition (lokutor_tts Psst) ran over the whole utterance when its first
 // pass came, at the end of speech, so its time grew with what the caller said and sat between the caller stopping and
 // the reply: recognition on the critical path was 87 ms median for utterances of 3-5 s (10% of turns), 167 ms at
-// 5-8 s and 352 ms past 8 s (734 turns, 7 days). Priming every 1.5 s of speech lets that pass denoise only the rest.
+// 5-8 s and 352 ms past 8 s (734 turns, 7 days). Priming every 0.5 s of speech lets that pass denoise only the rest.
 type STTPrimer interface {
 	Prime(ctx context.Context, audio []byte)
 }
 
-// primeEvery is how much new speech there is between primes.
-const primeEvery = 1500 * time.Millisecond
+// primeEvery is how much new speech there is between primes. What is left for the pass at the end of speech is the
+// speech since the last prime, so this bounds the denoising between the caller stopping and their transcript: Psst
+// costs 45-50 ms per second of audio whatever the slice (1 ms more per pass; 16 and 8 kHz, measured 2026-10-16), so
+// 1.5 s left up to 68 ms there (34 on average) and 0.5 s leaves up to 24 (12), for ~3% more denoising in all. A prime
+// still running when the caller stops is waited for, and is a third as long too.
+const primeEvery = 500 * time.Millisecond
 
 // maybePrimeSTT primes the STT provider with the utterance so far (the lead-in and the speech, as the transcription
 // passes send it) once primeEvery of new speech has arrived, one prime at a time, in the background.
