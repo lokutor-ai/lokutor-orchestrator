@@ -291,6 +291,10 @@ type ManagedStream struct {
 	specToolRound *specToolRound
 	// specStreamRound is a speculative run's live stream, taken over for the turn (TakeStream, streamedRound).
 	specStreamRound *specStreamRound
+	// primedLen is how much of speechAudioBuf the STT provider was last primed with; priming says a prime is running
+	// (stt_prime.go).
+	primedLen int
+	priming   bool
 	// specKnowledge is the knowledge-base retrieval the speculative seed made for its words (seedKnowledge), reused
 	// by injectRagContext when the turn's transcript is the same.
 	specKnowledge *seedKnowledge
@@ -792,6 +796,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 			ms.closeConfirmationGateIfOpen()
 			ms.userAudio = append(ms.userAudio, chunk...)
 			ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
+			ms.maybePrimeSTT()
 		}
 
 		if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
@@ -885,6 +890,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		// the hangover starts counting, every speech sample is already in the
 		// buffer — see speculative_stt.go.
 		ms.maybeSpeculateSTT()
+		ms.maybePrimeSTT()
 
 		// The audio-triggered guesses (this one and the pause trigger) only run when the hangover seed
 		// is off: they transcribe a fragment mid-sentence, rarely match the confirmed words (5-10% of
@@ -1647,6 +1653,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 
 	speechAudio := ms.speechAudioBuf
 	ms.speechAudioBuf = make([]byte, 0, 44100)
+	ms.primedLen = 0
 	// With the buffer it belongs to: a VAD start the cooldown ignores never sets a new one.
 	ms.speechLeadIn = nil
 
