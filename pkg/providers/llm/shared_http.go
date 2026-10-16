@@ -30,30 +30,52 @@ var (
 func getSharedLLMClient() *http.Client {
 	sharedLLMOnce.Do(func() {
 		sharedLLMClient = &http.Client{
-			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
-				// Connection pool: allow enough idle connections for
-				// concurrent voice-agent sessions (8+ concurrent LLM calls).
-				MaxIdleConns:        50,
-				MaxIdleConnsPerHost: 20,
-				IdleConnTimeout:     60 * time.Second,
-
-				// Dial/TLS timeouts prevent hanging on unreachable hosts.
-				DialContext: (&net.Dialer{
-					Timeout:   10 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				TLSHandshakeTimeout:   5 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-
-				// HTTP/2 is enabled by Go's default transport when the
-				// server supports ALPN TLS — which Cerebras, Groq, and
-				// Gemini all do. No explicit config needed.
-			},
+			Timeout:   60 * time.Second,
+			Transport: newLLMTransport(),
 		}
 	})
 	return sharedLLMClient
+}
+
+// newLLMTransport is the shared client's transport.
+//
+// HTTP/2 has to be asked for. Go negotiates it on its own only for http.DefaultTransport: a Transport
+// with its own DialContext (or TLS config) stays on HTTP/1.1 unless ForceAttemptHTTP2 is set
+// (net/http onceSetNextProtoDefaults). This one said otherwise in a comment and spoke HTTP/1.1 to
+// Cerebras, OpenRouter and Groq until 2026-10-16 (checked against all three). On HTTP/1.1 a stream
+// closed before its end takes its connection with it, and a voice call closes streams all the time: a
+// speculative guess the caller talked over, a hedge loser, a reply cut after its question. The next
+// request then paid a fresh TCP+TLS handshake to the Cloudflare edge in front of the provider,
+// 30-45 ms from eu-west-1, and two test calls opened eight. Over HTTP/2 a cancelled request resets its
+// stream and the connection stays.
+//
+// One connection now carries every concurrent request to a host, so a connection that dies without a
+// FIN must not be trusted for long: a ping goes out after 10 s without a frame and the connection is
+// dropped if no answer comes in 5 s, where before a request could wait out ResponseHeaderTimeout on it.
+// Idle connections are kept 5 minutes (was 60 s): at a few calls an hour most calls began after a
+// quiet minute and paid the handshake on their first model request.
+func newLLMTransport() *http.Transport {
+	return &http.Transport{
+		// Connection pool (HTTP/1.1 hosts; an HTTP/2 host multiplexes over one connection).
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     5 * time.Minute,
+
+		// Dial/TLS timeouts prevent hanging on unreachable hosts.
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+
+		ForceAttemptHTTP2: true,
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout: 10 * time.Second,
+			PingTimeout:     5 * time.Second,
+		},
+	}
 }
 
 // Reasoning models emit their entire chain of thought before the first token
