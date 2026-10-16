@@ -325,6 +325,17 @@ type replyRecord struct {
 func (ms *ManagedStream) beginSegmentLocked(gen int, text string) {
 	ms.segSeq++
 	ms.curSeg = segmentRef{gen: gen, id: ms.segSeq, text: text}
+	if ms.echoReplyGen != gen {
+		ms.echoReplyGen, ms.echoReplyText = gen, ""
+	}
+	ms.echoReplyText = strings.TrimSpace(ms.echoReplyText + " " + text)
+	if n := len(ms.echoReplyText); n > 2000 {
+		cut := ms.echoReplyText[n-2000:]
+		if i := strings.IndexByte(cut, ' '); i >= 0 {
+			cut = cut[i+1:] // whole words only
+		}
+		ms.echoReplyText = cut
+	}
 }
 
 // scheduleAudioLocked puts n bytes of outbound 16-bit audio for gen on the caller's playout clock
