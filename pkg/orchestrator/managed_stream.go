@@ -375,11 +375,17 @@ type ManagedStream struct {
 	inflightUtterances int
 	curSeg             segmentRef
 	segSeq             int
-	onset              heardSnapshot
-	lastReply          replyRecord
-	mergeOnConfirm     bool
-	truthAppliedGen    int
-	replyCommitMu      sync.Mutex
+	// echoReplyGen / echoReplyText: every sentence of the current reply begun so far, for the text echo check.
+	// lastResponseText is the sentence being synthesised, which runs ahead of what is playing while the echo
+	// arrives behind it, so an echo of the sentence before ("Hey there." over "What are you building today?")
+	// never matched it.
+	echoReplyGen    int
+	echoReplyText   string
+	onset           heardSnapshot
+	lastReply       replyRecord
+	mergeOnConfirm  bool
+	truthAppliedGen int
+	replyCommitMu   sync.Mutex
 	// resumeDiscardGen is the last generation speakText abandoned a sentence of because the caller
 	// had started speaking again before it played. With no audio of that generation ever sent, the
 	// reply was never heard and must not be recorded as said — see replyUnheardLocked.
@@ -2287,16 +2293,20 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// VAD and turn-completion heads before trusting them.
 		ms.mu.Lock()
 		currentlySpeaking := ms.lastResponseText
+		replySoFar := ""
+		if ms.echoReplyGen == pendingGen {
+			replySoFar = ms.echoReplyText
+		}
 		ms.mu.Unlock()
 		acousticEcho, acousticScore, acousticLagMs, acousticNearFrames := ms.isLikelyAcousticEcho(pendingGen)
-		textEcho := isLikelyEcho(ownTranscript, currentlySpeaking)
+		textEcho := isLikelyEcho(ownTranscript, currentlySpeaking) || isLikelyEcho(ownTranscript, replySoFar)
 		ms.logger.Info("Echo check",
 			"acoustic_echo", acousticEcho, "acoustic_score", acousticScore,
 			"acoustic_lag_ms", acousticLagMs, "acoustic_near_frames", acousticNearFrames,
-			"text_echo_shadow", textEcho, "transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
-		if acousticEcho {
+			"text_echo", textEcho, "transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
+		if echo, method := echoVerdict(acousticEcho, acousticScore, textEcho); echo {
 			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
-				"method", "acoustic", "score", acousticScore, "lag_ms", acousticLagMs,
+				"method", method, "score", acousticScore, "lag_ms", acousticLagMs,
 				"transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
 			ms.resolvePendingBargeInFor(true)
 			return
@@ -3245,15 +3255,44 @@ func isLikelyEcho(transcript, currentlySpeaking string) bool {
 	return float64(matched)/float64(len(tWords)) >= 0.6
 }
 
+// normalizeForEchoCompare lowercases s and keeps its words: apostrophes are dropped inside a word ("didn't" and
+// "didn’t" both become "didnt"), every other punctuation mark separates words. It used to drop them all, which glued
+// the words around a dash together: replies are full of em dashes, and "catch that—could you say it" became
+// "catch thatcould you say it", so the echo "Didn't touch that. Could you say it?" matched 4 of 7 words, under the bar.
 func normalizeForEchoCompare(s string) string {
 	s = strings.ToLower(s)
 	var b strings.Builder
 	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsSpace(r) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
 			b.WriteRune(r)
+		case r == '\'' || r == '’' || r == 'ʼ':
+		default:
+			b.WriteByte(' ')
 		}
 	}
 	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// echoTextAcousticFloor is the acoustic score under which a transcript made of the agent's own words is still taken
+// for the caller. The text check alone cannot tell a caller repeating the agent from its echo, and the acoustic one
+// misses echo the browser's canceller has distorted (it scores 0.5-0.75 where the canceller left a residual). Over 14
+// days of production barge-ins to 2026-10-16, every transcript the text check flagged at an acoustic score from 0.5 up
+// was the agent's own words coming back ("¿Quieres escuchar?" over "¿Quieres escuchar cómo suena nuestra voz…?",
+// "Part of the studio are you?" over "What part of the studio are you looking at…"), and those were answered as the
+// caller: the agent replying to itself. Under 0.5 the two flagged cases with no acoustic support stay the caller's.
+const echoTextAcousticFloor = 0.5
+
+// echoVerdict decides whether a barge-in is the agent's own voice: the acoustic match on its own, or the agent's own
+// words with acoustic support. method is for the log.
+func echoVerdict(acousticEcho bool, acousticScore float64, textEcho bool) (bool, string) {
+	switch {
+	case acousticEcho:
+		return true, "acoustic"
+	case textEcho && acousticScore >= echoTextAcousticFloor:
+		return true, "text+acoustic"
+	}
+	return false, ""
 }
 
 type rmsProvider interface {
