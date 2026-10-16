@@ -289,6 +289,8 @@ type ManagedStream struct {
 	// specToolRound is a speculative reply that called tools, matched to the confirmed transcript and handed to
 	// runLLMAndTTS to replay as the turn's first round (trySpeculativeResponse, replayedRound).
 	specToolRound *specToolRound
+	// specStreamRound is a speculative run's live stream, taken over for the turn (TakeStream, streamedRound).
+	specStreamRound *specStreamRound
 	// specKnowledge is the knowledge-base retrieval the speculative seed made for its words (seedKnowledge), reused
 	// by injectRagContext when the turn's transcript is the same.
 	specKnowledge *seedKnowledge
@@ -2493,8 +2495,15 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 		ms.mu.Lock()
 		round := ms.specToolRound
 		ms.specToolRound = nil
+		sround := ms.specStreamRound
+		ms.specStreamRound = nil
 		ms.mu.Unlock()
-		if round != nil && round.transcript == transcript {
+		if sround != nil && sround.transcript == transcript {
+			sProvider = &streamedRound{real: sProvider, round: sround}
+		} else if sround != nil {
+			sround.cancel() // taken for other words: nothing will read it
+		}
+		if round != nil && round.transcript == transcript && sround == nil {
 			sProvider = &replayedRound{real: sProvider, text: round.text, calls: round.calls, tokens: round.tokens}
 		}
 		ms.runStreamingLLM(rCtx, sProvider, gen, transcript)

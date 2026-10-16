@@ -142,6 +142,19 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 		return false
 	}
 
+	// A run guessing on these words that streams is taken over now, without waiting for it to finish: the turn reads
+	// its stream as its first round (spec_stream.go), speaking what has arrived at once. Until 2026-10-16 the turn
+	// waited here for the whole reply (234 ms median) and, past 350 ms, asked again from scratch (19% of turns).
+	if round, ok := ms.speculator.TakeStream(transcript); ok {
+		ms.prerender.discard()
+		ms.mu.Lock()
+		ms.specStreamRound = round
+		ms.specAwaitMs = 0
+		ms.mu.Unlock()
+		ms.logger.Info("Speculative stream taken over", "transcript_chars", len(transcript))
+		return false
+	}
+
 	// Bounded wait for an in-flight run. The bound has to be smaller than the
 	// thing it is an optimisation of, and at 4 seconds it was ten times larger.
 	//
