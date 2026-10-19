@@ -53,6 +53,9 @@ type spokenSegment struct {
 	id        int
 	text      string
 	intervals []playoutInterval
+	// sched is all the audio ever scheduled for it. cutAt shortens intervals to what played; sched
+	// keeps the whole length, so a sentence cut short can still be told from one that played out.
+	sched time.Duration
 }
 
 func (s *spokenSegment) total() time.Duration {
@@ -102,6 +105,7 @@ func (p *playoutTimeline) schedule(gen, id int, text string, now time.Time, dur 
 		n++
 	}
 	seg := &p.segs[n-1]
+	seg.sched += dur
 	if k := len(seg.intervals); k > 0 && seg.intervals[k-1].end.Equal(start) {
 		seg.intervals[k-1].end = p.end
 	} else {
@@ -191,6 +195,17 @@ func (p *playoutTimeline) heard(at time.Time) (text string, heardDur time.Durati
 		break
 	}
 	return strings.Join(parts, " "), heardDur, complete
+}
+
+// firstUnheard is the index of the first segment the caller had not heard to its end by at, or
+// len(p.segs) when they had heard them all. Unlike heard, it holds after cutAt.
+func (p *playoutTimeline) firstUnheard(at time.Time) int {
+	for i := range p.segs {
+		if p.segs[i].heardBefore(at) < p.segs[i].sched-20*time.Millisecond {
+			return i
+		}
+	}
+	return len(p.segs)
 }
 
 // withInterruptionMark ends a cut-off fragment with the interruption mark, replacing any trailing
@@ -906,4 +921,165 @@ func (ms *ManagedStream) noteSpeechOverPlayout(now time.Time) {
 	}
 	ms.applySpokenTruthToContext(gen, tr)
 	ms.emitWithGen(BotResponseTruncated, tr, gen)
+}
+
+// replyResumableLocked reports whether settling the pending barge-in as a false alarm puts any of the
+// reply back in the caller's ears, the way resolvePendingBargeInFor resumes it (ms.mu held): a turn
+// still generating it, synthesis still running with frames held for it, or a transport still holding
+// audio it has not played (a paused queue, or a play-through never told to stop).
+func (ms *ManagedStream) replyResumableLocked(now time.Time) bool {
+	gen := ms.payloadGen
+	if ms.pipelineCancel != nil && ms.pipelineCtx != nil && ms.pipelineCtx.Err() == nil {
+		return true
+	}
+	if ms.ttsCancel != nil && ms.heldAudioGen == gen && len(ms.heldAudio) > 0 {
+		return true
+	}
+	if ms.onset.gen != gen || ms.onset.at.IsZero() {
+		return false
+	}
+	switch {
+	case ms.pausesOnBargeIn:
+		return !ms.onset.complete
+	case ms.playsThroughBargeIn:
+		return !ms.onset.stopped && ms.playout.gen == gen && ms.playout.end.After(now)
+	}
+	return false
+}
+
+// lostReplyLocked is what the caller will not hear of gen's reply unless it is said again, once nothing
+// resumes it (ms.mu held): from the start of the first sentence they had not heard to the end — a
+// sentence cut short is said again whole — including sentences that never reached the transport (held
+// during the barge-in and dropped, discarded by speakText's resume check, or never synthesised; the
+// reply sent to the transcript, or else what began synthesis, says what they were). "" when they heard
+// it all.
+func (ms *ManagedStream) lostReplyLocked(gen int, now time.Time) string {
+	var sent []string
+	first := 0
+	if ms.playout.gen == gen {
+		first = ms.playout.firstUnheard(now)
+		for _, s := range ms.playout.segs {
+			sent = append(sent, strings.TrimSpace(s.text))
+		}
+	}
+	lost := strings.Fields(strings.Join(sent[first:], " "))
+	sentWords := strings.Fields(strings.Join(sent, " "))
+	whole := ""
+	switch {
+	case ms.lastReply.gen == gen:
+		whole = ms.lastReply.text
+	case ms.echoReplyGen == gen:
+		whole = ms.echoReplyText
+	}
+	if w := strings.Fields(whole); len(w) > len(sentWords) &&
+		sameWords(strings.Join(w[:len(sentWords)], " "), strings.Join(sentWords, " ")) {
+		lost = append(lost, w[len(sentWords):]...)
+	}
+	return strings.Join(lost, " ")
+}
+
+// settleEchoVeto decides what becomes of an utterance the echo check judged to be the agent's own voice,
+// and reports whether it is to be answered after all. The veto is there to keep the reply playing: it
+// drops the utterance and resumes the reply. When nothing of the reply was left to resume (a
+// play-through transport already told to stop, the turn cancelled when the utterance ended) it dropped
+// both, and the agent said nothing more until the caller spoke again or the silence check-in came 10 s
+// later: 27 of the 89 vetoes in the 14 days to 2026-10-19 came after playback had been stopped, among
+// them agent_1792403239900718816's, whose "What should I take?" was never answered.
+//
+//   - Something resumes: the reply plays on and the utterance is dropped, as before.
+//   - The caller had heard the whole reply: nothing was lost, and the utterance is dropped.
+//   - They had heard next to none of it (bargeBaseLocked) and only the acoustic check says echo: the
+//     utterance is answered as the continuation of their previous one, the two joined as one turn. A
+//     continuation is never dropped over a reply the caller did not hear; if it was the agent's voice
+//     after all, the turn carries a few of its words.
+//   - Otherwise the rest of the reply is said again, from the start of the sentence that was cut
+//     (resayLostReply), unless the caller is already speaking again.
+func (ms *ManagedStream) settleEchoVeto(ctx context.Context, seq, gen int, pendingBarge, carried bool, method string,
+	acoustic acousticEchoReading, textEcho bool, transcript, botWasSaying string) (answer bool) {
+	now := time.Now()
+	ms.mu.Lock()
+	resumable := ms.replyResumableLocked(now)
+	lost := ""
+	if !resumable {
+		lost = ms.lostReplyLocked(gen, now)
+	}
+	joinable := !resumable && lost != "" && !textEcho && !carried && ms.bargeBaseLocked(now, seq, pendingBarge) != nil
+	superseded := ms.utteranceSeq != seq || ms.vadSpeaking
+	ms.mu.Unlock()
+
+	outcome := "said_again"
+	switch {
+	case resumable:
+		outcome = "resumed"
+	case lost == "":
+		outcome = "nothing_lost"
+	case joinable:
+		outcome = "joined_to_previous"
+	case superseded:
+		outcome = "superseded"
+	}
+	ms.logger.Info("Barge-in looks like an echo of the bot's own speech",
+		"outcome", outcome, "method", method, "score", acoustic.score, "lag_ms", acoustic.lagMs,
+		"lost_len", len(lost), "transcript", ContentForLog(transcript), "bot_was_saying", ContentForLog(botWasSaying))
+	if outcome == "joined_to_previous" {
+		return true
+	}
+	ms.resolvePendingBargeInFor(true)
+	if outcome == "said_again" {
+		ms.resayLostReply(ctx, gen, lost)
+	}
+	return false
+}
+
+// resayLostReply says again the part of gen's reply an echo cost the caller (settleEchoVeto). What they
+// heard of it is settled first, as for an interruption (the context keeps the fragment, transcripts show
+// it cut), and the rest goes out as a reply of its own: a new generation, its BotResponse, and an
+// assistant message after the fragment, so an interruption of it is settled like any other. No model
+// call: these are the words the model already gave.
+func (ms *ManagedStream) resayLostReply(ctx context.Context, gen int, text string) {
+	ms.mu.Lock()
+	var tr TruncatedResponse
+	settle := false
+	if ms.payloadGen == gen && ms.truthAppliedGen != gen {
+		tr, settle = ms.spokenTruthLocked(time.Now())
+	}
+	ms.mu.Unlock()
+	if settle && !(tr.Emitted && tr.Spoken == strings.TrimSpace(tr.Full)) {
+		ms.applySpokenTruthToContext(gen, tr)
+		ms.emitWithGen(BotResponseTruncated, tr, gen)
+	}
+
+	rCtx, rCancel := context.WithCancel(ctx)
+	defer rCancel()
+	ms.mu.Lock()
+	if ms.payloadGen != gen {
+		// A newer reply started in the meantime: that is the caller's answer now.
+		ms.mu.Unlock()
+		ms.logger.Info("Not saying the lost reply again: a newer reply started", "gen", gen)
+		return
+	}
+	if ms.pipelineCancel != nil {
+		ms.pipelineCancel()
+	}
+	ms.pipelineCancel = rCancel
+	ms.pipelineCtx = rCtx
+	ms.payloadGen++
+	newGen := ms.payloadGen
+	ms.responseTrigger = "resay"
+	ms.turnTokens = nil
+	ms.discardStart = time.Time{}
+	ms.mu.Unlock()
+
+	now := time.Now()
+	ms.llmStartTime, ms.llmEndTime = now, now // nothing to generate
+	ms.ttsStartTime, ms.ttsFirstChunkTime = time.Time{}, time.Time{}
+	ms.turnAudioBytes = 0
+	ms.lastResponseText = text
+	ms.spokenTextPrefix = ""
+	ms.spokenTextLocked = false
+	ms.responseChunksSent = 0
+	ms.session.AddMessage("assistant", text)
+	ms.emitBotResponse(text)
+	ms.speakResponse(rCtx, text, newGen)
+	ms.withdrawUnheardReply(newGen, text)
 }

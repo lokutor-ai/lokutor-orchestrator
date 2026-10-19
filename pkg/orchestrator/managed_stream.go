@@ -1503,6 +1503,10 @@ func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 	// the bot is audibly still talking. resumedStatus carries that correction;
 	// emitted below, once the real destination state is known.
 	resumedStatus := ""
+	// Set when nothing resumes a reply the caller had not finished hearing: a caller losing audio
+	// must leave evidence. The echo check says again what was lost (settleEchoVeto); the other false
+	// alarms (noise, too few words) leave it lost.
+	lostGen, lostLen, heldDropped := -1, 0, 0
 	switch {
 	case ms.ttsCancel != nil:
 		ms.state = StateSpeaking
@@ -1516,14 +1520,24 @@ func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 		resumedStatus = "thinking"
 	default:
 		ms.state = StateIdle
+		if ms.heldAudioGen == ms.payloadGen {
+			heldDropped = ms.heldAudioBytes
+		}
 		// Nothing is left to play into, so nothing should be kept.
 		ms.discardHeldAudioLocked()
 		if resumePlayout {
 			// Synthesis had finished, but the paused transport still holds the rest of the reply.
 			resumedStatus = "speaking"
+		} else if lost := ms.lostReplyLocked(ms.payloadGen, time.Now()); lost != "" {
+			lostGen, lostLen = ms.payloadGen, len(lost)
 		}
 	}
 	ms.mu.Unlock()
+
+	if lostGen >= 0 {
+		ms.logger.Info("False alarm over a reply that cannot be resumed: the caller has not heard the rest of it",
+			"gen", lostGen, "lost_len", lostLen, "held_bytes_dropped", heldDropped)
+	}
 
 	// Emitted outside the lock: these re-enter emitWithGen, which takes ms.mu.
 	// Status first, matching the order a fresh turn uses (BotSpeaking/BotThinking
@@ -2294,9 +2308,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// near-end audio captured during this pending window well-explained as a delayed,
 		// attenuated copy of audio the bot is known to have just played — amplitude-envelope
 		// correlation against the bot's own recent output, needing neither STT nor a trained
-		// model. The text check still runs, but only as a shadow comparison for tuning the new
-		// threshold against real traffic, the same way this codebase already shadow-logs Turno's
-		// VAD and turn-completion heads before trusting them.
+		// model. The text check counts too, with acoustic support (echoVerdict). Neither can call
+		// speech an echo when the agent was silent while it began (correlateEnvelopesFrom), and a
+		// veto never drops the caller into silence: settleEchoVeto resumes the reply, joins the
+		// utterance to the one before it, or says again what the echo cost.
 		ms.mu.Lock()
 		currentlySpeaking := ms.lastResponseText
 		replySoFar := ""
@@ -2304,18 +2319,18 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			replySoFar = ms.echoReplyText
 		}
 		ms.mu.Unlock()
-		acousticEcho, acousticScore, acousticLagMs, acousticNearFrames := ms.isLikelyAcousticEcho(pendingGen)
+		acoustic := ms.acousticEchoCheck(pendingGen)
 		textEcho := isLikelyEcho(ownTranscript, currentlySpeaking) || isLikelyEcho(ownTranscript, replySoFar)
 		ms.logger.Info("Echo check",
-			"acoustic_echo", acousticEcho, "acoustic_score", acousticScore,
-			"acoustic_lag_ms", acousticLagMs, "acoustic_near_frames", acousticNearFrames,
+			"acoustic_echo", acoustic.echo, "acoustic_score", acoustic.score,
+			"acoustic_lag_ms", acoustic.lagMs, "acoustic_near_frames", acoustic.nearFrames,
+			"acoustic_unsourced_score", acoustic.unsourcedScore,
 			"text_echo", textEcho, "transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
-		if echo, method := echoVerdict(acousticEcho, acousticScore, textEcho); echo {
-			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
-				"method", method, "score", acousticScore, "lag_ms", acousticLagMs,
-				"transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
-			ms.resolvePendingBargeInFor(true)
-			return
+		if echo, method := echoVerdict(acoustic.echo, acoustic.score, textEcho); echo {
+			if !ms.settleEchoVeto(ctx, seq, pendingGen, pendingBarge, carryBase != nil, method, acoustic, textEcho,
+				ownTranscript, currentlySpeaking) {
+				return
+			}
 		}
 	}
 	ms.mu.Lock()
