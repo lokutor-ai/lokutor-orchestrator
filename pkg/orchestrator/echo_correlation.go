@@ -258,11 +258,42 @@ func pearson(a, b []float64) float64 {
 // already guarantees — far is oldest-first, so a smaller start is an OLDER, longer-lag match.
 // Returns peak 0 and atFarFrame -1 if far is shorter than near (nothing to search).
 func correlateEnvelopes(near, far []float64) (peak float64, atFarFrame int) {
+	return correlateEnvelopesFrom(near, far, 0, 0)
+}
+
+// correlateEnvelopesFrom is correlateEnvelopes over the alignments starting at far frame from or
+// later, and only those where the agent's audio could have produced the speech that opened the
+// barge-in. near starts where the VAD reported speech, which it does only once it has heard onset
+// frames of it: at an alignment starting at far frame s, that speech sat over far frames
+// s-onset..s-1. An echo cannot start before what it echoes, so an alignment where the far end was
+// silent (nothing played: echoFarEndBuf is zeros there, and frames before its start count as
+// silent) under more than half of those frames is not considered, however well the envelopes
+// correlate after it. onset 0 checks nothing.
+//
+// 2026-10-19 (agent_1792403239900718816): the caller paused mid-sentence, the reply to the first
+// half started playing 9 ms before the VAD confirmed their second half, and that second half,
+// begun 192 ms earlier over silence, scored 0.776 against the 420 ms of reply that played: the
+// match was the on/off outline of two voices starting together, not an echo. It was dropped.
+func correlateEnvelopesFrom(near, far []float64, from, onset int) (peak float64, atFarFrame int) {
 	atFarFrame = -1
 	if len(near) == 0 || len(far) < len(near) {
 		return 0, -1
 	}
-	for start := 0; start+len(near) <= len(far); start++ {
+	if from < 0 {
+		from = 0
+	}
+	for start := from; start+len(near) <= len(far); start++ {
+		if onset > 0 {
+			sourced := 0
+			for f := start - onset; f < start; f++ {
+				if f >= 0 && far[f] > 0 {
+					sourced++
+				}
+			}
+			if 2*sourced < onset {
+				continue
+			}
+		}
 		c := pearson(near, far[start:start+len(near)])
 		if c > peak {
 			peak = c
@@ -272,24 +303,63 @@ func correlateEnvelopes(near, far []float64) (peak float64, atFarFrame int) {
 	return peak, atFarFrame
 }
 
+// SpeechConfirmer is a VAD that reports the start of speech only once it has heard a run of it
+// (lokutor_tts's SileroVAD: MinSpeechFrames of 32 ms). The speech it reports began that long before
+// the report. Asserted rather than added to VADProvider, like silenceFramesProvider: a VAD without it
+// gets no onset check (correlateEnvelopesFrom with onset 0). Exported so an implementation in another
+// module can assert that it satisfies it.
+type SpeechConfirmer interface {
+	SpeechConfirmDuration() time.Duration
+}
+
+// vadOnsetFrames is how many 20 ms echo frames of speech the VAD had heard when it reported the
+// onset of the current utterance; 0 when the VAD does not say.
+func (ms *ManagedStream) vadOnsetFrames() int {
+	c, ok := ms.vad.(SpeechConfirmer)
+	if !ok {
+		return 0
+	}
+	frame := time.Duration(echoFrameBytes/2) * time.Second / 16000
+	return int((c.SpeechConfirmDuration() + frame/2) / frame)
+}
+
 // isLikelyAcousticEcho decides whether the near-end audio captured during the current pending
 // barge-in window (gen) is well-explained as a delayed, attenuated copy of the bot's own recent
 // output. nearFrames is returned for logging even on an early "not enough data" exit, so a run of
 // echoMinNearFrames near-misses is visible rather than looking identical to "never ran".
 func (ms *ManagedStream) isLikelyAcousticEcho(gen int) (echo bool, score float64, lagMs int, nearFrames int) {
+	r := ms.acousticEchoCheck(gen)
+	return r.echo, r.score, r.lagMs, r.nearFrames
+}
+
+// acousticEchoReading is isLikelyAcousticEcho's answer, with what the onset rule set aside.
+type acousticEchoReading struct {
+	echo       bool
+	score      float64
+	lagMs      int
+	nearFrames int
+	// unsourcedScore is the best correlation at an alignment ruled out because the agent was silent
+	// under the speech that opened the barge-in (correlateEnvelopesFrom), when it beats score: what
+	// the check would have read without that rule. 0 otherwise.
+	unsourcedScore float64
+}
+
+func (ms *ManagedStream) acousticEchoCheck(gen int) (r acousticEchoReading) {
+	onset := ms.vadOnsetFrames()
 	ms.echoMu.Lock()
 	if ms.echoNearEndGen != gen {
 		ms.echoMu.Unlock()
-		return false, 0, 0, 0
+		return r
 	}
 	near := make([]byte, len(ms.echoNearEndBuf))
 	copy(near, ms.echoNearEndBuf)
 	// Only the far end's last len(near)+echoMaxLagFrames frames can align with the near end (see
-	// below), so only they are copied: this runs on every microphone frame of a pending barge-in,
-	// under the stream lock when stopPlayThroughIfDue asks, and the far end holds 12 s. The cut is
-	// a whole number of frames from the start, so the frames kept are the same ones.
+	// below), plus the onset frames before the oldest alignment, so only they are copied: this runs
+	// on every microphone frame of a pending barge-in, under the stream lock when
+	// stopPlayThroughIfDue asks, and the far end holds 12 s. The cut is a whole number of frames
+	// from the start, so the frames kept are the same ones.
 	farSrc := ms.echoFarEndBuf
-	if skip := len(farSrc)/echoFrameBytes - (len(near)/echoFrameBytes + echoMaxLagFrames); skip > 0 {
+	if skip := len(farSrc)/echoFrameBytes - (len(near)/echoFrameBytes + echoMaxLagFrames + onset); skip > 0 {
 		farSrc = farSrc[skip*echoFrameBytes:]
 	}
 	far := make([]byte, len(farSrc))
@@ -298,19 +368,26 @@ func (ms *ManagedStream) isLikelyAcousticEcho(gen int) (echo bool, score float64
 
 	nearEnv := rmsEnvelope(near, echoFrameBytes)
 	farEnv := rmsEnvelope(far, echoFrameBytes)
-	nearFrames = len(nearEnv)
+	r.nearFrames = len(nearEnv)
 	// Both buffers end at the latest microphone frame, so the echo can only sit up to
-	// echoMaxLagFrames back from the far end's tail.
-	if maxFar := len(nearEnv) + echoMaxLagFrames; len(farEnv) > maxFar {
+	// echoMaxLagFrames back from the far end's tail; the onset frames before that are only read.
+	if maxFar := len(nearEnv) + echoMaxLagFrames + onset; len(farEnv) > maxFar {
 		farEnv = farEnv[len(farEnv)-maxFar:]
 	}
 	if len(nearEnv) < echoMinNearFrames || len(farEnv) < len(nearEnv) {
-		return false, 0, 0, nearFrames
+		return r
 	}
 
-	peak, atFrame := correlateEnvelopes(nearEnv, farEnv)
+	from := len(farEnv) - len(nearEnv) - echoMaxLagFrames
+	peak, atFrame := correlateEnvelopesFrom(nearEnv, farEnv, from, onset)
+	if onset > 0 {
+		if raw, _ := correlateEnvelopesFrom(nearEnv, farEnv, from, 0); raw > peak {
+			r.unsourcedScore = raw
+		}
+	}
+	r.score = peak
 	if atFrame < 0 {
-		return false, peak, 0, nearFrames
+		return r
 	}
 	// atFrame counts from the oldest end of farEnv. The most recent possible alignment is
 	// len(farEnv)-len(nearEnv); the gap between that and where the match actually landed is how
@@ -319,5 +396,7 @@ func (ms *ManagedStream) isLikelyAcousticEcho(gen int) (echo bool, score float64
 	if lagFrames < 0 {
 		lagFrames = 0
 	}
-	return peak >= echoCorrelationThreshold, peak, lagFrames * 20, nearFrames
+	r.lagMs = lagFrames * 20
+	r.echo = peak >= echoCorrelationThreshold
+	return r
 }
