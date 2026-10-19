@@ -1842,7 +1842,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	gotPartial:
 		if latestPartial != "" {
 			result = TranscriptionResult{Text: latestPartial}
-			ms.logger.Info("Using streaming STT partial", "text", latestPartial)
+			ms.logger.Info("Using streaming STT partial", "text", ContentForLog(latestPartial))
 		}
 		ms.sttResultChan = nil
 	}
@@ -1859,7 +1859,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			result = spec
 			specUsed = true
 			ms.logger.Info("Using speculative STT from the VAD hangover",
-				"waited_ms", waited.Milliseconds(), "text", result.Text)
+				"waited_ms", waited.Milliseconds(), "text", ContentForLog(result.Text))
 		}
 	}
 
@@ -1907,7 +1907,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// call — otherwise a real, quiet utterance getting discarded here
 		// is indistinguishable after the fact from actual silence/noise.
 		ms.logger.Info("Utterance discarded as noise, resuming bot",
-			"transcript", result.Text, "no_speech_prob", result.NoSpeechProb,
+			"transcript", ContentForLog(result.Text), "no_speech_prob", result.NoSpeechProb,
 			"audio_duration_ms", duration.Milliseconds())
 		// resolvePendingBargeIn emits BotResumed itself now, with the actual
 		// resulting status -- a second nil-payload emission here would just be
@@ -1929,13 +1929,13 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	switch recogniserFillerVerdict(result.Text, lang, duration, overAgent) {
 	case fillerDiscard:
 		ms.logger.Info("Utterance discarded as noise, resuming bot",
-			"transcript", result.Text, "reason", "recogniser_filler", "over_agent", overAgent,
+			"transcript", ContentForLog(result.Text), "reason", "recogniser_filler", "over_agent", overAgent,
 			"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
 		ms.resolvePendingBargeInFor(true)
 		return
 	case fillerAskRepeat:
 		ms.logger.Warn("Recogniser returned an English filler for the caller's turn in another language — asking the caller to repeat",
-			"transcript", result.Text, "audio_duration_ms", duration.Milliseconds())
+			"transcript", ContentForLog(result.Text), "audio_duration_ms", duration.Milliseconds())
 		ms.mu.Lock()
 		ms.payloadGen++
 		gen := ms.payloadGen
@@ -1952,7 +1952,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// question. See question_mark.go for why this is lexical and conservative.
 	if restored := restoreQuestionMark(transcript, ms.session.GetCurrentLanguage()); restored != transcript {
 		ms.logger.Info("Restored question mark the recogniser omitted",
-			"before", transcript, "after", restored)
+			"before", ContentForLog(transcript), "after", ContentForLog(restored))
 		transcript = restored
 	}
 	if transcript == "" {
@@ -2047,7 +2047,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			"p_end_200ms", turnoHorizon[0], "p_end_500ms", turnoHorizon[1],
 			"p_end_800ms", turnoHorizon[2],
 			"speech_frames", turnoFrames,
-			"transcript", transcript)
+			"transcript", ContentForLog(transcript))
 
 		// Same observation, durably. The log line stays for live debugging;
 		// this is what the analysis actually reads. No transcript goes in —
@@ -2101,7 +2101,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			ms.logger.Info("Turno hold: text looked complete but prosody says the speaker is not done",
 				"p_incomplete", turnoState[1], "p_wait", turnoState[3],
 				"threshold", ms.orch.config.TurnoHoldThreshold, "hold_ms", waitMs,
-				"transcript", transcript)
+				"transcript", ContentForLog(transcript))
 		}
 
 		// Turno horizon assist: when the head predicts the speaker was
@@ -2163,7 +2163,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// in a pod running concurrent calls a join would be guesswork.
 			// Self-contained lines make the analysis a single pass.
 			ms.logger.Info("Utterance looked incomplete and user resumed speaking, abandoning response",
-				"transcript", transcript, "wait_ms", waitMs,
+				"transcript", ContentForLog(transcript), "wait_ms", waitMs,
 				"truly_incomplete", true, "horizon_assisted", horizonAssisted,
 				"turno_model", "v6", "turno_label", turnoLabel,
 				"p_complete", turnoState[0], "p_incomplete", turnoState[1],
@@ -2196,7 +2196,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// was definitively over" -- a user resuming at waitMs+1 lands
 			// here too, so it is a slightly optimistic negative.
 			ms.logger.Info("Utterance looked incomplete but no continuation arrived, proceeding",
-				"transcript", transcript, "wait_ms", waitMs,
+				"transcript", ContentForLog(transcript), "wait_ms", waitMs,
 				"truly_incomplete", false, "horizon_assisted", horizonAssisted,
 				"turno_model", "v6", "turno_label", turnoLabel,
 				"p_complete", turnoState[0], "p_incomplete", turnoState[1],
@@ -2219,7 +2219,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			//
 			// and then stopped, with a correct transcript already in hand.
 			ms.logger.Warn("Utterance abandoned: cancelled while waiting to see if the caller continued — no reply for this turn",
-				"seq", seq, "transcript", transcript, "wait_ms", waitMs,
+				"seq", seq, "transcript", ContentForLog(transcript), "wait_ms", waitMs,
 				"ctx_err", ctx.Err())
 			return
 		}
@@ -2259,14 +2259,14 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			// resolves as a false barge-in.
 			if !acceptsSustainedSingleWordBargeIn(ownTranscript, duration) {
 				ms.logger.Info("Barge-in below MinWordsToInterrupt, resuming bot",
-					"transcript", ownTranscript, "word_count", countWords(ownTranscript),
+					"transcript", ContentForLog(ownTranscript), "word_count", countWords(ownTranscript),
 					"audio_duration_ms", duration.Milliseconds())
 				ms.resolvePendingBargeInFor(true)
 				return
 			}
 		} else if turnoAssisted && countWords(ownTranscript) < minWords {
 			ms.logger.Info("Turno assist relaxed MinWordsToInterrupt",
-				"transcript", ownTranscript, "word_count", countWords(ownTranscript),
+				"transcript", ContentForLog(ownTranscript), "word_count", countWords(ownTranscript),
 				"turno_bargein_peak", turnoPeak)
 		}
 		// Echo check: client-side echo cancellation (browser WebRTC AEC, requested by the SDK's
@@ -2303,11 +2303,11 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.logger.Info("Echo check",
 			"acoustic_echo", acousticEcho, "acoustic_score", acousticScore,
 			"acoustic_lag_ms", acousticLagMs, "acoustic_near_frames", acousticNearFrames,
-			"text_echo", textEcho, "transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
+			"text_echo", textEcho, "transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
 		if echo, method := echoVerdict(acousticEcho, acousticScore, textEcho); echo {
 			ms.logger.Info("Barge-in looks like an echo of the bot's own speech, resuming",
 				"method", method, "score", acousticScore, "lag_ms", acousticLagMs,
-				"transcript", ownTranscript, "bot_was_saying", currentlySpeaking)
+				"transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
 			ms.resolvePendingBargeInFor(true)
 			return
 		}
@@ -2368,7 +2368,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	} else {
 		if revisedFrom != nil {
 			ms.logger.Warn("Continuation: context changed before the merge could be applied; recording it as a new turn",
-				"previous", revisedFrom.transcript, "merged", transcript)
+				"previous", ContentForLog(revisedFrom.transcript), "merged", ContentForLog(transcript))
 		}
 		ms.emit(TranscriptFinal, transcript)
 		ms.session.AddMessage("user", transcript)
@@ -2441,7 +2441,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		"tts_total_ms", bd.TTSTotal,
 		"e2e_ms", bd.UserToPlay,
 		"bot_start_ms", bd.BotStartLatency,
-		"transcript", transcript,
+		"transcript", ContentForLog(transcript),
 	)
 }
 
@@ -2599,7 +2599,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	}
 	if ms.session != nil {
 		if reason := unspeakableReply(text, ms.session.GetTools()); reason != "" {
-			ms.logger.Warn("Not speaking: the reply text is not speech", "reason", reason, "gen", gen, "text", text)
+			ms.logger.Warn("Not speaking: the reply text is not speech", "reason", reason, "gen", gen, "text", ContentForLog(text))
 			return
 		}
 	}

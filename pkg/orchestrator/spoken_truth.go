@@ -809,19 +809,19 @@ func (ms *ManagedStream) mergeCarry(ctx context.Context, base *committedUtteranc
 		if needsJointPass(base.transcript) {
 			reason = "joint pass not started"
 		}
-		ms.logger.Info("Continuation: joined as text", "previous", base.transcript, "continuation", own,
-			"merged", asText, "reason", reason)
+		ms.logger.Info("Continuation: joined as text", "previous", ContentForLog(base.transcript), "continuation", ContentForLog(own),
+			"merged", ContentForLog(asText), "reason", reason)
 		return asText, joinUtteranceAudio(base.audio, audio, int(ms.inputSampleRate))
 	}
 	merged, why := ms.awaitJoint(ctx, joint, own)
 	if merged == "" {
 		jointText, jointErr := joint.result()
-		ms.logger.Info("Continuation: joint transcription "+why+", joined as text", "previous", base.transcript,
-			"continuation", own, "joint", jointText, "merged", asText, "error", jointErr)
+		ms.logger.Info("Continuation: joint transcription "+why+", joined as text", "previous", ContentForLog(base.transcript),
+			"continuation", ContentForLog(own), "joint", ContentForLog(jointText), "merged", ContentForLog(asText), "error", jointErr)
 		return asText, joint.joined
 	}
 	ms.logger.Info("Continuation: transcribed together with the previous utterance",
-		"previous", base.transcript, "continuation", own, "merged", merged,
+		"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "merged", ContentForLog(merged),
 		"over_reply", false, "joined_ms", len(joint.joined)*1000/(int(ms.inputSampleRate)*2))
 	return merged, joint.joined
 }
@@ -863,24 +863,24 @@ func (ms *ManagedStream) awaitJoint(ctx context.Context, joint *jointTranscripti
 func (ms *ManagedStream) mergeBarge(ctx context.Context, base *committedUtterance, audio []byte, own string, joint *jointTranscription) (string, []byte, bool) {
 	if !needsJointPass(base.transcript) {
 		merged := spaceSentences(strings.TrimSpace(base.transcript + " " + own))
-		ms.logger.Info("Continuation: joined as text", "previous", base.transcript, "continuation", own,
-			"merged", merged, "over_reply", true, "reason", "previous utterance complete on its own")
+		ms.logger.Info("Continuation: joined as text", "previous", ContentForLog(base.transcript), "continuation", ContentForLog(own),
+			"merged", ContentForLog(merged), "over_reply", true, "reason", "previous utterance complete on its own")
 		return merged, joinUtteranceAudio(base.audio, audio, int(ms.inputSampleRate)), true
 	}
 	if joint == nil || joint.base != base {
 		ms.logger.Info("Continuation: joint pass not started, keeping the two halves separate",
-			"previous", base.transcript, "continuation", own)
+			"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own))
 		return "", nil, false
 	}
 	merged, why := ms.awaitJoint(ctx, joint, own)
 	if merged == "" {
 		jointText, jointErr := joint.result()
 		ms.logger.Info("Continuation: joint transcription "+why+", keeping the two halves separate",
-			"previous", base.transcript, "continuation", own, "joint", jointText, "error", jointErr)
+			"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "joint", ContentForLog(jointText), "error", jointErr)
 		return "", nil, false
 	}
 	ms.logger.Info("Continuation: transcribed together with the previous utterance",
-		"previous", base.transcript, "continuation", own, "merged", merged,
+		"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "merged", ContentForLog(merged),
 		"over_reply", true, "joined_ms", len(joint.joined)*1000/(int(ms.inputSampleRate)*2))
 	return merged, joint.joined, true
 }

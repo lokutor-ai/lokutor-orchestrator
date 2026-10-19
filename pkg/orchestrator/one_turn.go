@@ -191,7 +191,7 @@ func firstRune(s string) rune {
 func (ms *ManagedStream) logRunOns(gen int, u *TokenUsage) {
 	for _, c := range u.TakeRunOns() {
 		ms.logger.Info("Reply cut: the model went on past its turn",
-			"gen", gen, "reason", c.Reason(), "kept", clipForLog(c.Kept()), "dropped", clipForLog(c.Dropped()))
+			"gen", gen, "reason", c.Reason(), "kept", ContentForLog(c.Kept()), "dropped", ContentForLog(c.Dropped()))
 	}
 }
 

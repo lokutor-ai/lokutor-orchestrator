@@ -135,7 +135,7 @@ func (o *Orchestrator) ProcessAudio(ctx context.Context, session *ConversationSe
 	// Reject very short text (< 3 chars or single very short word) as likely noise
 	// Real speech typically has at least a few words or meaningful length
 	if len(trimmedText) < 3 {
-		o.logger.Warn("transcription too short - likely noise", "sessionID", session.ID, "text", trimmedText)
+		o.logger.Warn("transcription too short - likely noise", "sessionID", session.ID, "text", ContentForLog(trimmedText))
 		return "", nil, ErrEmptyTranscription
 	}
 
