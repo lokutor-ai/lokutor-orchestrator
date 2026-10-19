@@ -25,6 +25,8 @@ func responseTriggerFor(transcript string) string {
 		return "silence_timeout"
 	case farewellTrigger:
 		return "farewell"
+	case hostNoteTrigger:
+		return "host_note"
 	}
 	return ""
 }
@@ -94,6 +96,15 @@ func (ms *ManagedStream) llmMessages(transcript string) []Message {
 		note := ms.farewellNote
 		ms.mu.Unlock()
 		return append(msgs, Message{Role: "user", Content: note})
+	}
+	if transcript == hostNoteTrigger {
+		ms.mu.Lock()
+		instruction := ms.hostNoteInstruction
+		ms.mu.Unlock()
+		if instruction == "" {
+			return msgs
+		}
+		return append(msgs, Message{Role: "user", Content: instruction})
 	}
 	if transcript == silenceTimeoutTrigger && !callerAwaitingReply(msgs) {
 		timeout := 10 * time.Second

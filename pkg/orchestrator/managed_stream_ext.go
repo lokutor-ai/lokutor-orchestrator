@@ -796,7 +796,7 @@ func (ms *ManagedStream) getState() StreamState {
 }
 
 func (ms *ManagedStream) checkResponseCache(transcript string) (string, []byte, bool) {
-	if ms.responseCache == nil {
+	if ms.responseCache == nil || transcript == hostNoteTrigger { // a host note is news: never a cached reply
 		return "", nil, false
 	}
 	key := CacheKeyFor(transcript, ms.lastUserText)
@@ -809,7 +809,7 @@ func (ms *ManagedStream) checkResponseCache(transcript string) (string, []byte, 
 }
 
 func (ms *ManagedStream) cacheResponse(transcript, response string, audio []byte) {
-	if ms.responseCache == nil {
+	if ms.responseCache == nil || transcript == hostNoteTrigger {
 		return
 	}
 	key := CacheKeyFor(transcript, ms.lastUserText)
