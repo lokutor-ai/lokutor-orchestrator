@@ -244,7 +244,7 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 			// was running, the case that used to take this transcript for the turn's.
 			if displaced && err == nil {
 				ms.logger.Info("Speculative STT: an earlier pause's transcript finished during a later pause's pass and was discarded",
-					"attempt", attempt, "text", res.Text)
+					"attempt", attempt, "text", ContentForLog(res.Text))
 			}
 			return
 		}
@@ -277,7 +277,7 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		history, tail := ms.seedKnowledgeRequest(ms.ctx, seed, history)
 		ms.speculator.StartFromTranscriptWithTail(ms.ctx, ms.orch, seed, history, tail, ms.session.GetTools())
 		ms.logger.Info("Speculative LLM seeded from hangover transcript", "run", ms.speculator.RunID(),
-			"transcript", seed, "continues", continues, "state_before", before, "state_after", ms.speculator.State())
+			"transcript", ContentForLog(seed), "continues", continues, "state_before", before, "state_after", ms.speculator.State())
 	}()
 }
 

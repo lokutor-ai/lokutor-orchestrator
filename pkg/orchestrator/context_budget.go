@@ -221,7 +221,7 @@ func (s *ConversationSession) runFold(summarize HistorySummarizer, logger Logger
 	logger.Info("History folded into the call summary",
 		"turns_folded", len(turns), "summary_tokens", estimateTokens(summary),
 		"conversation_tokens_after", convTokens, "elapsed_ms", time.Since(started).Milliseconds(),
-		"summary", clipForLog(summary))
+		"summary", ContentForLog(summary))
 }
 
 // applyFoldLocked replaces the call summary and removes exactly the turns it now covers. It

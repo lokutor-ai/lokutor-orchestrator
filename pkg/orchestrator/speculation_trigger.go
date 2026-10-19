@@ -193,7 +193,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 		// messages glued after it show there, and they go (ReplyTurn).
 		if kept, cut := OneTurn(ctx, response); cut != nil {
 			ms.logger.Info("Reply cut: the model went on past its turn", "gen", "speculative",
-				"reason", cut.Reason(), "kept", clipForLog(kept), "dropped", clipForLog(cut.Dropped()))
+				"reason", cut.Reason(), "kept", ContentForLog(kept), "dropped", ContentForLog(cut.Dropped()))
 			response = kept
 		}
 	}
@@ -214,7 +214,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 		// sentence: a tool call written out, or leaked reasoning, becomes a miss and the turn is
 		// generated again instead (unspeakableReply).
 		if reason := unspeakableReply(response, ms.session.GetTools()); reason != "" {
-			ms.logger.Warn("Speculative reply discarded: not speech", "reason", reason, "text", response)
+			ms.logger.Warn("Speculative reply discarded: not speech", "reason", reason, "text", ContentForLog(response))
 			ok = false
 		}
 	}
@@ -276,7 +276,7 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.emitBotResponseWithGen(response, gen)
 	ms.cacheResponse(transcript, response, nil)
 
-	ms.logger.Info("Speculative LLM response used", "transcript", transcript)
+	ms.logger.Info("Speculative LLM response used", "transcript", ContentForLog(transcript))
 	ms.speakResponse(rCtx, response, gen)
 	ms.withdrawUnheardReply(gen, response)
 	return true

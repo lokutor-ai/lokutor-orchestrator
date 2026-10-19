@@ -564,7 +564,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			break
 		}
 		ms.logger.Warn("Not speaking: the model wrote its tool call or its reasoning as the reply",
-			"reason", unspeakable, "attempt", attempt, "gen", gen, "text", fullText.String())
+			"reason", unspeakable, "attempt", attempt, "gen", gen, "text", ContentForLog(fullText.String()))
 		fullText.Reset()
 		pendingSentence.Reset()
 		if said := strings.TrimSpace(strings.Join(spokenThisTry, " ")); said != "" {
@@ -756,7 +756,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			// the model's reasoning, went straight to the caller.
 			if reason := unspeakableReply(text, tools); reason != "" {
 				ms.logger.Warn("Not speaking after tool calls: the model wrote a tool call or its reasoning as the reply",
-					"reason", reason, "gen", gen, "text", text)
+					"reason", reason, "gen", gen, "text", ContentForLog(text))
 				// At "medium": asked again as it was, the same model writes the call out again 7 times in 9
 				// (low), and at medium 1 in 9 (a replay of a computer-control agent's calls against Cerebras,
 				// 2026-10-05, finance/measurements/tool_call_written_out_2026-10-05.json). It costs about twice
@@ -802,7 +802,7 @@ func (ms *ManagedStream) checkResponseCache(transcript string) (string, []byte, 
 	key := CacheKeyFor(transcript, ms.lastUserText)
 	response, audio, ok := ms.responseCache.Get(key)
 	if ok {
-		ms.logger.Info("Response cache hit", "key", key)
+		ms.logger.Info("Response cache hit", "key", ContentForLog(key))
 		ms.emit(CacheHit, key)
 	}
 	return response, audio, ok
