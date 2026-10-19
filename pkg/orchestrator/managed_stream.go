@@ -268,6 +268,12 @@ type ManagedStream struct {
 	ckEnterSpecMs int64
 	// farewellNote is what Farewell told the model (the reason the call is ending).
 	farewellNote string
+	// hostNoteInstruction is what HostNote asked the model to do now (host_note.go).
+	hostNoteInstruction string
+	// held is set while the host has the caller on hold (Hold): their audio is dropped before the VAD
+	// and the silence check-in waits. heldDropped counts the chunks dropped, logged when the hold ends.
+	held        atomic.Bool
+	heldDropped atomic.Int64
 	// responseTrigger is what started the response now being generated: "" for a caller's turn,
 	// or the bot-initiated reason ("opening", "silence_timeout"). A bot-initiated response has no
 	// caller turn behind it, so every caller-anchored clock above still holds the LAST caller turn's
@@ -3065,6 +3071,10 @@ func (ms *ManagedStream) internalInterrupt() {
 }
 
 func (ms *ManagedStream) Write(chunk []byte) error {
+	if ms.held.Load() { // on hold (Hold): counted and logged when the hold ends
+		ms.heldDropped.Add(1)
+		return nil
+	}
 	buf := make([]byte, len(chunk))
 	copy(buf, chunk)
 	select {
@@ -3834,6 +3844,9 @@ func (ms *ManagedStream) monitorInactivity() {
 
 			if ms.isClosed.Load() {
 				return
+			}
+			if ms.held.Load() { // on hold: nobody is expected to speak, and the hold's end restarts the clock
+				continue
 			}
 
 			if !thinking && !speaking && !userSpeaking {
