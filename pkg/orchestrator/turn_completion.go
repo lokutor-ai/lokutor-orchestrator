@@ -185,3 +185,11 @@ func (tca *TurnCompletionAnalyzer) CombinedCompletionScore(text string, duration
 
 	return (semantic * 0.6) + (temporal * 0.4)
 }
+
+// eouOrNil is the recogniser's end-of-turn probability for an experiment row, or nil when it gave none.
+func eouOrNil(r TranscriptionResult) interface{} {
+	if !r.HasEndOfTurn {
+		return nil
+	}
+	return r.EndOfTurn
+}
