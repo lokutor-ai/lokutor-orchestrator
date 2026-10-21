@@ -137,6 +137,7 @@ func (ms *ManagedStream) logBotInitiatedLatency(trigger string) {
 	}
 	ms.mu.Lock()
 	turnTokens := ms.turnTokens
+	gen := ms.payloadGen
 	ms.mu.Unlock()
 	response, llm := stageMs(ms.llmStartTime, first), stageMs(ms.llmStartTime, ms.llmEndTime)
 	llmToTTS, ttsFirst := stageMs(ms.llmEndTime, ms.ttsStartTime), stageMs(ms.ttsStartTime, first)
@@ -147,6 +148,7 @@ func (ms *ManagedStream) logBotInitiatedLatency(trigger string) {
 		}
 		ms.logger.Info("bot-initiated response latency",
 			"trigger", trigger,
+			"gen", gen, // as on "turn latency"
 			// llmStart -> first audio out: the whole time this response took to be heard.
 			"response_ms", response,
 			"llm_ms", llm,
