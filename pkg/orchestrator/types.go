@@ -28,6 +28,11 @@ func (n *NoOpLogger) Error(msg string, args ...interface{}) {}
 type TranscriptionResult struct {
 	Text         string
 	NoSpeechProb float64 // Probability that the audio contains no speech (0.0 to 1.0)
+	// EndOfTurn is the recogniser's probability that the speaker has finished their turn at the end of this audio,
+	// judged from what was said and how it ended (lokutor_tts's recogniser, "eou"); HasEndOfTurn is false when the
+	// recogniser gave none. It is what EndOfTurnThreshold decides on.
+	EndOfTurn    float64
+	HasEndOfTurn bool
 }
 
 type STTProvider interface {
@@ -325,6 +330,18 @@ type Config struct {
 	// the user. Those are not symmetric, which is why this errs toward
 	// holding. Zero disables the hold.
 	TurnoHoldThreshold float32
+
+	// EndOfTurnThreshold: when the recogniser reports an end-of-turn probability (TranscriptionResult.EndOfTurn),
+	// a turn below this value is treated as unfinished and waits EndOfTurnWaitMs for the caller to go on, and a turn
+	// at or above it is answered at once, whatever its punctuation says. The lexical gate decides when there is no
+	// probability. It replaces the lexical verdict because the recogniser ends every transcript with a full stop,
+	// so "I'd like to book an appointment for." read as finished and was answered after the VAD hangover alone.
+	// Zero keeps the lexical gate and only logs the probability beside it (shadow).
+	EndOfTurnThreshold float64
+
+	// EndOfTurnWaitMs is how long a turn the recogniser calls unfinished waits for more speech; zero uses
+	// SilenceConfirmationMs.
+	EndOfTurnWaitMs int
 
 	// TurnoHoldMs is how long a Turno-flagged turn is held. Deliberately much
 	// shorter than SilenceConfirmationMs: the text does look complete, so this

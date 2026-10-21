@@ -2057,6 +2057,17 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.mu.Unlock()
 
 	lexicalComplete := ms.turnComp == nil || ms.turnComp.IsLikelyComplete(transcript)
+
+	// The recogniser's end-of-turn probability, when it gives one: logged beside the lexical verdict on every turn
+	// (the same ground truth below scores both), and the decision when EndOfTurnThreshold is set.
+	eouThr := ms.orch.config.EndOfTurnThreshold
+	eouDecides := result.HasEndOfTurn && eouThr > 0
+	eouComplete := !result.HasEndOfTurn || result.EndOfTurn >= eouThr
+	if result.HasEndOfTurn {
+		ms.logger.Info("End of turn",
+			"eou", result.EndOfTurn, "lexical_complete", lexicalComplete, "threshold", eouThr, "decides", eouDecides,
+			"transcript", ContentForLog(transcript))
+	}
 	ms.mu.Lock()
 	turnoLabel, turnoFrames := ms.turnoLastTurnLabel, ms.turnoTurnStateFrames
 	turnoState, turnoHorizon := ms.turnoLastTurnState, ms.turnoLastHorizon
@@ -2092,6 +2103,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"speech_frames":    turnoFrames,
 				"transcript_chars": len(transcript),
 				"transcript_words": countWords(transcript),
+				"eou":              eouOrNil(result),
 			}, nil)
 	}
 
@@ -2102,18 +2114,26 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// on text that looks incomplete. That is the case where the agent talks
 	// over a continuation.
 	turnoSaysHold := false
-	if thr := ms.orch.config.TurnoHoldThreshold; thr > 0 && ms.turnoTurn != nil && turnoFrames > 0 {
+	if thr := ms.orch.config.TurnoHoldThreshold; thr > 0 && !eouDecides && ms.turnoTurn != nil && turnoFrames > 0 {
 		// p_incomplete + p_wait: "not finished" and "pausing, expecting to go
 		// on" are both reasons to keep the floor with the caller.
 		turnoSaysHold = (turnoState[1] + turnoState[3]) >= thr
 	}
 
-	if ms.turnComp != nil && (!lexicalComplete || turnoSaysHold) {
+	// The verdict: the recogniser's when it decides, the lexical gate's (and Turno's hold) otherwise.
+	unfinished := !lexicalComplete || turnoSaysHold
+	if eouDecides {
+		unfinished = !eouComplete
+	}
+	if ms.turnComp != nil && unfinished {
 		waitMs := ms.orch.config.SilenceConfirmationMs
 		if waitMs <= 0 {
 			waitMs = 800
 		}
-		if lexicalComplete && turnoSaysHold {
+		if eouDecides && ms.orch.config.EndOfTurnWaitMs > 0 {
+			waitMs = ms.orch.config.EndOfTurnWaitMs
+		}
+		if !eouDecides && lexicalComplete && turnoSaysHold {
 			// Text looks done and only prosody disagrees, so this is a grace
 			// window rather than a full mid-thought wait.
 			hold := ms.orch.config.TurnoHoldMs
@@ -2139,8 +2159,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// the same risk the lexical gate beside it is already taking. The gate
 		// still runs, and a user who resumes inside the shortened window still
 		// reclaims the turn.
+		// Not when the recogniser decided: its probability is the stronger signal, and shortening its wait to 150 ms
+		// on Turno's low-precision horizon would undo it.
 		horizonAssisted := false
-		if thr := ms.orch.config.TurnoHorizonAssistThreshold; thr > 0 &&
+		if thr := ms.orch.config.TurnoHorizonAssistThreshold; thr > 0 && !eouDecides &&
 			!lexicalComplete && !turnoSaysHold &&
 			ms.turnoTurn != nil && turnoFrames > 0 && turnoHorizon[0] >= thr {
 			factor := ms.orch.config.TurnoHorizonAssistFactor
