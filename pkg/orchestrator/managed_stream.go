@@ -1083,6 +1083,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	specMissTail := ms.specMissTailMs
 	ckEnterSpec := ms.ckEnterSpecMs
 	turnTokens := ms.turnTokens
+	gen := ms.payloadGen
 	ms.mu.Unlock()
 
 	// Token counts for this turn. -1, not 0, when the provider reported nothing: language-model
@@ -1109,7 +1110,7 @@ func (ms *ManagedStream) logTurnLatency() {
 		ms.logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
 			ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm,
 			turnTokens.AnsweredBy(), promptTok, completionTok, totalTok, trimmed, folded,
-			llmToTTS, ttsFirst, discarded, unaccounted, ttfa, sttSpeculative)
+			llmToTTS, ttsFirst, discarded, unaccounted, ttfa, sttSpeculative, gen)
 	})
 }
 
@@ -1136,8 +1137,12 @@ func whenTokensSettled(u *TokenUsage, log func()) {
 func (ms *ManagedStream) logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
 	ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm int64,
 	provider string, promptTok, completionTok, totalTok, trimmed, folded int,
-	llmToTTS, ttsFirst, discarded, unaccounted, ttfa int64, sttSpeculative bool) {
+	llmToTTS, ttsFirst, discarded, unaccounted, ttfa int64, sttSpeculative bool, gen int) {
 	ms.logger.Info("turn latency",
+		// The turn's generation, as on "Turn tokens after tools": the token counts below are the turn's
+		// running total at first audio, and that line's the total once its tools are done, so a host that
+		// adds them up per turn subtracts the one from the other.
+		"gen", gen,
 		// The caller's clock: last voiced frame -> first audio out.
 		"e2e_ms", e2e,
 		// Silence the VAD required before it would call the turn over.
