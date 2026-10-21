@@ -2225,7 +2225,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				ms.confirmationGate = nil
 			}
 			// Not dropped: the caller's next utterance is transcribed together with this one.
-			ms.carry = &committedUtterance{audio: uttAudio, transcript: transcript, endedAt: uttEndedAt, gen: ms.payloadGen}
+			ms.carry = &committedUtterance{audio: uttAudio, transcript: transcript, endedAt: uttEndedAt, gen: ms.payloadGen, seq: seq}
 			ms.mu.Unlock()
 			ms.resolvePendingBargeInFor(true)
 			return
@@ -2371,6 +2371,11 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		bargeBase := ms.bargeBaseLocked(time.Now(), seq, pendingBarge)
 		ms.mu.Unlock()
 		if bargeBase != nil {
+			// Ground truth for the end-of-turn verdicts: the caller went on talking over the reply to their previous
+			// utterance before hearing much of it, so that turn was answered mid-sentence. Filed under the earlier
+			// turn's unit, beside the eou and lexical verdict recorded for it, as the gate's own resume label is.
+			ms.recordExperiment(turnoTurnCompletionExperiment, "v6", ms.openingUnitID(bargeBase.seq), nil,
+				map[string]interface{}{"truly_incomplete": true, "via": "spoke_over_reply"})
 			ms.session.mu.Lock()
 			_, tailOK := mergeableTail(ms.session.Context)
 			ms.session.mu.Unlock()
@@ -2422,7 +2427,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		ms.session.AddMessage("user", transcript)
 	}
 	ms.mu.Lock()
-	ms.lastUtt = &committedUtterance{audio: uttAudio, transcript: transcript, endedAt: uttEndedAt, gen: ms.payloadGen}
+	ms.lastUtt = &committedUtterance{audio: uttAudio, transcript: transcript, endedAt: uttEndedAt, gen: ms.payloadGen, seq: seq}
 	ms.mu.Unlock()
 
 	// If a newer utterance already arrived, skip LLM — the newest
