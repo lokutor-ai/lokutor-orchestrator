@@ -252,6 +252,8 @@ type committedUtterance struct {
 	endedAt    time.Time
 	// gen is ms.payloadGen when it was committed: its reply is any later generation.
 	gen int
+	// seq is its utterance number, the unit its turn-completion experiment row is filed under.
+	seq int
 }
 
 // joinUtteranceAudio is prev + a short silence + next, as one recogniser input (16-bit PCM).
