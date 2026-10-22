@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -85,5 +87,44 @@ func TestEndOfTurnAltDecidesWhenChosen(t *testing.T) {
 	}
 	if w := eouTurnWait(t, eouSTT{text, 0.95, true, &low}, 0.7); w != 0 {
 		t.Fatalf("eou decides by default: finished, yet waited %d ms", w)
+	}
+}
+
+// A turn the end-of-turn wait held is answered whatever its continuation turns out to be. The caller resumed
+// with "hours", the recogniser returned nothing for it alone (or a filler), and discarding that as noise used to drop
+// the held "Can you tell me your opening" too: the caller got silence (2026-10-22, live, with EOU_THRESHOLD on).
+func TestHeldTurnIsAnsweredWhenItsContinuationIsEmpty(t *testing.T) {
+	for _, cont := range []string{"", "Mm."} {
+		t.Run("continuation "+cont, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SilenceTimeout = 0
+			cfg.SilenceConfirmationMs = 200
+			llm := &sequencedLLM{responses: []string{"We open at nine."}}
+			orch := NewWithAllLayers(eouSTT{cont, 0, false, nil}, llm, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+			stream := orch.NewManagedStream(context.Background(), NewConversationSession("held"))
+			defer stream.Close()
+			stream.mu.Lock()
+			stream.carry = &committedUtterance{audio: make([]byte, 32000), transcript: "Can you tell me your opening",
+				endedAt: time.Now(), gen: stream.payloadGen, seq: 1}
+			stream.state = StateProcessing
+			stream.utteranceSeq = 2
+			stream.inflightUtterances = 1
+			stream.mu.Unlock()
+			stream.processUtterance(make([]byte, 8000), 250*time.Millisecond, 2)
+			if atomic.LoadInt32(&llm.call) == 0 {
+				t.Fatal("the held turn was never answered")
+			}
+			stream.session.mu.Lock()
+			defer stream.session.mu.Unlock()
+			found := false
+			for _, m := range stream.session.Context {
+				if m.Role == "user" && strings.Contains(m.Content, "opening") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("the held words are not in the conversation: %+v", stream.session.Context)
+			}
+		})
 	}
 }

@@ -861,7 +861,10 @@ func (ms *ManagedStream) awaitJoint(ctx context.Context, joint *jointTranscripti
 		joint.cancel()
 		return "", "cancelled"
 	}
-	if joint.err != nil || !acceptMerged(joint.text, own) {
+	// Nor may it say less than the earlier half alone: with an empty continuation (a held turn completed by a lone
+	// word the recogniser could not read) the rule above accepts any joint text, and one that lost the held words
+	// would replace them; the two halves joined as text keep them.
+	if joint.err != nil || !acceptMerged(joint.text, own) || countWords(spaceSentences(joint.text)) < countWords(joint.base.transcript) {
 		return "", "not used"
 	}
 	return restoreQuestionMark(spaceSentences(joint.text), ms.session.GetCurrentLanguage()), ""
