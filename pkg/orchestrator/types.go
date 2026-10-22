@@ -355,10 +355,10 @@ type Config struct {
 	// instead of EndOfTurn.
 	EndOfTurnUseAlt bool
 
-	// EndOfTurnOpenThreshold: a turn held as unfinished whose words read as clearly unfinished (EndOfTurnText, or
-	// EndOfTurnAlt without it, below this: "...una cita para el", "...and like") waits EndOfTurnOpenWaitMs instead of
-	// EndOfTurnWaitMs. A caller who stops on an open phrase is almost always going on, often after a longer pause than a
-	// short wait allows. Zero disables it.
+	// EndOfTurnOpenThreshold: a turn held as unfinished that is clearly unfinished, by its words (EndOfTurnText, or
+	// EndOfTurnAlt without it) or by the deciding probability itself, either below this ("...una cita para el",
+	// "...and like"), waits EndOfTurnOpenWaitMs instead of EndOfTurnWaitMs. A caller who stops there is almost always
+	// going on, often after a longer pause than a short wait allows. Zero disables it.
 	EndOfTurnOpenThreshold float64
 	EndOfTurnOpenWaitMs    int
 
