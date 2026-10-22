@@ -193,3 +193,11 @@ func eouOrNil(r TranscriptionResult) interface{} {
 	}
 	return r.EndOfTurn
 }
+
+// eouAltOrNil is the recogniser's second end-of-turn probability for an experiment row, or nil when it gave none.
+func eouAltOrNil(r TranscriptionResult) interface{} {
+	if !r.HasEndOfTurnAlt {
+		return nil
+	}
+	return r.EndOfTurnAlt
+}

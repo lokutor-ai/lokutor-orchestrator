@@ -2061,11 +2061,16 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// The recogniser's end-of-turn probability, when it gives one: logged beside the lexical verdict on every turn
 	// (the same ground truth below scores both), and the decision when EndOfTurnThreshold is set.
 	eouThr := ms.orch.config.EndOfTurnThreshold
-	eouDecides := result.HasEndOfTurn && eouThr > 0
-	eouComplete := !result.HasEndOfTurn || result.EndOfTurn >= eouThr
-	if result.HasEndOfTurn {
+	eouVal, eouHas := result.EndOfTurn, result.HasEndOfTurn
+	if ms.orch.config.EndOfTurnUseAlt {
+		eouVal, eouHas = result.EndOfTurnAlt, result.HasEndOfTurnAlt
+	}
+	eouDecides := eouHas && eouThr > 0
+	eouComplete := !eouHas || eouVal >= eouThr
+	if result.HasEndOfTurn || result.HasEndOfTurnAlt {
 		ms.logger.Info("End of turn",
-			"eou", result.EndOfTurn, "lexical_complete", lexicalComplete, "threshold", eouThr, "decides", eouDecides,
+			"eou", eouOrNil(result), "eou_alt", eouAltOrNil(result), "uses_alt", ms.orch.config.EndOfTurnUseAlt,
+			"lexical_complete", lexicalComplete, "threshold", eouThr, "decides", eouDecides,
 			"transcript", ContentForLog(transcript))
 	}
 	ms.mu.Lock()
@@ -2104,6 +2109,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"transcript_chars": len(transcript),
 				"transcript_words": countWords(transcript),
 				"eou":              eouOrNil(result),
+				"eou_alt":          eouAltOrNil(result),
 			}, nil)
 	}
 
