@@ -11,17 +11,23 @@ type eouSTT struct {
 	text string
 	eou  float64
 	has  bool
+	alt  *float64
 }
 
 func (s eouSTT) Transcribe(ctx context.Context, audio []byte, lang Language) (TranscriptionResult, error) {
-	return TranscriptionResult{Text: s.text, EndOfTurn: s.eou, HasEndOfTurn: s.has}, nil
+	r := TranscriptionResult{Text: s.text, EndOfTurn: s.eou, HasEndOfTurn: s.has}
+	if s.alt != nil {
+		r.EndOfTurnAlt, r.HasEndOfTurnAlt = *s.alt, true
+	}
+	return r, nil
 }
 func (s eouSTT) Name() string { return "eou" }
 
 // eouTurnWait runs one utterance through processUtterance and reports how long it waited for the caller to go on.
-func eouTurnWait(t *testing.T, stt eouSTT, threshold float64) int64 {
+func eouTurnWait(t *testing.T, stt eouSTT, threshold float64, useAlt ...bool) int64 {
 	t.Helper()
 	cfg := DefaultConfig()
+	cfg.EndOfTurnUseAlt = len(useAlt) > 0 && useAlt[0]
 	cfg.SilenceTimeout = 0
 	cfg.SilenceConfirmationMs = 300
 	cfg.EndOfTurnThreshold = threshold
@@ -50,10 +56,10 @@ func TestEndOfTurnProbabilityDecidesTheWait(t *testing.T) {
 		threshold float64
 		wantWait  bool
 	}{
-		{"low probability waits though the text ends in a full stop", eouSTT{"I'd like to book an appointment for.", 0.1, true}, 0.7, true},
-		{"high probability answers though the words trail off", eouSTT{"I want to book a table, and", 0.95, true}, 0.7, false},
-		{"shadow: no threshold leaves the full stop's verdict", eouSTT{"I'd like to book an appointment for.", 0.1, true}, 0, false},
-		{"no probability falls back to the lexical gate", eouSTT{"I want to book a table, and", 0, false}, 0.7, true},
+		{"low probability waits though the text ends in a full stop", eouSTT{"I'd like to book an appointment for.", 0.1, true, nil}, 0.7, true},
+		{"high probability answers though the words trail off", eouSTT{"I want to book a table, and", 0.95, true, nil}, 0.7, false},
+		{"shadow: no threshold leaves the full stop's verdict", eouSTT{"I'd like to book an appointment for.", 0.1, true, nil}, 0, false},
+		{"no probability falls back to the lexical gate", eouSTT{"I want to book a table, and", 0, false, nil}, 0.7, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			waited := eouTurnWait(t, tc.stt, tc.threshold)
@@ -64,5 +70,20 @@ func TestEndOfTurnProbabilityDecidesTheWait(t *testing.T) {
 				t.Fatalf("waited %d ms, want an answer at once", waited)
 			}
 		})
+	}
+}
+
+// With two heads scored, EndOfTurnUseAlt picks the one that decides; the other is only logged.
+func TestEndOfTurnAltDecidesWhenChosen(t *testing.T) {
+	low, high := 0.1, 0.95
+	text := "I'd like to book an appointment for."
+	if w := eouTurnWait(t, eouSTT{text, 0.95, true, &low}, 0.7, true); w < 150 {
+		t.Fatalf("alt says unfinished but waited %d ms", w)
+	}
+	if w := eouTurnWait(t, eouSTT{text, 0.1, true, &high}, 0.7, true); w != 0 {
+		t.Fatalf("alt says finished but waited %d ms", w)
+	}
+	if w := eouTurnWait(t, eouSTT{text, 0.95, true, &low}, 0.7); w != 0 {
+		t.Fatalf("eou decides by default: finished, yet waited %d ms", w)
 	}
 }

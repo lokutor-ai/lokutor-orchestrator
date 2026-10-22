@@ -33,6 +33,10 @@ type TranscriptionResult struct {
 	// recogniser gave none. It is what EndOfTurnThreshold decides on.
 	EndOfTurn    float64
 	HasEndOfTurn bool
+	// EndOfTurnAlt is a second end-of-turn probability the recogniser scores on the same audio ("eou_alt", another head
+	// under evaluation); both are logged, EndOfTurnUseAlt picks the one that decides.
+	EndOfTurnAlt    float64
+	HasEndOfTurnAlt bool
 }
 
 type STTProvider interface {
@@ -342,6 +346,10 @@ type Config struct {
 	// EndOfTurnWaitMs is how long a turn the recogniser calls unfinished waits for more speech; zero uses
 	// SilenceConfirmationMs.
 	EndOfTurnWaitMs int
+
+	// EndOfTurnUseAlt makes EndOfTurnAlt (the recogniser's second head) the probability EndOfTurnThreshold decides on,
+	// instead of EndOfTurn.
+	EndOfTurnUseAlt bool
 
 	// TurnoHoldMs is how long a Turno-flagged turn is held. Deliberately much
 	// shorter than SilenceConfirmationMs: the text does look complete, so this
