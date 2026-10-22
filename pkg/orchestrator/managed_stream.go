@@ -1925,7 +1925,26 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.sttEndTime = time.Now()
 	ms.lastNoSpeechProb = result.NoSpeechProb
 
-	if ms.isLikelyNoise(result, duration) {
+	// A turn the end-of-turn wait held (ms.carry) is answered whatever its continuation turns out to be. The caller
+	// resumed, so the wait abandoned the turn's reply and left it for this utterance to complete; when this one is
+	// noise, a filler or empty (a lone "hours" the recogniser cannot read on its own), discarding it as before dropped
+	// the held turn as well, and the caller got silence. With a held turn, such a continuation falls through to the
+	// merge below, which uses the two transcribed together if that pass is ready, else the held words alone.
+	ms.mu.Lock()
+	heldTurn := ms.carry != nil && time.Since(ms.carry.endedAt) <= continuationMergeWindow
+	ms.mu.Unlock()
+	keepHeld := func(why string) bool {
+		if !heldTurn {
+			return false
+		}
+		ms.logger.Info("Continuation of a held turn is "+why+": answering the held turn",
+			"transcript", ContentForLog(result.Text), "no_speech_prob", result.NoSpeechProb,
+			"audio_duration_ms", duration.Milliseconds())
+		result.Text = ""
+		return true
+	}
+
+	if ms.isLikelyNoise(result, duration) && !keepHeld("noise") {
 		// False alarm — if this cut off a tentative barge-in, resume the bot
 		// instead of leaving the caller with dead air. Logged with the raw
 		// (possibly gibberish) transcript and the scores that drove the
@@ -1951,7 +1970,11 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.mu.Lock()
 	overAgent := ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen
 	ms.mu.Unlock()
-	switch recogniserFillerVerdict(result.Text, lang, duration, overAgent) {
+	verdict := recogniserFillerVerdict(result.Text, lang, duration, overAgent)
+	if verdict != fillerNone && result.Text != "" && keepHeld("a filler") {
+		verdict = fillerNone
+	}
+	switch verdict {
 	case fillerDiscard:
 		ms.logger.Info("Utterance discarded as noise, resuming bot",
 			"transcript", ContentForLog(result.Text), "reason", "recogniser_filler", "over_agent", overAgent,
@@ -1980,7 +2003,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			"before", ContentForLog(transcript), "after", ContentForLog(restored))
 		transcript = restored
 	}
-	if transcript == "" {
+	if transcript == "" && !heldTurn {
 		// A short empty transcript is a cough, a door, a breath — silence is the
 		// right answer and saying anything would be worse.
 		//
