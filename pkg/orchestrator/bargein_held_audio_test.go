@@ -170,3 +170,68 @@ func TestHeldAudioIsNotFlushedAcrossGenerations(t *testing.T) {
 		t.Errorf("flushed %d frames from a superseded generation into the current turn", len(got))
 	}
 }
+
+// A short reply finishes synthesising inside the barge-in window (~150-220 ms): its frames are held
+// with nothing left running. A false alarm then plays them, and the stream goes back to idle once they
+// are out, where synthesis ending would have left it. Dropping them lost the reply whole: 14 of 705
+// production turns in the 7 days to 2026-10-22 logged it.
+func TestFalseAlarmPlaysHeldFramesOfAFinishedReply(t *testing.T) {
+	ms := newHeldAudioStream(t)
+	frames := [][]byte{{1, 1}, {2, 2}, {3, 3}}
+	for _, f := range frames {
+		ms.emitWithGen(AudioChunk, f, 0)
+	}
+	ms.ttsCancel = nil // synthesis finished while the frames were held
+
+	ms.vadSpeaking = false
+	ms.resolvePendingBargeIn()
+
+	var resumed []string
+	var audio [][]byte
+	for done := false; !done; {
+		select {
+		case ev := <-ms.events:
+			switch ev.Type {
+			case BotResumed:
+				resumed = append(resumed, ev.Data.(string))
+			case AudioChunk:
+				audio = append(audio, ev.Data.([]byte))
+			}
+		default:
+			done = true
+		}
+	}
+	if len(audio) != len(frames) {
+		t.Fatalf("played %d held frames of a finished reply, want %d", len(audio), len(frames))
+	}
+	if len(resumed) != 1 || resumed[0] != "speaking" {
+		t.Fatalf("BotResumed = %v, want one \"speaking\"", resumed)
+	}
+	if ms.state != StateIdle {
+		t.Fatalf("state = %v after the held frames went out, want StateIdle", ms.state)
+	}
+	if ms.heldAudioBytes != 0 || ms.pendingBargeIn {
+		t.Fatalf("held %d bytes, pending %v after the resume", ms.heldAudioBytes, ms.pendingBargeIn)
+	}
+}
+
+// The same with the turn still generating its next sentence: the frames play, and the stream is left
+// processing, for that sentence's synthesis to take over.
+func TestFalseAlarmPlaysHeldFramesBetweenSentences(t *testing.T) {
+	ms := newHeldAudioStream(t)
+	ms.emitWithGen(AudioChunk, []byte{7, 7}, 0)
+	ms.ttsCancel = nil
+	pctx, pcancel := context.WithCancel(context.Background())
+	defer pcancel()
+	ms.pipelineCtx, ms.pipelineCancel = pctx, pcancel
+
+	ms.vadSpeaking = false
+	ms.resolvePendingBargeIn()
+
+	if got := drainAudio(ms.events); len(got) != 1 {
+		t.Fatalf("played %d held frames, want 1", len(got))
+	}
+	if ms.state != StateProcessing {
+		t.Fatalf("state = %v, want StateProcessing while the turn is still generating", ms.state)
+	}
+}

@@ -1513,11 +1513,25 @@ func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 	// must leave evidence. The echo check says again what was lost (settleEchoVeto); the other false
 	// alarms (noise, too few words) leave it lost.
 	lostGen, lostLen, heldDropped := -1, 0, 0
+	// Set when the held frames are played with synthesis already finished: the state is put back
+	// once they have gone out.
+	settleAfterFlush := false
 	switch {
 	case ms.ttsCancel != nil:
 		ms.state = StateSpeaking
 		resumedGen = ms.payloadGen
 		resumedStatus = "speaking"
+	case ms.heldAudioGen == ms.payloadGen && len(ms.heldAudio) > 0:
+		// Synthesis has finished, but frames it made during the barge-in never reached the caller.
+		// A short reply is synthesised in ~150-220 ms, so a sound just after it starts holds nearly
+		// all of it: these frames were dropped, and the caller heard a blip of the reply and nothing
+		// more ("False alarm over a reply that cannot be resumed", 14 of 705 turns in the 7 days to
+		// 2026-10-22; a probe's trailing "for", transcribed empty, lost "Sure, what day and time works
+		// for you?" whole). They are played now, as while synthesis is still running.
+		ms.state = StateSpeaking
+		resumedGen = ms.payloadGen
+		resumedStatus = "speaking"
+		settleAfterFlush = true
 	case ms.pipelineCancel != nil && ms.pipelineCtx != nil && ms.pipelineCtx.Err() == nil:
 		// A turn still in flight (the reply is being generated). pipelineCancel alone is not
 		// that: it stays set after a turn finishes, so a false alarm over a finished reply used to
@@ -1556,6 +1570,20 @@ func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 		for _, c := range ms.takeHeldAudio(resumedGen) {
 			ms.emitWithGen(AudioChunk, c, resumedGen)
 		}
+	}
+	if settleAfterFlush {
+		// Where synthesis ending would have left it: idle, or processing while the turn is still
+		// generating its next sentence. Unless something has moved on since (a new sentence started
+		// synthesising, a new barge-in, a new turn).
+		ms.mu.Lock()
+		if ms.state == StateSpeaking && ms.payloadGen == resumedGen && ms.ttsCancel == nil && !ms.pendingBargeIn {
+			if ms.pipelineCancel != nil && ms.pipelineCtx != nil && ms.pipelineCtx.Err() == nil {
+				ms.state = StateProcessing
+			} else {
+				ms.state = StateIdle
+			}
+		}
+		ms.mu.Unlock()
 	}
 }
 
