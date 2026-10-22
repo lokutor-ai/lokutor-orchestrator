@@ -129,6 +129,66 @@ func TestHeldTurnIsAnsweredWhenItsContinuationIsEmpty(t *testing.T) {
 	}
 }
 
+// The caller resumed while the end-of-turn wait held their turn, so the stream was Processing and onVADStart opened a
+// tentative barge-in for the resumption. Its continuation was one word ("11.", 180 ms): the word gate counted it alone,
+// called it a too-short barge-in, and the false alarm dropped the held "How does Locke compared to?" with it. No reply,
+// nothing to resume, and the silence check-in ~10 s later (2026-10-22, live, a sentence the VAD split in two). The gate
+// counts the words of the turn being answered.
+func TestHeldTurnContinuationIsNotJudgedAsAOneWordBargeIn(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	cfg.SilenceConfirmationMs = 200
+	llm := &sequencedLLM{responses: []string{"Lokutor runs its own models."}}
+	orch := NewWithAllLayers(eouSTT{"11.", 0.9, true, nil}, llm, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("held-barge"))
+	defer stream.Close()
+	stream.mu.Lock()
+	stream.carry = &committedUtterance{audio: make([]byte, 32000), transcript: "How does Locke compared to?",
+		endedAt: time.Now(), gen: stream.payloadGen, seq: 1}
+	stream.pendingBargeIn = true
+	stream.pendingBargeGen = stream.payloadGen
+	stream.state = StateListening
+	stream.utteranceSeq = 2
+	stream.inflightUtterances = 1
+	stream.mu.Unlock()
+	stream.processUtterance(make([]byte, 5760), 180*time.Millisecond, 2)
+	if atomic.LoadInt32(&llm.call) == 0 {
+		t.Fatal("the held turn was dropped as a one-word barge-in")
+	}
+	stream.session.mu.Lock()
+	defer stream.session.mu.Unlock()
+	found := false
+	for _, m := range stream.session.Context {
+		if m.Role == "user" && strings.Contains(m.Content, "compared") && strings.Contains(m.Content, "11") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the turn answered is not the two halves together: %+v", stream.session.Context)
+	}
+}
+
+// A one-word utterance over the agent that continues nothing is still a false alarm: the gate's purpose is unchanged.
+func TestOneWordBargeInWithoutAHeldTurnIsStillAFalseAlarm(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	llm := &sequencedLLM{responses: []string{"Sure."}}
+	orch := NewWithAllLayers(eouSTT{"Mm.", 0.9, true, nil}, llm, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+	stream := orch.NewManagedStream(context.Background(), NewConversationSession("one-word"))
+	defer stream.Close()
+	stream.mu.Lock()
+	stream.pendingBargeIn = true
+	stream.pendingBargeGen = stream.payloadGen
+	stream.state = StateListening
+	stream.utteranceSeq = 1
+	stream.inflightUtterances = 1
+	stream.mu.Unlock()
+	stream.processUtterance(make([]byte, 5760), 180*time.Millisecond, 1)
+	if n := atomic.LoadInt32(&llm.call); n != 0 {
+		t.Fatalf("a one-word barge-in over the agent was answered (%d model calls)", n)
+	}
+}
+
 // A held turn whose words read as clearly unfinished gets the longer margin; one that only sounds unfinished keeps the
 // short wait. Measured the same way as TestEndOfTurnProbabilityDecidesTheWait (confirmWaitMs).
 func TestClearlyOpenWordsGetTheLongerWait(t *testing.T) {
