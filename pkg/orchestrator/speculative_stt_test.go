@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -295,5 +296,52 @@ func TestSpecSTTRejectedWhenAShortWordFollowsTheSnapshot(t *testing.T) {
 	quiet.finish(TranscriptionResult{Text: "what are your opening hours"}, nil)
 	if _, ok, _ := quiet.awaitUsable(context.Background(), 8, snap+480*testBytesPerMs, testBytesPerMs, defaultSpecSTTMaxTailMs); !ok {
 		t.Fatal("voice before the snapshot must not reject it")
+	}
+}
+
+// toneAt is ms of a 16 kHz sine whose RMS is db dBFS.
+func toneAt(db float64, ms int) []byte {
+	n := 16 * ms
+	amp := math.Pow(10, db/20) * math.Sqrt2 * 32768
+	out := make([]byte, 2*n)
+	for i := 0; i < n; i++ {
+		v := int16(amp * math.Sin(2*math.Pi*200*float64(i)/16000))
+		out[2*i], out[2*i+1] = byte(v), byte(uint16(v)>>8)
+	}
+	return out
+}
+
+// A soft last word the VAD never calls voiced still rejects the snapshot when it is loud against the sentence:
+// Silero scored a rendered "for" 0.036-0.040 under a 0.065 threshold while it was 10 dB under the peak. The hangover's
+// own quiet, and a click, do not.
+func TestSpecSTTRejectedWhenASoftWordFollowsTheSnapshot(t *testing.T) {
+	if db := peakFrameDbfs(append(toneAt(-40, 100), toneAt(-28, 40)...), 640); math.Abs(db+28) > 0.5 {
+		t.Fatalf("peakFrameDbfs = %.1f, want -28", db)
+	}
+	snap := 32000
+	for _, c := range []struct {
+		name   string
+		frames [][]byte
+		usable bool
+	}{
+		{"\"for\": 60 ms at peak-10 dB", [][]byte{toneAt(-38, 20), toneAt(-37, 20), toneAt(-38, 20)}, false},
+		{"the hangover's quiet at peak-26 dB", [][]byte{toneAt(-54, 20), toneAt(-55, 20), toneAt(-54, 20), toneAt(-54, 20)}, true},
+		{"a 20 ms click", [][]byte{toneAt(-30, 20), toneAt(-60, 20)}, true},
+	} {
+		var s specSTT
+		if !s.begin(snap, 3) {
+			t.Fatal("begin refused")
+		}
+		s.setSpeechPeak(-28)
+		s.finish(TranscriptionResult{Text: "I'd like to book an appointment."}, nil)
+		time.Sleep(2 * time.Millisecond)
+		for _, f := range c.frames {
+			s.noteAudio(f, time.Now())
+		}
+		_, ok, _ := s.awaitUsable(context.Background(), 3, snap+300*testBytesPerMs, testBytesPerMs, defaultSpecSTTMaxTailMs)
+		if ok != c.usable {
+			_, loud := s.heardAfter()
+			t.Errorf("%s: usable = %v, want %v (loud_ms_after %d)", c.name, ok, c.usable, loud)
+		}
 	}
 }

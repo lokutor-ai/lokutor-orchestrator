@@ -898,6 +898,8 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 			ms.lastVoicedAt = time.Now()
 			ms.specSTT.noteVoiced(ms.lastVoicedAt)
 		}
+		// And by level: a soft last word can stay under the VAD's threshold all the way through.
+		ms.specSTT.noteAudio(audioChunk16k, time.Now())
 
 		// Spend the VAD hangover transcribing rather than waiting. By the time
 		// the hangover starts counting, every speech sample is already in the
@@ -1914,6 +1916,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			specUsed = true
 			ms.logger.Info("Using speculative STT from the VAD hangover",
 				"waited_ms", waited.Milliseconds(), "text", ContentForLog(result.Text))
+		} else if voiced, loudMs := ms.specSTT.heardAfter(); voiced >= specVoicedFramesAfter || loudMs >= specLoudMsAfter {
+			// Costs the turn a full transcription (~100-250 ms); logged so the rate can be read.
+			ms.logger.Info("Speculative STT not used: the caller said more after its snapshot",
+				"voiced_frames_after", voiced, "loud_ms_after", loudMs)
 		}
 	}
 

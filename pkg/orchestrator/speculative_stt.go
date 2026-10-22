@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -98,6 +99,13 @@ type specSTT struct {
 	// is ~3 VAD frames); fewer is the VAD flickering on a word's trailing edge, which must not throw away the
 	// snapshot's head start.
 	voicedAfter int
+	// speechPeakDb is the loudest 20 ms of the snapshot's speech (dBFS; 0 until setSpeechPeak), and loudMsAfter how
+	// much audio after startedAt came within specLoudBelowPeakDb of it. The VAD alone misses a soft last word: on a
+	// rendered "I'd like to book an appointment for", Silero scored "for" 0.036-0.040 against a 0.065 threshold while
+	// it was 10 dB under the sentence's peak, so no frame after the snapshot counted as voiced and the turn arrived as
+	// "...an appointment." (2026-10-22).
+	speechPeakDb float64
+	loudMsAfter  int
 
 	// cancel stops the pass in flight. invalidate() calls it: the result would be discarded anyway, and a pass
 	// still denoising skips its recognition request (2026-10-16).
@@ -239,6 +247,9 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 	if !ok {
 		return // already running (or already finished) for this pause
 	}
+	if rate := int(ms.inputSampleRate); rate > 0 {
+		ms.specSTT.setSpeechPeak(peakFrameDbfs(snapshot[len(snapshot)-speechLen:], rate/50*2))
+	}
 
 	go func() {
 		// Not tied to the utterance context: the pass belongs to this pause, and invalidate() (the caller
@@ -358,6 +369,8 @@ func (s *specSTT) start(snapshotLen, seq int) (int, bool) {
 	s.err = nil
 	s.startedAt = time.Now()
 	s.voicedAfter = 0
+	s.speechPeakDb = 0
+	s.loudMsAfter = 0
 	s.cancel = nil
 	return s.attempt, true
 }
@@ -373,6 +386,72 @@ func (s *specSTT) noteVoiced(t time.Time) {
 }
 
 const specVoicedFramesAfter = 3
+
+const (
+	// Audio within this much of the snapshot's loudest 20 ms is speech, not the hangover's silence: a soft function
+	// word sits ~10 dB under the peak, a room or line's floor usually 30 dB or more.
+	specLoudBelowPeakDb = 20.0
+	// specLoudMsAfter of it after the snapshot is a word (a short one is ~60 ms of loud frames), less a click.
+	specLoudMsAfter = 60
+)
+
+// setSpeechPeak records the snapshot's speech peak for noteAudio.
+func (s *specSTT) setSpeechPeak(db float64) {
+	s.mu.Lock()
+	s.speechPeakDb = db
+	s.mu.Unlock()
+}
+
+// noteAudio measures a 16 kHz frame heard after the snapshot against its speech peak.
+func (s *specSTT) noteAudio(pcm16k []byte, t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.startedAt.IsZero() || !t.After(s.startedAt) || s.speechPeakDb == 0 || len(pcm16k) < 2 {
+		return
+	}
+	if rmsDbfs(pcm16k) >= s.speechPeakDb-specLoudBelowPeakDb {
+		s.loudMsAfter += len(pcm16k) / 32
+	}
+}
+
+// heardAfter is what was heard after the snapshot: voiced VAD frames and loud milliseconds.
+func (s *specSTT) heardAfter() (voiced, loudMs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.voicedAfter, s.loudMsAfter
+}
+
+// rmsDbfs is the RMS level of 16-bit PCM in dBFS (-200 for digital silence).
+func rmsDbfs(pcm []byte) float64 {
+	n := len(pcm) / 2
+	if n == 0 {
+		return -200
+	}
+	var sum float64
+	for i := 0; i < n; i++ {
+		v := float64(int16(uint16(pcm[2*i])|uint16(pcm[2*i+1])<<8)) / 32768
+		sum += v * v
+	}
+	if sum == 0 {
+		return -200
+	}
+	return 10 * math.Log10(sum/float64(n))
+}
+
+// peakFrameDbfs is the loudest frameBytes-long window of pcm in dBFS.
+func peakFrameDbfs(pcm []byte, frameBytes int) float64 {
+	peak := -200.0
+	if frameBytes < 2 {
+		return peak
+	}
+	frameBytes &^= 1
+	for off := 0; off+frameBytes <= len(pcm); off += frameBytes {
+		if db := rmsDbfs(pcm[off : off+frameBytes]); db > peak {
+			peak = db
+		}
+	}
+	return peak
+}
 
 // setCancel registers how to stop attempt's pass. An attempt already invalidated is stopped at once.
 func (s *specSTT) setCancel(attempt int, cancel context.CancelFunc) {
@@ -465,7 +544,7 @@ func (s *specSTT) awaitUsable(ctx context.Context, seq, finalLen, bytesPerMs, ma
 
 	// Reject when the caller spoke after the snapshot: its transcript is short of what they said.
 	s.mu.Lock()
-	spokeAfter := s.voicedAfter >= specVoicedFramesAfter
+	spokeAfter := s.voicedAfter >= specVoicedFramesAfter || s.loudMsAfter >= specLoudMsAfter
 	s.mu.Unlock()
 	if spokeAfter {
 		return TranscriptionResult{}, false, 0
