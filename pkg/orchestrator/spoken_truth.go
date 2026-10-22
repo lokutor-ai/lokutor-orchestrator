@@ -1029,6 +1029,15 @@ func (ms *ManagedStream) settleEchoVeto(ctx context.Context, seq, gen int, pendi
 	if outcome == "joined_to_previous" {
 		return true
 	}
+	if outcome == "said_again" {
+		// The rest is said again from the cut sentence, frames held for it included: resolving must not
+		// also play them (it does once synthesis has finished, for the other false alarms).
+		ms.mu.Lock()
+		if ms.heldAudioGen == gen {
+			ms.discardHeldAudioLocked()
+		}
+		ms.mu.Unlock()
+	}
 	ms.resolvePendingBargeInFor(true)
 	if outcome == "said_again" {
 		ms.resayLostReply(ctx, gen, lost)
