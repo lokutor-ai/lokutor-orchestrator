@@ -426,9 +426,12 @@ type ManagedStream struct {
 	lastRawEnergyAt     time.Time
 	specTriggeredForRun bool
 
-	// preSpeechBuf stores the last ~300ms of audio unconditionally, updated BEFORE VAD.
+	// preSpeechBuf stores the last ~300ms of audio and the current chunk unconditionally, updated BEFORE VAD.
 	// Used in onVADStart to prepend speech onset that VAD's confirmation window missed.
 	preSpeechBuf *bytes.Buffer
+	// leadInExclude is how many bytes at the end of preSpeechBuf onVADStart leaves out of the lead-in: the chunk
+	// the VAD confirmed speech on, which the speech buffers already hold. Set only around that call.
+	leadInExclude int
 	// speechLeadIn is the copy of preSpeechBuf onVADStart prepended to userAudio for the utterance
 	// in progress. The speculative transcription snapshots speechAudioBuf, which never had it, so
 	// it has to be added back there — see maybeSpeculateSTT.
@@ -788,10 +791,11 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	ms.mu.Lock()
 	state := ms.state
 	clientVAD := ms.clientVAD
-	// Update pre-speech buffer BEFORE VAD processing so it never includes
-	// the current chunk when onVADStart reads it later in this call.
+	// The pre-speech buffer holds the last 300 ms before this chunk, and this chunk: when it is the one the VAD
+	// confirms speech on, it goes into the speech buffers below and onVADStart leaves it out of the lead-in
+	// (leadInExclude).
 	ms.preSpeechBuf.Write(chunk)
-	maxPreSpeech := 300 * int(ms.inputSampleRate) * 2 / 1000
+	maxPreSpeech := 300*int(ms.inputSampleRate)*2/1000 + len(chunk)
 	if ms.preSpeechBuf.Len() > maxPreSpeech {
 		data := ms.preSpeechBuf.Bytes()
 		keep := data[len(data)-maxPreSpeech:]
@@ -934,7 +938,19 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 	switch {
 	case event != nil && event.Type == VADSpeechStart:
+		// The chunk that confirmed speech is already in the speech buffers (isSpeaking, above) and is the newest
+		// in preSpeechBuf. Taken into the lead-in as well, it was in every utterance twice: 20 ms repeated where
+		// the lead-in meets the speech, the rest shifted by it. Psst then dropped a soft last word it kept on the
+		// same audio without the repeat ("...an appointment for" came back "...an appointment.", 2026-10-22).
+		if isSpeaking {
+			ms.mu.Lock()
+			ms.leadInExclude = len(chunk)
+			ms.mu.Unlock()
+		}
 		ms.onVADStart(state)
+		ms.mu.Lock()
+		ms.leadInExclude = 0
+		ms.mu.Unlock()
 	case event != nil && event.Type == VADSpeechEnd:
 		ms.onVADEnd(state)
 	}
@@ -1328,12 +1344,14 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 
 	// Prepend 300ms of pre-speech audio to capture the speech onset
 	// that VAD may have missed during its confirmation window (first ~1-2 chunks).
-	// preSpeechBuf is updated BEFORE VAD in handleAudio, so it never includes
-	// the current chunk — no duplicates in userAudio.
+	// Without the chunk that confirmed speech, which the speech buffers already start with (leadInExclude).
 	ms.mu.Lock()
 	ms.speechLeadIn = nil
-	if ms.preSpeechBuf.Len() > 0 {
-		buf := ms.preSpeechBuf.Bytes()
+	buf := ms.preSpeechBuf.Bytes()
+	if n := ms.leadInExclude; n > 0 && n <= len(buf) {
+		buf = buf[:len(buf)-n]
+	}
+	if len(buf) > 0 {
 		leadIn := make([]byte, len(buf))
 		copy(leadIn, buf)
 		ms.speechLeadIn = leadIn

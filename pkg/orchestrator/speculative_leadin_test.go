@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -139,5 +140,73 @@ func TestLeadInFollowsTheUtterance(t *testing.T) {
 	ms.mu.Unlock()
 	if len(ms.speechLeadIn) != len(pre) || ms.speechLeadIn[len(pre)-1] != 7 {
 		t.Fatal("userAudio and speechLeadIn share a backing array")
+	}
+}
+
+// Every chunk reaches userAudio and the speculative snapshot once. The chunk the VAD confirms speech on went in
+// twice, once as the end of the lead-in and once as the first speech chunk: a 20 ms repeat in every utterance, the
+// rest shifted by it, and Psst dropped a soft last word it kept on the same audio without the repeat (2026-10-22).
+func TestConfirmingChunkIsNotRepeatedInTheLeadIn(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.FirstSpeaker = FirstSpeakerUser
+	cfg.SampleRate = 16000
+	orch := NewWithVAD(&MockSTTProvider{transcribeResult: "hola"}, &MockLLMProvider{},
+		&MockTTSProvider{}, NewRMSVAD(0.1, 200*time.Millisecond), cfg)
+	ms := orch.NewManagedStream(context.Background(), NewConversationSession("test"))
+	defer ms.Close()
+
+	// Each 20 ms chunk carries its own number: quiet ones before the speech, loud ones in it.
+	chunk := func(v int16) []byte {
+		b := make([]byte, 640)
+		for i := 0; i < 320; i++ {
+			b[2*i], b[2*i+1] = byte(v), byte(uint16(v)>>8)
+		}
+		return b
+	}
+	var fed [][]byte
+	for i := 1; i <= 30; i++ {
+		fed = append(fed, chunk(int16(i)))
+	}
+	for i := 1; i <= 10; i++ {
+		fed = append(fed, chunk(int16(10000+i)))
+	}
+	confirmedAt := -1 // the chunk the VAD confirmed speech on
+	for i, c := range fed {
+		ms.handleAudio(c)
+		ms.mu.Lock()
+		started := len(ms.speechAudioBuf) > 0
+		ms.mu.Unlock()
+		if started && confirmedAt < 0 {
+			confirmedAt = i
+		}
+	}
+	if confirmedAt < 15 {
+		t.Fatalf("speech confirmed at chunk %d; the test needs 300 ms of audio before it", confirmedAt)
+	}
+	// 300 ms before the confirming chunk, then every chunk from it on, each once.
+	var want []int16
+	for _, c := range fed[confirmedAt-15:] {
+		want = append(want, int16(uint16(c[0])|uint16(c[1])<<8))
+	}
+
+	ms.mu.Lock()
+	user := append([]byte(nil), ms.userAudio...)
+	snap := append(append([]byte(nil), ms.speechLeadIn...), ms.speechAudioBuf...)
+	ms.mu.Unlock()
+	if len(user) == 0 {
+		t.Fatal("no speech was started")
+	}
+	for _, c := range []struct {
+		name  string
+		audio []byte
+	}{{"userAudio", user}, {"lead-in + speech buffer", snap}} {
+		name, audio := c.name, c.audio
+		var got []int16
+		for off := 0; off+640 <= len(audio); off += 640 {
+			got = append(got, int16(uint16(audio[off])|uint16(audio[off+1])<<8))
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("%s = chunks %v, want %v", name, got, want)
+		}
 	}
 }
