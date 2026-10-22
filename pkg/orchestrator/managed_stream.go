@@ -2442,6 +2442,19 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		gateWords := ownTranscript
 		if carryBase != nil {
 			gateWords = transcript
+		} else {
+			// The same over a reply the caller barely heard (bargeBaseLocked: this utterance continues the one
+			// that reply answers) when a false alarm would resume nothing of it: the play-through transport stops
+			// a reply after 400 ms of the caller's speech, before this gate runs, so a one-word "Tuesday." after
+			// "I'd like to book an appointment for" was rejected, the stopped reply could not resume, and the
+			// caller heard half a sentence and then silence ("False alarm over a reply that cannot be resumed",
+			// 2026-10-22, live). While the reply would resume, the gate still keeps a "yeah" from cutting it off.
+			ms.mu.Lock()
+			now := time.Now()
+			if bb := ms.bargeBaseLocked(now, seq, true); bb != nil && !ms.replyWillResumeLocked(now) {
+				gateWords = strings.TrimSpace(bb.transcript + " " + ownTranscript)
+			}
+			ms.mu.Unlock()
 		}
 		if effectiveMinWords > 0 && countWords(gateWords) < effectiveMinWords {
 			// Keep the two-word guard for short noise/backchannels, but do

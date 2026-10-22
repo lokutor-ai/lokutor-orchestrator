@@ -226,3 +226,68 @@ func TestClearlyOpenWordsGetTheLongerWait(t *testing.T) {
 		t.Fatalf("sounds clearly open (eou 0.01) waited %d ms, want the 450 ms margin", w)
 	}
 }
+
+// The agent answered "I'd like to book an appointment for" (the caller paused 0.9 s, past the end-of-turn wait) and
+// the caller went on, "Tuesday.", 462 ms into the reply. The play-through transport stops a reply after 400 ms of the
+// caller's speech, so by the time the word gate ran there was nothing to resume; counting "Tuesday." alone it was a
+// one-word false alarm, and the caller heard half a sentence and then silence (2026-10-22, live). When the utterance
+// continues the one the reply answers and nothing would resume, the gate counts both; while the reply would resume,
+// it still protects it from a one-word sound.
+func TestOneWordContinuationOverAStoppedReplyIsAnswered(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		resumes    bool
+		wantAnswer bool
+	}{
+		{"the reply was stopped: answer the two halves", false, true},
+		{"the reply is still being synthesised: it resumes", true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.SilenceTimeout = 0
+			llm := &sequencedLLM{responses: []string{"Tuesday works. Morning or afternoon?"}}
+			orch := NewWithAllLayers(eouSTT{"Tuesday.", 1, true, nil}, llm, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+			session := NewConversationSession("over-reply")
+			session.Context = append(session.Context,
+				Message{Role: "user", Content: "I'd like to book an appointment for."},
+				Message{Role: "assistant", Content: "Sure thing, when would you like to come in?"})
+			stream := orch.NewManagedStream(context.Background(), session)
+			defer stream.Close()
+			stream.SetTransportPlaysThroughBargeIn(true)
+			now := time.Now()
+			stream.mu.Lock()
+			stream.lastUtt = &committedUtterance{audio: make([]byte, 64000), transcript: "I'd like to book an appointment for.",
+				endedAt: now.Add(-time.Second), gen: 1, seq: 1}
+			stream.payloadGen = 2
+			stream.pendingBargeIn = true
+			stream.pendingBargeGen = 2
+			stream.onset = heardSnapshot{gen: 2, seq: 2, at: now.Add(-500 * time.Millisecond), dur: 300 * time.Millisecond, stopped: true}
+			if c.resumes {
+				stream.ttsCancel = func() {}
+			}
+			stream.state = StateListening
+			stream.utteranceSeq = 2
+			stream.inflightUtterances = 1
+			stream.mu.Unlock()
+			stream.processUtterance(make([]byte, 462*32), 462*time.Millisecond, 2)
+			answered := atomic.LoadInt32(&llm.call) > 0
+			if answered != c.wantAnswer {
+				t.Fatalf("answered = %v, want %v", answered, c.wantAnswer)
+			}
+			if !c.wantAnswer {
+				return
+			}
+			stream.session.mu.Lock()
+			defer stream.session.mu.Unlock()
+			found := false
+			for _, m := range stream.session.Context {
+				if m.Role == "user" && strings.Contains(m.Content, "Tuesday") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("the caller's word is not in the conversation: %+v", stream.session.Context)
+			}
+		})
+	}
+}
