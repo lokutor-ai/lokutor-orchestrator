@@ -2092,7 +2092,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	eouComplete := !eouHas || eouVal >= eouThr
 	if result.HasEndOfTurn || result.HasEndOfTurnAlt {
 		ms.logger.Info("End of turn",
-			"eou", eouOrNil(result), "eou_alt", eouAltOrNil(result), "uses_alt", ms.orch.config.EndOfTurnUseAlt,
+			"eou", eouOrNil(result), "eou_alt", eouAltOrNil(result), "eou_text", eouTextOrNil(result), "uses_alt", ms.orch.config.EndOfTurnUseAlt,
 			"lexical_complete", lexicalComplete, "threshold", eouThr, "decides", eouDecides,
 			"transcript", ContentForLog(transcript))
 	}
@@ -2133,6 +2133,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"transcript_words": countWords(transcript),
 				"eou":              eouOrNil(result),
 				"eou_alt":          eouAltOrNil(result),
+				"eou_text":         eouTextOrNil(result),
 			}, nil)
 	}
 
@@ -2161,6 +2162,14 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		}
 		if eouDecides && ms.orch.config.EndOfTurnWaitMs > 0 {
 			waitMs = ms.orch.config.EndOfTurnWaitMs
+		}
+		// The words read as clearly unfinished: give the caller the longer margin.
+		if open, ok := wordsReadOpen(result); eouDecides && ok && ms.orch.config.EndOfTurnOpenThreshold > 0 &&
+			ms.orch.config.EndOfTurnOpenWaitMs > waitMs && open < ms.orch.config.EndOfTurnOpenThreshold {
+			ms.logger.Info("End of turn: the words read as clearly unfinished, longer wait",
+				"open_score", open, "threshold", ms.orch.config.EndOfTurnOpenThreshold,
+				"wait_ms_before", waitMs, "wait_ms_after", ms.orch.config.EndOfTurnOpenWaitMs)
+			waitMs = ms.orch.config.EndOfTurnOpenWaitMs
 		}
 		if !eouDecides && lexicalComplete && turnoSaysHold {
 			// Text looks done and only prosody disagrees, so this is a grace

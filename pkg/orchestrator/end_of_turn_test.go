@@ -128,3 +128,34 @@ func TestHeldTurnIsAnsweredWhenItsContinuationIsEmpty(t *testing.T) {
 		})
 	}
 }
+
+// A held turn whose words read as clearly unfinished gets the longer margin; one that only sounds unfinished keeps the
+// short wait. Measured the same way as TestEndOfTurnProbabilityDecidesTheWait (confirmWaitMs).
+func TestClearlyOpenWordsGetTheLongerWait(t *testing.T) {
+	run := func(alt float64) int64 {
+		cfg := DefaultConfig()
+		cfg.SilenceTimeout = 0
+		cfg.EndOfTurnThreshold = 0.7
+		cfg.EndOfTurnWaitMs = 150
+		cfg.EndOfTurnOpenThreshold = 0.05
+		cfg.EndOfTurnOpenWaitMs = 450
+		orch := NewWithAllLayers(eouSTT{"Quería reservar una cita para el.", 0.1, true, &alt}, &sequencedLLM{responses: []string{"Claro."}}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+		stream := orch.NewManagedStream(context.Background(), NewConversationSession("open"))
+		defer stream.Close()
+		stream.mu.Lock()
+		stream.state = StateProcessing
+		stream.utteranceSeq = 1
+		stream.inflightUtterances = 1
+		stream.mu.Unlock()
+		stream.processUtterance(make([]byte, 64000), 2*time.Second, 1)
+		stream.mu.Lock()
+		defer stream.mu.Unlock()
+		return stream.confirmWaitMs
+	}
+	if w := run(0.001); w < 400 {
+		t.Fatalf("clearly open words waited %d ms, want the 450 ms margin", w)
+	}
+	if w := run(0.5); w < 100 || w > 300 {
+		t.Fatalf("words not clearly open waited %d ms, want the 150 ms wait", w)
+	}
+}

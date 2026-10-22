@@ -37,6 +37,10 @@ type TranscriptionResult struct {
 	// under evaluation); both are logged, EndOfTurnUseAlt picks the one that decides.
 	EndOfTurnAlt    float64
 	HasEndOfTurnAlt bool
+	// EndOfTurnText is the recogniser's text completeness probability alone ("eou_text"): how finished the words read,
+	// whatever the voice did. EndOfTurnOpenThreshold reads it (EndOfTurnAlt when it is absent).
+	EndOfTurnText    float64
+	HasEndOfTurnText bool
 }
 
 type STTProvider interface {
@@ -350,6 +354,13 @@ type Config struct {
 	// EndOfTurnUseAlt makes EndOfTurnAlt (the recogniser's second head) the probability EndOfTurnThreshold decides on,
 	// instead of EndOfTurn.
 	EndOfTurnUseAlt bool
+
+	// EndOfTurnOpenThreshold: a turn held as unfinished whose words read as clearly unfinished (EndOfTurnText, or
+	// EndOfTurnAlt without it, below this: "...una cita para el", "...and like") waits EndOfTurnOpenWaitMs instead of
+	// EndOfTurnWaitMs. A caller who stops on an open phrase is almost always going on, often after a longer pause than a
+	// short wait allows. Zero disables it.
+	EndOfTurnOpenThreshold float64
+	EndOfTurnOpenWaitMs    int
 
 	// TurnoHoldMs is how long a Turno-flagged turn is held. Deliberately much
 	// shorter than SilenceConfirmationMs: the text does look complete, so this

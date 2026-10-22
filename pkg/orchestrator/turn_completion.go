@@ -201,3 +201,23 @@ func eouAltOrNil(r TranscriptionResult) interface{} {
 	}
 	return r.EndOfTurnAlt
 }
+
+// eouTextOrNil is the recogniser's text completeness probability for an experiment row, or nil when it gave none.
+func eouTextOrNil(r TranscriptionResult) interface{} {
+	if !r.HasEndOfTurnText {
+		return nil
+	}
+	return r.EndOfTurnText
+}
+
+// wordsReadOpen is how finished the turn's words read: the recogniser's text completeness probability, else its
+// second head (whose text term can only lower it). ok is false when it gave neither.
+func wordsReadOpen(r TranscriptionResult) (float64, bool) {
+	if r.HasEndOfTurnText {
+		return r.EndOfTurnText, true
+	}
+	if r.HasEndOfTurnAlt {
+		return r.EndOfTurnAlt, true
+	}
+	return 0, false
+}
