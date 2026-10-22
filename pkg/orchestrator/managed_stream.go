@@ -2091,8 +2091,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// waited below and was abandoned when the caller resumed, or was answered by a reply the caller
 	// started speaking over before hearing more than a word or two — the two halves are one turn.
 	// Transcribed apart, the second half loses the first as context ("Grillo" without "Pito") and
-	// both show as separate turns. So transcribe them together. The barge-in checks further down
-	// still judge the continuation on its own words: they decide whether the NEW speech is real.
+	// both show as separate turns. So transcribe them together. The echo check further down still
+	// judges the continuation on its own words: it decides whether the NEW speech is real. The word
+	// count judges the turn being answered, which for a held fragment is the two halves together.
 	//
 	// The fragment the mid-thought wait abandoned is joined here, before that wait runs again, so
 	// the wait judges the whole sentence. A merge over a reply is joined later, only once the
@@ -2394,22 +2395,32 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				effectiveMinWords = 0
 			}
 		}
-		if effectiveMinWords > 0 && countWords(ownTranscript) < effectiveMinWords {
+		// The words of the turn being answered. For the continuation of a held turn that is the whole turn: the
+		// caller had resumed, so the end-of-turn wait abandoned the held turn's reply and left it to this utterance,
+		// and nothing of that turn is being interrupted. Counting the continuation alone ("11." after "How does
+		// Locke compared to?") called it a one-word barge-in and the false alarm dropped the held turn with it: no
+		// reply, and nothing to resume (2026-10-22, live, a sentence the VAD split in two). The echo check below
+		// still judges the continuation's own words.
+		gateWords := ownTranscript
+		if carryBase != nil {
+			gateWords = transcript
+		}
+		if effectiveMinWords > 0 && countWords(gateWords) < effectiveMinWords {
 			// Keep the two-word guard for short noise/backchannels, but do
 			// not make a sustained one-word command impossible to use. With
 			// the current VAD hangover, a real "yes", "no", or "stop" turn
 			// remains active long enough to qualify here; brief noise still
 			// resolves as a false barge-in.
-			if !acceptsSustainedSingleWordBargeIn(ownTranscript, duration) {
+			if !acceptsSustainedSingleWordBargeIn(gateWords, duration) {
 				ms.logger.Info("Barge-in below MinWordsToInterrupt, resuming bot",
-					"transcript", ContentForLog(ownTranscript), "word_count", countWords(ownTranscript),
-					"audio_duration_ms", duration.Milliseconds())
+					"transcript", ContentForLog(gateWords), "word_count", countWords(gateWords),
+					"audio_duration_ms", duration.Milliseconds(), "held_turn", carryBase != nil)
 				ms.resolvePendingBargeInFor(true)
 				return
 			}
-		} else if turnoAssisted && countWords(ownTranscript) < minWords {
+		} else if turnoAssisted && countWords(gateWords) < minWords {
 			ms.logger.Info("Turno assist relaxed MinWordsToInterrupt",
-				"transcript", ContentForLog(ownTranscript), "word_count", countWords(ownTranscript),
+				"transcript", ContentForLog(gateWords), "word_count", countWords(gateWords),
 				"turno_bargein_peak", turnoPeak)
 		}
 		// Echo check: client-side echo cancellation (browser WebRTC AEC, requested by the SDK's
