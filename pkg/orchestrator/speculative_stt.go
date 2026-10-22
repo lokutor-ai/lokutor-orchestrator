@@ -90,6 +90,15 @@ type specSTT struct {
 	// the hangover it actually managed to use.
 	startedAt time.Time
 
+	// lastVoiced is the last frame the VAD heard voice on (noteVoiced). A voiced frame after startedAt means the
+	// caller said more after the snapshot: "I'd like to book an appointment" [pause] "for" arrived as the snapshot's
+	// "...an appointment." because "for" plus the hangover fit in maxTailMs, and the turn lost its open ending.
+	lastVoiced time.Time
+	// voicedAfter counts voiced frames heard after startedAt. specVoicedFramesAfter or more is speech (a short word
+	// is ~3 VAD frames); fewer is the VAD flickering on a word's trailing edge, which must not throw away the
+	// snapshot's head start.
+	voicedAfter int
+
 	// cancel stops the pass in flight. invalidate() calls it: the result would be discarded anyway, and a pass
 	// still denoising skips its recognition request (2026-10-16).
 	cancel context.CancelFunc
@@ -348,9 +357,22 @@ func (s *specSTT) start(snapshotLen, seq int) (int, bool) {
 	s.result = TranscriptionResult{}
 	s.err = nil
 	s.startedAt = time.Now()
+	s.voicedAfter = 0
 	s.cancel = nil
 	return s.attempt, true
 }
+
+// noteVoiced records a frame the VAD heard voice on.
+func (s *specSTT) noteVoiced(t time.Time) {
+	s.mu.Lock()
+	s.lastVoiced = t
+	if !s.startedAt.IsZero() && t.After(s.startedAt) {
+		s.voicedAfter++
+	}
+	s.mu.Unlock()
+}
+
+const specVoicedFramesAfter = 3
 
 // setCancel registers how to stop attempt's pass. An attempt already invalidated is stopped at once.
 func (s *specSTT) setCancel(attempt int, cancel context.CancelFunc) {
@@ -439,6 +461,14 @@ func (s *specSTT) awaitUsable(ctx context.Context, seq, finalLen, bytesPerMs, ma
 		if tailMs < 0 || tailMs > maxTailMs {
 			return TranscriptionResult{}, false, 0
 		}
+	}
+
+	// Reject when the caller spoke after the snapshot: its transcript is short of what they said.
+	s.mu.Lock()
+	spokeAfter := s.voicedAfter >= specVoicedFramesAfter
+	s.mu.Unlock()
+	if spokeAfter {
+		return TranscriptionResult{}, false, 0
 	}
 
 	waitStart := time.Now()
