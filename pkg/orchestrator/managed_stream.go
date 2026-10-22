@@ -214,6 +214,8 @@ type ManagedStream struct {
 	// rate is noticeable.
 	sttSpeculative bool
 	specSTT        specSTT
+	// unconfirmed is the evidence of speech-level caller audio the VAD did not confirm (unconfirmed_speech.go).
+	unconfirmed unconfirmedSpeech
 	// lastVoicedAt is the last frame on which the VAD saw speech. The VAD
 	// hangover sits between this and userSpeechEnd.
 	lastVoicedAt time.Time
@@ -869,6 +871,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	if pendingForEcho {
 		ms.noteNearEndEcho(audioChunk16k, pendingGenForEcho)
 	}
+	ms.noteUnconfirmedSpeech(audioChunk16k, isSpeaking, time.Now())
 	if ms.turno != nil {
 		ms.feedTurno(audioChunk16k)
 	}
