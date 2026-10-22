@@ -896,6 +896,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		// latency budget, which flatters every number in it.
 		if sf, ok := ms.vad.(silenceFramesProvider); ok && sf.SilenceFrames() == 0 {
 			ms.lastVoicedAt = time.Now()
+			ms.specSTT.noteVoiced(ms.lastVoicedAt)
 		}
 
 		// Spend the VAD hangover transcribing rather than waiting. By the time

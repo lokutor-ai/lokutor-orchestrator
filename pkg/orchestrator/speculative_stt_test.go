@@ -256,3 +256,44 @@ func TestInvalidateCancelsThePassInFlight(t *testing.T) {
 		t.Fatal("a finished pass was cancelled")
 	}
 }
+
+// The byte check alone let a short last word through: "I'd like to book an appointment" [pause] "for" plus the
+// hangover is well under the 700 ms tail allowance, so the snapshot's "...an appointment." was used and the turn lost
+// its open ending (2026-10-22, live). A voiced frame after the snapshot rejects it, whatever the tail's length.
+func TestSpecSTTRejectedWhenAShortWordFollowsTheSnapshot(t *testing.T) {
+	var s specSTT
+	snap := 32000
+	if !s.begin(snap, 7) {
+		t.Fatal("begin refused")
+	}
+	s.finish(TranscriptionResult{Text: "I'd like to book an appointment."}, nil)
+	time.Sleep(2 * time.Millisecond)
+	s.noteVoiced(time.Now()) // one frame: the VAD flickering on the last word's tail
+	if _, ok, _ := s.awaitUsable(context.Background(), 7, snap+480*testBytesPerMs, testBytesPerMs, defaultSpecSTTMaxTailMs); !ok {
+		t.Fatal("one voiced frame after the snapshot is a flicker, not speech")
+	}
+	s.invalidate()
+	if !s.begin(snap, 9) {
+		t.Fatal("begin refused")
+	}
+	s.finish(TranscriptionResult{Text: "I'd like to book an appointment."}, nil)
+	time.Sleep(2 * time.Millisecond)
+	for i := 0; i < 8; i++ { // "for": ~250 ms of voice
+		s.noteVoiced(time.Now())
+	}
+	final := snap + (250+192)*testBytesPerMs
+	if _, ok, _ := s.awaitUsable(context.Background(), 9, final, testBytesPerMs, defaultSpecSTTMaxTailMs); ok {
+		t.Fatal("a snapshot followed by voice must be rejected even when the tail is short")
+	}
+
+	var quiet specSTT
+	quiet.noteVoiced(time.Now()) // the last voiced frame, before the snapshot
+	time.Sleep(2 * time.Millisecond)
+	if !quiet.begin(snap, 8) {
+		t.Fatal("begin refused")
+	}
+	quiet.finish(TranscriptionResult{Text: "what are your opening hours"}, nil)
+	if _, ok, _ := quiet.awaitUsable(context.Background(), 8, snap+480*testBytesPerMs, testBytesPerMs, defaultSpecSTTMaxTailMs); !ok {
+		t.Fatal("voice before the snapshot must not reject it")
+	}
+}
