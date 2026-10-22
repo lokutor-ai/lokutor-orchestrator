@@ -2163,8 +2163,13 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		if eouDecides && ms.orch.config.EndOfTurnWaitMs > 0 {
 			waitMs = ms.orch.config.EndOfTurnWaitMs
 		}
-		// The words read as clearly unfinished: give the caller the longer margin.
-		if open, ok := wordsReadOpen(result); eouDecides && ok && ms.orch.config.EndOfTurnOpenThreshold > 0 &&
+		// Clearly unfinished, by the words (eou_text) or by how it sounded (the deciding probability itself): give the
+		// caller the longer margin.
+		open, ok := wordsReadOpen(result)
+		if !ok || eouVal < open {
+			open, ok = eouVal, true
+		}
+		if eouDecides && ok && ms.orch.config.EndOfTurnOpenThreshold > 0 &&
 			ms.orch.config.EndOfTurnOpenWaitMs > waitMs && open < ms.orch.config.EndOfTurnOpenThreshold {
 			ms.logger.Info("End of turn: the words read as clearly unfinished, longer wait",
 				"open_score", open, "threshold", ms.orch.config.EndOfTurnOpenThreshold,
