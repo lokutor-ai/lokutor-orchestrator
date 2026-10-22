@@ -1610,6 +1610,29 @@ func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 	}
 }
 
+// replyWillResumeLocked reports whether a false alarm now would put the caller back in the reply they spoke over
+// (ms.mu held): the cases of resolvePendingBargeInFor that resume something, which must stay in step with it.
+// Synthesis still running, frames held for the reply, a turn still generating, a paused transport with the reply
+// unfinished, or a play-through transport still playing it.
+func (ms *ManagedStream) replyWillResumeLocked(now time.Time) bool {
+	if !ms.pendingBargeIn || ms.pendingBargeGen != ms.payloadGen {
+		return false
+	}
+	switch {
+	case ms.ttsCancel != nil:
+		return true
+	case ms.heldAudioGen == ms.payloadGen && len(ms.heldAudio) > 0:
+		return true
+	case ms.pipelineCancel != nil && ms.pipelineCtx != nil && ms.pipelineCtx.Err() == nil:
+		return true
+	case ms.pausesOnBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.at.IsZero():
+		return !ms.onset.complete
+	case ms.playsThroughBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.stopped:
+		return ms.playout.gen == ms.payloadGen && ms.playout.end.After(now)
+	}
+	return false
+}
+
 // confirmBargeInIfPending finalizes a tentative barge-in once STT confirms the
 // interrupting audio was real speech, running the same cancel + spoken-truth
 // truncation + Interrupted-event bookkeeping as handleInterrupt(), but
@@ -2000,7 +2023,17 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		return true
 	}
 
-	if ms.isLikelyNoise(result, duration) && !keepHeld("noise") {
+	// A long utterance the recogniser returned nothing for is real speech it failed on, not noise: it goes on to the
+	// empty-transcript branch below, which asks the caller to repeat. isLikelyNoise calls every empty transcript noise,
+	// so since that branch was added (2026-09-19) it never once ran and every such caller got silence: 6 in the 30
+	// days to 2026-10-22 on the web, among them a probe's whole "How does Lokutor compare to ElevenLabs?" spoken over
+	// the opening (2.16 s; the recogniser's greedy pass returned "", its beam the sentence). Not when the recogniser
+	// itself says no speech, nor when a false alarm puts the caller back in a reply (the old behaviour: it resumes).
+	ms.mu.Lock()
+	unheardSpeech := strings.TrimSpace(result.Text) == "" && result.NoSpeechProb <= 0.7 && duration >= time.Second &&
+		!ms.replyWillResumeLocked(time.Now())
+	ms.mu.Unlock()
+	if !unheardSpeech && ms.isLikelyNoise(result, duration) && !keepHeld("noise") {
 		// False alarm — if this cut off a tentative barge-in, resume the bot
 		// instead of leaving the caller with dead air. Logged with the raw
 		// (possibly gibberish) transcript and the scores that drove the
@@ -2077,6 +2110,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		if duration >= time.Second {
 			ms.logger.Warn("Empty transcript for a long utterance — asking the caller to repeat",
 				"no_speech_prob", result.NoSpeechProb, "audio_duration_ms", duration.Milliseconds())
+			// Over a reply that will not resume: the barge-in is real, settled as any other before the agent speaks.
+			ms.confirmBargeInIfPending()
 			ms.mu.Lock()
 			ms.payloadGen++
 			gen := ms.payloadGen
