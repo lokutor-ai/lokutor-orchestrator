@@ -66,6 +66,50 @@ const (
 	echoCorrelationThreshold = 0.75
 )
 
+// echoChanceP99 is how well a real caller's voice correlates with the agent's by chance: the 99th percentile of
+// correlateEnvelopesFrom's peak (75 lags, the 192 ms onset rule) between a human speaker's envelope and an
+// unrelated stretch of the agent's, by the near end's length in 20 ms frames. Measured 2026-10-23 on the TEN-VAD
+// test set (30 real recordings) at 16 kHz and through an 8 kHz mu-law phone band, against Versa renders, 1,500
+// windows per length, the larger of the two bands (finance/measurements/echo_chance_correlation_2026-10-23.json).
+// The peak over 75 alignments of a few frames is high for any two voices: 0.75 is reached by chance by 51% of
+// 320 ms windows, 10% at 1 s and under 1% only from ~2 s, so a fixed 0.75 called half of all short interruptions
+// the agent's own echo. On a phone call (telnyx_1792770225951567702) the caller's two "wait"s over a long reply,
+// 240 and 320 ms, scored 0.88 and 0.95 and were vetoed; the agent talked on over them. Production agreed: in the
+// 14 days to 2026-10-23 the acoustic-only veto fired on 50% of checks of 400 ms or less, 35% at 0.4-1 s and 4%
+// over 1 s, the chance rate at each length.
+var echoChanceP99 = []struct {
+	frames int
+	p99    float64
+}{{3, 1.0}, {5, 0.999}, {8, 0.994}, {10, 0.99}, {12, 0.984}, {16, 0.98}, {20, 0.976}, {25, 0.972}, {30, 0.967},
+	{40, 0.943}, {50, 0.917}, {60, 0.853}, {80, 0.776}, {100, 0.729}}
+
+// echoThresholdFor is the correlation an n-frame near end needs to be called the agent's echo on the envelope alone:
+// what a real caller reaches by chance one time in a hundred (echoChanceP99, linear between the lengths measured),
+// and never under echoCorrelationThreshold. A real echo of the agent at a level that passes the phone's echo gate,
+// or the browser's canceller, is the same signal delayed: it correlates near 1.0 at any length. The text check
+// (echoVerdict) still needs only echoTextAcousticFloor.
+func echoThresholdFor(n int) float64 {
+	t := echoCorrelationThreshold
+	switch {
+	case n <= echoChanceP99[0].frames:
+		t = echoChanceP99[0].p99
+	case n >= echoChanceP99[len(echoChanceP99)-1].frames:
+		t = echoChanceP99[len(echoChanceP99)-1].p99
+	default:
+		for i := 1; i < len(echoChanceP99); i++ {
+			lo, hi := echoChanceP99[i-1], echoChanceP99[i]
+			if n <= hi.frames {
+				t = lo.p99 + (hi.p99-lo.p99)*float64(n-lo.frames)/float64(hi.frames-lo.frames)
+				break
+			}
+		}
+	}
+	if t < echoCorrelationThreshold {
+		t = echoCorrelationThreshold
+	}
+	return t
+}
+
 // echoFarChunk is outgoing audio handed to the transport, not yet played: start is when the
 // caller's playout clock (spoken_truth.go) says it starts playing.
 type echoFarChunk struct {
@@ -338,6 +382,8 @@ type acousticEchoReading struct {
 	score      float64
 	lagMs      int
 	nearFrames int
+	// threshold is what score had to reach for echo (echoThresholdFor nearFrames).
+	threshold float64
 	// unsourcedScore is the best correlation at an alignment ruled out because the agent was silent
 	// under the speech that opened the barge-in (correlateEnvelopesFrom), when it beats score: what
 	// the check would have read without that rule. 0 otherwise.
@@ -397,6 +443,7 @@ func (ms *ManagedStream) acousticEchoCheck(gen int) (r acousticEchoReading) {
 		lagFrames = 0
 	}
 	r.lagMs = lagFrames * 20
-	r.echo = peak >= echoCorrelationThreshold
+	r.threshold = echoThresholdFor(len(nearEnv))
+	r.echo = peak >= r.threshold
 	return r
 }
