@@ -335,3 +335,70 @@ func TestIsLikelyAcousticEcho_TailCopyMatchesWholeBuffer(t *testing.T) {
 		t.Errorf("lag %d ms, want 300", lagMs)
 	}
 }
+
+// The threshold follows the chance table: a few frames need near-perfect correlation, long windows the old 0.75.
+func TestEchoThresholdForFollowsTheChanceTable(t *testing.T) {
+	if got := echoThresholdFor(16); math.Abs(got-0.98) > 1e-9 {
+		t.Fatalf("16 frames: %.3f, want 0.98", got)
+	}
+	if got := echoThresholdFor(1); got != 1.0 {
+		t.Fatalf("1 frame: %.3f, want 1.0", got)
+	}
+	if got := echoThresholdFor(300); got != echoCorrelationThreshold {
+		t.Fatalf("300 frames: %.3f, want %.2f", got, echoCorrelationThreshold)
+	}
+	prev := 2.0
+	for n := 1; n <= 200; n++ {
+		got := echoThresholdFor(n)
+		if got > prev+1e-12 || got < echoCorrelationThreshold {
+			t.Fatalf("not non-increasing within [%.2f, 1] at %d frames: %.4f after %.4f", echoCorrelationThreshold, n, got, prev)
+		}
+		prev = got
+	}
+}
+
+// A caller's 320 ms "espera" over the agent whose loudness happens to rise and fall with the agent's (0.75-0.98: half
+// of all real 320 ms interruptions score at least 0.75 by chance) is not the agent's echo; an attenuated copy is.
+// On telnyx_1792770225951567702 two such interruptions, 0.95 and 0.88, were vetoed and the agent talked on.
+func TestShortWindowNeedsMoreThanChanceToBeEcho(t *testing.T) {
+	stt := &MockSTTProvider{transcribeResult: "hi"}
+	stream := NewWithVAD(stt, &MockLLMProvider{completeResult: "ok"}, &MockTTSProvider{synthesizeResult: []byte("a")},
+		NewRMSVAD(0.05, 50*time.Millisecond), DefaultConfig()).NewManagedStream(context.Background(), NewConversationSession("chance"))
+	defer stream.Close()
+	frameAmp := func(f int) float64 { return 2000 + 6000*math.Abs(math.Sin(float64(f)*0.7)*math.Cos(float64(f)*0.13)) }
+	samples := 4 * 16000
+	far := make([]byte, samples*2)
+	for i := 0; i < samples; i++ {
+		v := int16(frameAmp(i/320) * math.Sin(float64(i)*0.3))
+		far[i*2], far[i*2+1] = byte(v), byte(v>>8)
+	}
+	const nearFrames, lagFrames = 16, 15 // 320 ms, heard 300 ms late
+	end := len(far) / echoFrameBytes
+	first := end - lagFrames - nearFrames
+	copyNear := attenuate(far[first*echoFrameBytes:(end-lagFrames)*echoFrameBytes], 0.3)
+	// A different voice: its own pitch, loudness that follows the agent's only loosely.
+	caller := make([]byte, nearFrames*320*2)
+	for i := 0; i < nearFrames*320; i++ {
+		f := first + i/320
+		amp := 0.3 * frameAmp(f) * (1 + 0.35*math.Sin(float64(f)*2.1+1))
+		v := int16(amp * math.Sin(float64(i)*0.17))
+		caller[i*2], caller[i*2+1] = byte(v), byte(v>>8)
+	}
+	check := func(near []byte) acousticEchoReading {
+		stream.echoMu.Lock()
+		stream.echoFarEndBuf, stream.echoNearEndBuf, stream.echoNearEndGen = far, near, 1
+		stream.echoMu.Unlock()
+		return stream.acousticEchoCheck(1)
+	}
+	if r := check(copyNear); !r.echo || r.nearFrames != nearFrames {
+		t.Fatalf("an attenuated copy of the agent: echo=%v score=%.3f threshold=%.3f frames=%d", r.echo, r.score, r.threshold, r.nearFrames)
+	}
+	r := check(caller)
+	if r.score < echoCorrelationThreshold || r.score >= r.threshold {
+		t.Fatalf("the stimulus should score in [%.2f, %.3f) like the live interruptions; it scored %.3f", echoCorrelationThreshold, r.threshold, r.score)
+	}
+	if r.echo {
+		t.Fatalf("a caller at %.3f over %d frames was called the agent's echo (threshold %.3f)", r.score, r.nearFrames, r.threshold)
+	}
+	t.Logf("caller %.3f over %d frames, threshold %.3f", r.score, r.nearFrames, r.threshold)
+}

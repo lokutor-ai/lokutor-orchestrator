@@ -2508,7 +2508,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		textEcho := isLikelyEcho(ownTranscript, currentlySpeaking) || isLikelyEcho(ownTranscript, replySoFar)
 		ms.logger.Info("Echo check",
 			"acoustic_echo", acoustic.echo, "acoustic_score", acoustic.score,
-			"acoustic_lag_ms", acoustic.lagMs, "acoustic_near_frames", acoustic.nearFrames,
+			"acoustic_lag_ms", acoustic.lagMs, "acoustic_near_frames", acoustic.nearFrames, "acoustic_threshold", acoustic.threshold,
 			"acoustic_unsourced_score", acoustic.unsourcedScore,
 			"text_echo", textEcho, "transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
 		if echo, method := echoVerdict(acoustic.echo, acoustic.score, textEcho); echo {
