@@ -1,0 +1,30 @@
+name: Benchmark / measurement
+description: Measure something whose number someone will act on (capacity, cost, quality, latency, model comparison).
+labels: ["type:benchmark", "status:triage"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What decision does this number feed? What do we expect (hypothesis)?
+    validations:
+      required: true
+  - type: textarea
+    id: metric
+    attributes:
+      label: Metric and decision rule
+      description: What is measured, how, and which result leads to which decision.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup (for reproducibility)
+      description: Commits of every repo involved, model/bundle tag, data and sample, hardware, environment (never the production pool for capacity — use a canary), exact command and flags.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Filled in when done — summary numbers, where the full results live (measurement file, report path, attachment), date.
