@@ -2246,7 +2246,6 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 
 	// The verdict: the recogniser's when it decides, the lexical gate's (and Turno's hold) otherwise.
 	unfinished := !lexicalComplete || turnoSaysHold
-	eouHangs := false
 	if eouDecides {
 		unfinished = !eouComplete
 		// Words that read as clearly unfinished ("I want to book a flight to", "... uh") hold the turn WHATEVER the audio head
@@ -2263,12 +2262,6 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				if ok && open < thr {
 					unfinished = true
 				}
-			}
-			// A sentence that stops on a conjunction, an article, a comma or an ellipsis is the caller in the middle of it, whatever the
-			// audio head says about the voice.
-			if HangsOnConnective(transcript) {
-				unfinished = true
-				eouHangs = true
 			}
 		}
 	}
@@ -2287,8 +2280,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		if !ok || eouVal < open {
 			open, ok = eouVal, true
 		}
-		if eouDecides && ms.orch.config.EndOfTurnOpenWaitMs > waitMs &&
-			(eouHangs || (ok && ms.orch.config.EndOfTurnOpenThreshold > 0 && open < ms.orch.config.EndOfTurnOpenThreshold)) {
+		if eouDecides && ok && ms.orch.config.EndOfTurnOpenThreshold > 0 &&
+			ms.orch.config.EndOfTurnOpenWaitMs > waitMs && open < ms.orch.config.EndOfTurnOpenThreshold {
 			ms.logger.Info("End of turn: the words read as clearly unfinished, longer wait",
 				"open_score", open, "threshold", ms.orch.config.EndOfTurnOpenThreshold,
 				"wait_ms_before", waitMs, "wait_ms_after", ms.orch.config.EndOfTurnOpenWaitMs)

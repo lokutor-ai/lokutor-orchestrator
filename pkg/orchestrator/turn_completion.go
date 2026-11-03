@@ -221,34 +221,3 @@ func wordsReadOpen(r TranscriptionResult) (float64, bool) {
 	}
 	return 0, false
 }
-
-// hangingEnders are words a finished sentence does not end on: conjunctions and articles/determiners, in the languages the
-// agent listens in. "I want to book a flight and" / "quiero reservar un vuelo y" is the caller thinking, not finishing.
-// Prepositions and pronouns are left out on purpose (a question can end on "for", an answer on "that" or "so").
-var hangingEnders = map[string]bool{
-	"and": true, "or": true, "but": true, "because": true, "if": true, "when": true, "while": true, "although": true,
-	"the": true, "a": true, "an": true, "my": true, "your": true, "his": true, "her": true, "our": true, "their": true,
-	"y": true, "o": true, "pero": true, "porque": true, "cuando": true, "mientras": true, "aunque": true,
-	"el": true, "la": true, "los": true, "las": true, "un": true, "una": true, "mi": true, "tu": true, "su": true,
-	"i": true, "però": true, "perquè": true, "quan": true, "mentre": true, "els": true, "les": true,
-	"et": true, "ou": true, "mais": true, "car": true, "le": true, "mon": true, "ma": true, "une": true,
-	"und": true, "oder": true, "aber": true, "weil": true, "der": true, "die": true, "das": true, "ein": true, "eine": true,
-	"e": true, "perché": true, "il": true,
-	"mas": true, "um": true, "uma": true,
-}
-
-// HangsOnConnective reports a transcript that stops on a conjunction or article, or on a comma or an ellipsis: the caller is
-// in the middle of a sentence. It is a signal of an explicit continuation, used to hold the turn even when the audio head is
-// confident the voice finished.
-func HangsOnConnective(text string) bool {
-	t := strings.TrimSpace(text)
-	if t == "" {
-		return false
-	}
-	if strings.HasSuffix(t, ",") || strings.HasSuffix(t, "...") || strings.HasSuffix(t, "…") {
-		return true
-	}
-	fields := strings.Fields(t)
-	last := strings.ToLower(strings.Trim(fields[len(fields)-1], ".,;:!?¿¡…\"'()"))
-	return hangingEnders[last]
-}

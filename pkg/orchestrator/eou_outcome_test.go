@@ -72,16 +72,3 @@ func TestEOUOutcomeClosesEveryDecisionOnce(t *testing.T) {
 		t.Fatalf("outcomes = %v", o)
 	}
 }
-
-func TestHangsOnConnective(t *testing.T) {
-	for _, s := range []string{"I want to book a flight and", "I want to book a flight and.", "quiero reservar un vuelo y", "Vull reservar un vol i,", "I went to the", "so, well,", "I was thinking..."} {
-		if !HangsOnConnective(s) {
-			t.Errorf("%q should read as hanging", s)
-		}
-	}
-	for _, s := range []string{"I think so.", "What are you looking for", "That is what I want.", "sí", "Quiero reservar un vuelo para mañana.", ""} {
-		if HangsOnConnective(s) {
-			t.Errorf("%q should not read as hanging", s)
-		}
-	}
-}
