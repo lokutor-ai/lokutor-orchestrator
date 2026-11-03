@@ -53,6 +53,7 @@ const (
 )
 
 type ManagedStream struct {
+	eou     eouTracker // end-of-turn decision/outcome logging (eou_outcome.go)
 	orch    *Orchestrator
 	session *ConversationSession
 	ctx     context.Context
@@ -1864,6 +1865,7 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Duration, seq int) {
 	ms.logger.Info("processUtterance: entered", "seq", seq, "duration_ms", duration.Milliseconds(), "audioBytes", len(audioData))
 	uttEndedAt := time.Now()
+	ms.resolveEOUOutcome(uttEndedAt.Add(-duration))
 	defer func() {
 		ms.mu.Lock()
 		ms.inflightUtterances--
@@ -2247,6 +2249,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	if eouDecides {
 		unfinished = !eouComplete
 	}
+	eouLogged := false
 	if ms.turnComp != nil && unfinished {
 		waitMs := ms.orch.config.SilenceConfirmationMs
 		if waitMs <= 0 {
@@ -2320,6 +2323,12 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				horizonAssisted = true
 			}
 		}
+		eouRule := "waited"
+		if eouDecides && ms.orch.config.EndOfTurnOpenWaitMs > 0 && waitMs == ms.orch.config.EndOfTurnOpenWaitMs && waitMs > ms.orch.config.EndOfTurnWaitMs {
+			eouRule = "open_wait"
+		}
+		ms.logEOUDecision(seq, result, transcript, eouRule, waitMs, lexicalComplete)
+		eouLogged = true
 		ms.mu.Lock()
 		gate := make(chan struct{})
 		ms.confirmationGate = gate
@@ -2405,6 +2414,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"ctx_err", ctx.Err())
 			return
 		}
+	}
+
+	if !eouLogged {
+		ms.logEOUDecision(seq, result, transcript, "answer_now", 0, lexicalComplete)
 	}
 
 	// Barge-in confirmation gate: if this utterance tentatively interrupted a
@@ -3606,6 +3619,7 @@ func splitSentences(text string) []string {
 func (ms *ManagedStream) Close() {
 	ms.closeOnce.Do(func() {
 		ms.isClosed.Store(true)
+		ms.flushEOUOutcome()
 
 		ms.cancelPipeline()
 		ms.cancel()
