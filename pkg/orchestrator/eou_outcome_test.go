@@ -44,7 +44,7 @@ func newEOUStream() (*ManagedStream, *capLogger) {
 
 func TestEOUOutcomeResumedWithinTheWindow(t *testing.T) {
 	ms, lg := newEOUStream()
-	ms.logEOUDecision(3, TranscriptionResult{}, "hello there friend", "waited", 700, true)
+	ms.logEOUDecision(3, TranscriptionResult{}, "hello there friend", "waited", 700, true, [4]float32{}, 0)
 	ms.resolveEOUOutcome(time.Now().Add(900 * time.Millisecond))
 	o := lg.outcomes()
 	if len(o) != 1 || o[0]["resumed"] != true || o[0]["turn_seq"] != 3 {
@@ -54,7 +54,7 @@ func TestEOUOutcomeResumedWithinTheWindow(t *testing.T) {
 
 func TestEOUOutcomeNotResumedWhenTheNextUtteranceIsLater(t *testing.T) {
 	ms, lg := newEOUStream()
-	ms.logEOUDecision(1, TranscriptionResult{}, "hi", "answer_now", 0, true)
+	ms.logEOUDecision(1, TranscriptionResult{}, "hi", "answer_now", 0, true, [4]float32{}, 0)
 	ms.resolveEOUOutcome(time.Now().Add(5 * time.Second))
 	if o := lg.outcomes(); len(o) != 1 || o[0]["resumed"] != false {
 		t.Fatalf("outcomes = %v", o)
@@ -63,8 +63,8 @@ func TestEOUOutcomeNotResumedWhenTheNextUtteranceIsLater(t *testing.T) {
 
 func TestEOUOutcomeClosesEveryDecisionOnce(t *testing.T) {
 	ms, lg := newEOUStream()
-	ms.logEOUDecision(1, TranscriptionResult{}, "a", "answer_now", 0, true)
-	ms.logEOUDecision(2, TranscriptionResult{}, "b", "answer_now", 0, true) // 1 closed: nothing followed it
+	ms.logEOUDecision(1, TranscriptionResult{}, "a", "answer_now", 0, true, [4]float32{}, 0)
+	ms.logEOUDecision(2, TranscriptionResult{}, "b", "answer_now", 0, true, [4]float32{}, 0) // 1 closed: nothing followed it
 	ms.flushEOUOutcome()                                                    // 2 closed at the end of the session
 	ms.flushEOUOutcome()                                                    // no double line
 	o := lg.outcomes()

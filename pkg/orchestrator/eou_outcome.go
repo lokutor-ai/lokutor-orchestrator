@@ -27,7 +27,7 @@ type eouTracker struct {
 
 // logEOUDecision records the decision just taken for utterance seq. rule is "answer_now", "waited" or "open_wait";
 // waitMs is the wait the gate applied (0 for answer_now).
-func (ms *ManagedStream) logEOUDecision(seq int, result TranscriptionResult, transcript, rule string, waitMs int, lexicalComplete bool) {
+func (ms *ManagedStream) logEOUDecision(seq int, result TranscriptionResult, transcript, rule string, waitMs int, lexicalComplete bool, turno [4]float32, turnoFrames int) {
 	// The previous decision, if still unresolved, ended without the caller resuming before this one.
 	ms.eou.mu.Lock()
 	prev := ms.eou.pending
@@ -36,8 +36,14 @@ func (ms *ManagedStream) logEOUDecision(seq int, result TranscriptionResult, tra
 	if prev != nil {
 		ms.logger.Info("eou_outcome", "turn_seq", prev.seq, "resumed", false, "resume_ms", nil, "bot_state", "", "reason", "next_decision")
 	}
+	// Turno's prosody read of the same turn (null when it saw no speech frames): the signal that, with the recogniser's heads, can decide.
+	var tc, ti, tb, tw interface{}
+	if turnoFrames > 0 {
+		tc, ti, tb, tw = turno[0], turno[1], turno[2], turno[3]
+	}
 	ms.logger.Info("eou_decision",
 		"turn_seq", seq,
+		"turno_complete", tc, "turno_incomplete", ti, "turno_backchannel", tb, "turno_wait", tw,
 		"eou", eouOrNil(result), "eou_alt", eouAltOrNil(result), "eou_text", eouTextOrNil(result),
 		"words", countWords(transcript), "chars", len(transcript),
 		"rule", rule, "wait_ms", waitMs, "lexical_complete", lexicalComplete,

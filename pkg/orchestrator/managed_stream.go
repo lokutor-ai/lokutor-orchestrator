@@ -2238,7 +2238,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// on text that looks incomplete. That is the case where the agent talks
 	// over a continuation.
 	turnoSaysHold := false
-	if thr := ms.orch.config.TurnoHoldThreshold; thr > 0 && !eouDecides && ms.turnoTurn != nil && turnoFrames > 0 {
+	// Turno's prosody joins the recogniser's heads: when TURNO_HOLD_THRESHOLD is set, a turn it reads as unfinished is held whoever else says finished.
+	if thr := ms.orch.config.TurnoHoldThreshold; thr > 0 && ms.turnoTurn != nil && turnoFrames > 0 {
 		// p_incomplete + p_wait: "not finished" and "pausing, expecting to go
 		// on" are both reasons to keep the floor with the caller.
 		turnoSaysHold = (turnoState[1] + turnoState[3]) >= thr
@@ -2247,7 +2248,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// The verdict: the recogniser's when it decides, the lexical gate's (and Turno's hold) otherwise.
 	unfinished := !lexicalComplete || turnoSaysHold
 	if eouDecides {
-		unfinished = !eouComplete
+		unfinished = !eouComplete || turnoSaysHold
 		// Words that read as clearly unfinished ("I want to book a flight to", "... uh") hold the turn WHATEVER the audio head
 		// says (2026-11-04): a confident eou used to answer them at once, and the longer open wait below was only reached
 		// by turns the eou had already marked unfinished.
@@ -2343,7 +2344,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		if eouDecides && ms.orch.config.EndOfTurnOpenWaitMs > 0 && waitMs == ms.orch.config.EndOfTurnOpenWaitMs && waitMs > ms.orch.config.EndOfTurnWaitMs {
 			eouRule = "open_wait"
 		}
-		ms.logEOUDecision(seq, result, transcript, eouRule, waitMs, lexicalComplete)
+		ms.logEOUDecision(seq, result, transcript, eouRule, waitMs, lexicalComplete, turnoState, turnoFrames)
 		eouLogged = true
 		ms.mu.Lock()
 		gate := make(chan struct{})
@@ -2433,7 +2434,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	}
 
 	if !eouLogged {
-		ms.logEOUDecision(seq, result, transcript, "answer_now", 0, lexicalComplete)
+		ms.logEOUDecision(seq, result, transcript, "answer_now", 0, lexicalComplete, turnoState, turnoFrames)
 	}
 
 	// Barge-in confirmation gate: if this utterance tentatively interrupted a
