@@ -50,7 +50,7 @@ func eouTurnWait(t *testing.T, stt eouSTT, threshold float64, useAlt ...bool) in
 
 // The recogniser ends every transcript with a full stop, so "...an appointment for." reads as finished and was
 // answered after the VAD hangover alone. With a threshold its probability decides: low waits for the caller to go on
-// (EndOfTurnWaitMs), high answers at once even when the words trail off; and with none set nothing changes.
+// (EndOfTurnWaitMs), high answers a finished sentence at once (not one that stops on a conjunction or article); and with none set nothing changes.
 func TestEndOfTurnProbabilityDecidesTheWait(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -59,7 +59,8 @@ func TestEndOfTurnProbabilityDecidesTheWait(t *testing.T) {
 		wantWait  bool
 	}{
 		{"low probability waits though the text ends in a full stop", eouSTT{"I'd like to book an appointment for.", 0.1, true, nil}, 0.7, true},
-		{"high probability answers though the words trail off", eouSTT{"I want to book a table, and", 0.95, true, nil}, 0.7, false},
+		{"high probability answers a finished sentence", eouSTT{"I want to book a table for two.", 0.95, true, nil}, 0.7, false},
+		{"high probability does not answer a sentence that stops on a conjunction (2026-11-04)", eouSTT{"I want to book a table, and", 0.95, true, nil}, 0.7, true},
 		{"shadow: no threshold leaves the full stop's verdict", eouSTT{"I'd like to book an appointment for.", 0.1, true, nil}, 0, false},
 		{"no probability falls back to the lexical gate", eouSTT{"I want to book a table, and", 0, false, nil}, 0.7, true},
 	} {
@@ -203,7 +204,7 @@ func TestClearlyOpenWordsGetTheLongerWait(t *testing.T) {
 		cfg.EndOfTurnWaitMs = 150
 		cfg.EndOfTurnOpenThreshold = 0.05
 		cfg.EndOfTurnOpenWaitMs = 450
-		orch := NewWithAllLayers(eouSTT{"Quería reservar una cita para el.", e, true, &alt}, &sequencedLLM{responses: []string{"Claro."}}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
+		orch := NewWithAllLayers(eouSTT{"Quería reservar una cita para mañana.", e, true, &alt}, &sequencedLLM{responses: []string{"Claro."}}, fixedAudioTTS{}, nil, cfg, &NoOpLogger{})
 		stream := orch.NewManagedStream(context.Background(), NewConversationSession("open"))
 		defer stream.Close()
 		stream.mu.Lock()
