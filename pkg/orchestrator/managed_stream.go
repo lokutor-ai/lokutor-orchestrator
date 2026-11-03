@@ -2248,6 +2248,18 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	unfinished := !lexicalComplete || turnoSaysHold
 	if eouDecides {
 		unfinished = !eouComplete
+		// Words that read as clearly unfinished ("I want to book a flight to", "... uh") hold the turn WHATEVER the audio head
+		// says (2026-11-04): a confident eou used to answer them at once, and the longer open wait below was only reached
+		// by turns the eou had already marked unfinished.
+		if thr := ms.orch.config.EndOfTurnOpenThreshold; thr > 0 {
+			open, ok := wordsReadOpen(result)
+			if !ok || eouVal < open {
+				open, ok = eouVal, true
+			}
+			if ok && open < thr {
+				unfinished = true
+			}
+		}
 	}
 	eouLogged := false
 	if ms.turnComp != nil && unfinished {
