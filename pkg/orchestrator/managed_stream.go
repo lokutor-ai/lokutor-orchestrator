@@ -2266,6 +2266,12 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			}
 		}
 	}
+	adaptMs := ms.eouAdaptMs()
+	adaptOnly := false
+	if eouDecides && !unfinished && adaptMs > 0 && ms.orch.config.EndOfTurnAdaptAnswerNow {
+		// A caller who has shown in this call that they resume gets a pause even when the heads say finished.
+		unfinished, adaptOnly = true, true
+	}
 	eouLogged := false
 	if ms.turnComp != nil && unfinished {
 		waitMs := ms.orch.config.SilenceConfirmationMs
@@ -2340,11 +2346,18 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				horizonAssisted = true
 			}
 		}
+		if adaptOnly {
+			waitMs = adaptMs
+		} else if adaptMs > 0 {
+			waitMs += adaptMs
+		}
 		eouRule := "waited"
-		if eouDecides && ms.orch.config.EndOfTurnOpenWaitMs > 0 && waitMs == ms.orch.config.EndOfTurnOpenWaitMs && waitMs > ms.orch.config.EndOfTurnWaitMs {
+		if adaptOnly {
+			eouRule = "adapt_wait"
+		} else if eouDecides && ms.orch.config.EndOfTurnOpenWaitMs > 0 && waitMs-adaptMs == ms.orch.config.EndOfTurnOpenWaitMs && waitMs-adaptMs > ms.orch.config.EndOfTurnWaitMs {
 			eouRule = "open_wait"
 		}
-		ms.logEOUDecision(seq, result, transcript, eouRule, waitMs, lexicalComplete, turnoState, turnoFrames)
+		ms.logEOUDecision(seq, result, transcript, eouRule, waitMs, lexicalComplete, turnoState, turnoFrames, adaptMs)
 		eouLogged = true
 		ms.mu.Lock()
 		gate := make(chan struct{})
@@ -2434,7 +2447,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	}
 
 	if !eouLogged {
-		ms.logEOUDecision(seq, result, transcript, "answer_now", 0, lexicalComplete, turnoState, turnoFrames)
+		ms.logEOUDecision(seq, result, transcript, "answer_now", 0, lexicalComplete, turnoState, turnoFrames, adaptMs)
 	}
 
 	// Barge-in confirmation gate: if this utterance tentatively interrupted a

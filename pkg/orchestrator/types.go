@@ -361,6 +361,11 @@ type Config struct {
 	// going on, often after a longer pause than a short wait allows. Zero disables it.
 	EndOfTurnOpenThreshold float64
 	EndOfTurnOpenWaitMs    int
+	// Adaptive patience (2026-11-04): each time the caller resumes within eouResumeWindow of a decision in this call, every wait of the call grows by
+	// EndOfTurnAdaptStepMs, up to EndOfTurnAdaptMaxMs; with EndOfTurnAdaptAnswerNow even a turn the heads call finished waits that long. 0 step = off.
+	EndOfTurnAdaptStepMs    int
+	EndOfTurnAdaptMaxMs     int
+	EndOfTurnAdaptAnswerNow bool
 
 	// TurnoHoldMs is how long a Turno-flagged turn is held. Deliberately much
 	// shorter than SilenceConfirmationMs: the text does look complete, so this
