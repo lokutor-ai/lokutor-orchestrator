@@ -111,8 +111,11 @@ func TestAdaptivePatienceDecaysAfterThreeCalmDecisions(t *testing.T) {
 
 func TestOpenScoreTakesTheLowestHead(t *testing.T) {
 	r := TranscriptionResult{HasEndOfTurnText: true, EndOfTurnText: 0.6, HasEndOfTurnAlt: true, EndOfTurnAlt: 0.005}
-	if got, _ := openScore(r, 0.84); got != 0.005 {
-		t.Errorf("alt head is the lowest, got %v", got)
+	if got, _ := openScore(r, 0.84); got != 0.6 {
+		t.Errorf("the text head is the one that counts, not the second audio head, got %v", got)
+	}
+	if got, _ := openScore(TranscriptionResult{HasEndOfTurnAlt: true, EndOfTurnAlt: 0.01}, 0.84); got != 0.01 {
+		t.Errorf("with no text head the second audio head stands in, got %v", got)
 	}
 	if got, _ := openScore(TranscriptionResult{}, 0.84); got != 0.84 {
 		t.Errorf("no other head: the deciding probability, got %v", got)

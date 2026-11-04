@@ -222,15 +222,13 @@ func wordsReadOpen(r TranscriptionResult) (float64, bool) {
 	return 0, false
 }
 
-// openScore is how finished the turn reads at its least: the lowest of the text head, the second audio head and the deciding probability itself
-// (2026-11-04). A turn is "clearly unfinished" when this is under EndOfTurnOpenThreshold.
+// openScore is how finished the turn reads at its least: the lower of the text head (the second audio head when there is no text head) and the
+// deciding probability itself. A turn is "clearly unfinished" when this is under EndOfTurnOpenThreshold. (The second audio head was part of the min
+// for a few hours on 2026-11-04 and delayed too many real turn ends.)
 func openScore(r TranscriptionResult, eouVal float64) (float64, bool) {
-	best, ok := eouVal, true
-	if r.HasEndOfTurnText && r.EndOfTurnText < best {
-		best = r.EndOfTurnText
+	best := eouVal
+	if words, ok := wordsReadOpen(r); ok && words < best {
+		best = words
 	}
-	if r.HasEndOfTurnAlt && r.EndOfTurnAlt < best {
-		best = r.EndOfTurnAlt
-	}
-	return best, ok
+	return best, true
 }
