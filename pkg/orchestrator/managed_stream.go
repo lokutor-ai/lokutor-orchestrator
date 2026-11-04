@@ -2256,11 +2256,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// reliable, and holding such a reply for seconds reads as the agent ignoring the caller (2026-11-04).
 		if countWords(transcript) >= 3 {
 			if thr := ms.orch.config.EndOfTurnOpenThreshold; thr > 0 {
-				open, ok := wordsReadOpen(result)
-				if !ok || eouVal < open {
-					open, ok = eouVal, true
-				}
-				if ok && open < thr {
+				if open, ok := openScore(result, eouVal); ok && open < thr {
 					unfinished = true
 				}
 			}
@@ -2283,10 +2279,7 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		}
 		// Clearly unfinished, by the words (eou_text) or by how it sounded (the deciding probability itself): give the
 		// caller the longer margin.
-		open, ok := wordsReadOpen(result)
-		if !ok || eouVal < open {
-			open, ok = eouVal, true
-		}
+		open, ok := openScore(result, eouVal)
 		if eouDecides && ok && ms.orch.config.EndOfTurnOpenThreshold > 0 &&
 			ms.orch.config.EndOfTurnOpenWaitMs > waitMs && open < ms.orch.config.EndOfTurnOpenThreshold {
 			ms.logger.Info("End of turn: the words read as clearly unfinished, longer wait",

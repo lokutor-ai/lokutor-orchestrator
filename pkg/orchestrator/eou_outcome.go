@@ -24,6 +24,7 @@ type eouTracker struct {
 	mu      sync.Mutex
 	pending *eouPending
 	events  int // resumes seen in this call (adaptive patience)
+	calm    int // decisions in a row that nobody resumed after: three of them take one event back
 }
 
 // logEOUDecision records the decision just taken for utterance seq. rule is "answer_now", "waited" or "open_wait";
@@ -94,11 +95,18 @@ func (ms *ManagedStream) resolveEOUOutcome(newSpeechStart time.Time) {
 	if d <= eouResumeWindow {
 		ms.eou.mu.Lock()
 		ms.eou.events++
+		ms.eou.calm = 0
 		ms.eou.mu.Unlock()
 		ms.logger.Info("eou_outcome", "turn_seq", p.seq, "resumed", true, "resume_ms", d.Milliseconds(), "bot_state", state, "reason", "new_utterance",
 			"audio_started_ms", audioStarted, "resumed_after_audio", resumedAfterAudio)
 		return
 	}
+	ms.eou.mu.Lock()
+	if ms.eou.calm++; ms.eou.calm >= 3 && ms.eou.events > 0 {
+		ms.eou.events--
+		ms.eou.calm = 0
+	}
+	ms.eou.mu.Unlock()
 	ms.logger.Info("eou_outcome", "turn_seq", p.seq, "resumed", false, "resume_ms", d.Milliseconds(), "bot_state", state, "reason", "new_utterance_later",
 		"audio_started_ms", audioStarted, "resumed_after_audio", resumedAfterAudio)
 }

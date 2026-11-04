@@ -91,3 +91,30 @@ func TestAdaptivePatienceGrowsPerResumeAndIsCapped(t *testing.T) {
 		t.Fatal("step 0 is off")
 	}
 }
+
+func TestAdaptivePatienceDecaysAfterThreeCalmDecisions(t *testing.T) {
+	ms, _ := newEOUStream()
+	ms.orch.config.EndOfTurnAdaptStepMs, ms.orch.config.EndOfTurnAdaptMaxMs = 400, 1600
+	ms.logEOUDecision(1, TranscriptionResult{}, "a b c", "waited", 700, true, [4]float32{}, 0, 0)
+	ms.resolveEOUOutcome(time.Now().Add(200 * time.Millisecond)) // one resume: 400 ms earned
+	if ms.eouAdaptMs() != 400 {
+		t.Fatalf("want 400, got %d", ms.eouAdaptMs())
+	}
+	for i := 2; i <= 4; i++ {
+		ms.logEOUDecision(i, TranscriptionResult{}, "a b c", "answer_now", 0, true, [4]float32{}, 0, 0)
+		ms.resolveEOUOutcome(time.Now().Add(9 * time.Second)) // nobody resumed
+	}
+	if ms.eouAdaptMs() != 0 {
+		t.Fatalf("three calm decisions in a row should take the event back, got %d", ms.eouAdaptMs())
+	}
+}
+
+func TestOpenScoreTakesTheLowestHead(t *testing.T) {
+	r := TranscriptionResult{HasEndOfTurnText: true, EndOfTurnText: 0.6, HasEndOfTurnAlt: true, EndOfTurnAlt: 0.005}
+	if got, _ := openScore(r, 0.84); got != 0.005 {
+		t.Errorf("alt head is the lowest, got %v", got)
+	}
+	if got, _ := openScore(TranscriptionResult{}, 0.84); got != 0.84 {
+		t.Errorf("no other head: the deciding probability, got %v", got)
+	}
+}
