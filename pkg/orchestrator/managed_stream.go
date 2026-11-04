@@ -326,6 +326,9 @@ type ManagedStream struct {
 	// not to the moment the server finished generating and sending it — see the comment on its use
 	// at the end of speakText for the incident this closes.
 	turnAudioBytes int64
+	// segIdx counts the segments spoken in the current turn and segPrevTrailMs is the previous segment's trailing silence (tts_segment log).
+	segIdx         int
+	segPrevTrailMs int64
 
 	// silenceNudgeSent gates monitorInactivity's silence-timeout reprompt to
 	// at most once per idle stretch — it used to have no such gate and would
@@ -2754,6 +2757,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	// Reset with them: turnAudioBytes accumulates across every sentence of THIS turn, same lifetime
 	// as ttsStartTime above — see its field comment.
 	ms.turnAudioBytes = 0
+	ms.segIdx, ms.segPrevTrailMs = 0, 0
 
 	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
 		ms.mu.Lock()
@@ -2994,7 +2998,14 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// Only one StreamSynthesize call per session at a time.
 	ms.ttsMu.Lock()
 	voice, lang := ms.session.GetCurrentVoice(), ms.session.GetCurrentLanguage()
+	probe := newSegmentProbe(ms.playbackRate)
+	segStart := time.Now()
+	ms.mu.Lock()
+	bytesBefore, segIdx, prevTrail := ms.turnAudioBytes, ms.segIdx, ms.segPrevTrailMs
+	ms.segIdx++
+	ms.mu.Unlock()
 	onChunk := func(chunk []byte) error {
+		probe.add(chunk)
 		ms.mu.Lock()
 		ms.lastAudioSentAt = time.Now()
 		ms.responseChunksSent++
@@ -3051,6 +3062,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 		err = ms.orch.SynthesizeStream(sCtx, text, voice, lang, onChunk)
 	}
 	ms.ttsMu.Unlock()
+	ms.logTTSSegment(probe, text, string(lang), segIdx, bytesBefore, prevTrail, segStart, sCtx.Err() != nil)
 
 	if !started && len(jitterBuf) > 0 {
 		ms.emitFrames(jitterBuf, frameSize, gen)

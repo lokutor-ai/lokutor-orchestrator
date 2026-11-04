@@ -121,3 +121,32 @@ func TestOpenScoreTakesTheLowestHead(t *testing.T) {
 		t.Errorf("no other head: the deciding probability, got %v", got)
 	}
 }
+
+func TestSegmentProbeMeasuresLeadingAndTrailingSilence(t *testing.T) {
+	rate := 16000
+	p := newSegmentProbe(rate)
+	pcm := func(ms int, amp int16) []byte {
+		n := rate * ms / 1000
+		b := make([]byte, n*2)
+		for i := 0; i < n; i++ {
+			v := amp
+			if i%2 == 1 {
+				v = -amp
+			}
+			b[2*i], b[2*i+1] = byte(uint16(v)), byte(uint16(v)>>8)
+		}
+		return b
+	}
+	p.add(pcm(120, 0))
+	p.add(pcm(300, 6000))
+	p.add(pcm(200, 0))
+	if p.leadingMs() < 110 || p.leadingMs() > 130 {
+		t.Errorf("leading silence = %d ms, want ~120", p.leadingMs())
+	}
+	if p.trailingMs() < 190 || p.trailingMs() > 210 {
+		t.Errorf("trailing silence = %d ms, want ~200", p.trailingMs())
+	}
+	if p.ms(p.bytes) != 620 {
+		t.Errorf("audio = %d ms, want 620", p.ms(p.bytes))
+	}
+}
