@@ -134,6 +134,12 @@ func parseToolCallMarker(response string) ([]ToolCallEventData, bool) {
 // had been booked (2026-09-30).
 func (ms *ManagedStream) dispatchToolCall(ctx context.Context, tcData ToolCallEventData) string {
 	start := time.Now()
+	if msg := checkToolArguments(ms.session.GetTools(), tcData.Name, tcData.Arguments); msg != "" {
+		// Refused before it runs, as the tool's result: the model reads it this turn and calls again or
+		// asks the caller. Logged, so a model that keeps sending blank arguments shows up (rule 6).
+		ms.logger.Warn("Tool call refused: arguments cannot be right", "tool", tcData.Name, "reason", clipForLog(msg))
+		return fmt.Sprintf(`{"error": %s}`, jsonQuote(msg))
+	}
 	res := ms.runToolCall(ctx, tcData)
 	ms.mu.Lock()
 	gen := ms.payloadGen
