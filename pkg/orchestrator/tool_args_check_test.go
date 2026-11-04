@@ -44,3 +44,23 @@ func TestCheckToolArguments(t *testing.T) {
 		}
 	}
 }
+
+func TestCallToolRunsTheHandlerAndChecksArguments(t *testing.T) {
+	o := &Orchestrator{toolHandlers: map[string]ToolHandler{}}
+	var got string
+	o.RegisterTool("book", func(args string) (string, error) { got = args; return `{"ok":true}`, nil })
+	if !o.HasTool("book") || o.HasTool("nope") {
+		t.Fatal("HasTool")
+	}
+	if _, ok := o.CallTool(testTools(), "nope", `{}`); ok {
+		t.Fatal("no handler must be reported")
+	}
+	res, ok := o.CallTool(testTools(), "book", `{"name":"","party":2}`)
+	if !ok || !strings.Contains(res, "not run") || got != "" {
+		t.Fatalf("blank arguments must not reach the handler: %q %v %q", res, ok, got)
+	}
+	res, _ = o.CallTool(testTools(), "book", `{"name":"Ana","party":2}`)
+	if res != `{"ok":true}` || !strings.Contains(got, "Ana") {
+		t.Fatalf("handler not run: %q %q", res, got)
+	}
+}

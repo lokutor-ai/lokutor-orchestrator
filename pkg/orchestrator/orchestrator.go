@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -82,6 +83,37 @@ func (o *Orchestrator) SummarizeContext(ctx context.Context, session *Conversati
 		fold()
 	}
 	return ctx.Err()
+}
+
+// HasTool reports whether a server-side handler is registered under name.
+func (o *Orchestrator) HasTool(name string) bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	_, ok := o.toolHandlers[name]
+	return ok
+}
+
+// CallTool runs the server-side handler registered under name, as the conversation's own tool calls do
+// (same handler, same arguments check), for a host that runs tools outside a turn: a background task. A
+// handler's failure comes back as the {"error": ...} result the model would have seen. ok is false when
+// no handler is registered (a client-side tool cannot be called from here).
+func (o *Orchestrator) CallTool(tools []Tool, name, args string) (result string, ok bool) {
+	o.mu.RLock()
+	handler, found := o.toolHandlers[name]
+	o.mu.RUnlock()
+	if !found {
+		return "", false
+	}
+	if msg := checkToolArguments(tools, name, args); msg != "" {
+		b, _ := json.Marshal(msg)
+		return `{"error": ` + string(b) + `}`, true
+	}
+	res, err := handler(args)
+	if err != nil {
+		b, _ := json.Marshal(err.Error())
+		return `{"error": ` + string(b) + `}`, true
+	}
+	return res, true
 }
 
 func (o *Orchestrator) RegisterTool(name string, handler ToolHandler) {
