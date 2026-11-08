@@ -367,6 +367,10 @@ type Config struct {
 	EndOfTurnAdaptMaxMs     int
 	EndOfTurnAdaptAnswerNow bool
 
+	// EOUTextSink, when set, receives the words of each end-of-turn decision (what the caller said, the agent's last
+	// reply, the language). The orchestrator never logs them; the embedder decides where they go and for how long. Nil = nothing leaves.
+	EOUTextSink func(EOUText)
+
 	// TurnoHoldMs is how long a Turno-flagged turn is held. Deliberately much
 	// shorter than SilenceConfirmationMs: the text does look complete, so this
 	// is a grace window, not a full mid-thought wait.
@@ -868,4 +872,13 @@ func (s *ConversationSession) ResetToolCallCounts() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.toolCallCounts = make(map[string]int)
+}
+
+// EOUText is the words behind one end-of-turn decision (Config.EOUTextSink); TurnSeq is the same number the eou_decision
+// and eou_outcome log lines carry.
+type EOUText struct {
+	TurnSeq   int
+	Text      string // the caller's transcript at decision time
+	PrevAgent string // the agent's last reply, "" when it has not spoken yet
+	Language  string
 }

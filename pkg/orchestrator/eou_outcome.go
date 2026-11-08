@@ -9,7 +9,7 @@ import (
 // End-of-turn decision and outcome logging (2026-11-03). Every end-of-turn decision writes one "eou_decision" line, and the
 // next thing that happens writes one "eou_outcome" line for it: did the caller resume within eouResumeWindow of the
 // decision, and in which state was the agent. Both carry only derived features (scores, counts, the rule that fired), never
-// the words, so the pair can be exported and used to calibrate the end-of-turn model on real outcomes. Field names are
+// the words (those go to Config.EOUTextSink, if the embedder set one), so the pair can be exported and used to calibrate the end-of-turn model on real outcomes. Field names are
 // stable; the session_id and transport come with the logger.
 
 const eouResumeWindow = 2 * time.Second
@@ -59,6 +59,16 @@ func (ms *ManagedStream) logEOUDecision(seq int, result TranscriptionResult, tra
 	var tc, ti, tb, tw interface{}
 	if turnoFrames > 0 {
 		tc, ti, tb, tw = turno[0], turno[1], turno[2], turno[3]
+	}
+	if sink := ms.orch.config.EOUTextSink; sink != nil {
+		ms.mu.Lock()
+		prevAgent := ms.lastReply.text
+		ms.mu.Unlock()
+		lang := ""
+		if ms.session != nil {
+			lang = string(ms.session.GetCurrentLanguage())
+		}
+		sink(EOUText{TurnSeq: seq, Text: transcript, PrevAgent: prevAgent, Language: lang})
 	}
 	ms.logger.Info("eou_decision",
 		"turn_seq", seq,

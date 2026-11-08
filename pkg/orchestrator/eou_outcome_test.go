@@ -150,3 +150,26 @@ func TestSegmentProbeMeasuresLeadingAndTrailingSilence(t *testing.T) {
 		t.Errorf("audio = %d ms, want 620", p.ms(p.bytes))
 	}
 }
+
+func TestEOUTextGoesToTheSinkNotTheLog(t *testing.T) {
+	ms, lg := newEOUStream()
+	var got []EOUText
+	ms.orch.config.EOUTextSink = func(e EOUText) { got = append(got, e) }
+	ms.lastReply = replyRecord{gen: 1, text: "How can I help?"}
+	ms.logEOUDecision(4, TranscriptionResult{}, "I would like to book", "waited", 700, true, [4]float32{}, 0, 0)
+	if len(got) != 1 || got[0].TurnSeq != 4 || got[0].Text != "I would like to book" || got[0].PrevAgent != "How can I help?" {
+		t.Fatalf("sink got %+v", got)
+	}
+	lg.mu.Lock()
+	defer lg.mu.Unlock()
+	for _, l := range lg.lines {
+		for k, v := range l {
+			if s, ok := v.(string); ok && (s == "I would like to book" || s == "How can I help?") {
+				t.Fatalf("call words reached the log under %q", k)
+			}
+		}
+	}
+	// no sink: nothing is called and the existing lines are unchanged
+	ms2, _ := newEOUStream()
+	ms2.logEOUDecision(1, TranscriptionResult{}, "hi", "answer_now", 0, true, [4]float32{}, 0, 0)
+}
