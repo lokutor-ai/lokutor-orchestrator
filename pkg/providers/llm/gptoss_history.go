@@ -85,6 +85,7 @@ func forGptOss(model string, messages []orchestrator.Message, where GptOssToolHi
 	if !strings.Contains(strings.ToLower(model), "gpt-oss") {
 		return messages
 	}
+	messages = gptOssCallsWithoutWords(messages)
 	if where == "" {
 		where = defaultGptOssToolHistory
 	}
@@ -166,4 +167,27 @@ func toolCallsIn(v interface{}) []toolCallRecord {
 		return nil
 	}
 	return calls
+}
+
+// gptOssCallsWithoutWords blanks the words of the assistant messages that carry tool calls. Since
+// 2026-11-11 the orchestrator records what the model said before its calls with them, since the caller
+// heard it and a model that cannot see it says it again. gpt-oss garbles the reply after a tool call when
+// that message has words: 5 of 23 replies against 2 of 22 in lokutor_tts's LIVE_SAID A/B (2026-10-15).
+// So it is sent the history it had before. The caller's messages are never touched, and the slice it was
+// given is not changed.
+func gptOssCallsWithoutWords(messages []orchestrator.Message) []orchestrator.Message {
+	var out []orchestrator.Message
+	for i, m := range messages {
+		if m.ToolCalls == nil || m.Content == "" {
+			continue
+		}
+		if out == nil {
+			out = append([]orchestrator.Message(nil), messages...)
+		}
+		out[i].Content = ""
+	}
+	if out == nil {
+		return messages
+	}
+	return out
 }

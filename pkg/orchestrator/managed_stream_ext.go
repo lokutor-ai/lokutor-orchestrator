@@ -454,10 +454,19 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	// offer. It is also part of what the reply records (below), since it was said.
 	alreadySaid := ""
 	var spokenThisTry []string
+	// saidBeforeCalls is the model's own words before its tool calls (not the platform's filler). They are
+	// spoken, so they are recorded with the calls: a model that says its goodbye, or "le reservo el viernes",
+	// before calling the tool, and then sees a history without those words, said them again after the
+	// result. Claude Haiku 5.5 did it in most simulated calls that ended with end_call or booked
+	// (2026-11-11, lokutor_tts finance/measurements/talker_2026-11-11/). A gpt-oss provider strips them again
+	// (providers/llm gptOssCallsWithoutWords): gpt-oss garbles the reply after a tool call when the
+	// message carrying the calls has words (2026-10-15).
+	var saidBeforeCalls strings.Builder
 	tryCtx := ctx
 	for attempt := 1; ; attempt++ {
 		unspeakable = ""
 		spokenThisTry = nil
+		saidBeforeCalls.Reset()
 		_, err = provider.StreamComplete(tryCtx, messages, ms.toolsOffered(userTranscript),
 			func(chunk string) error {
 				fullText.WriteString(chunk)
@@ -534,6 +543,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					// the tail a third way at the end of the turn: "Un momento, lo miro." was heard twice, a
 					// goodbye before end_call twice (2026-10-16, TestPreToolWordsSpokenOnce).
 					flushSentence()
+					saidBeforeCalls.WriteString(" " + strings.TrimSpace(fullText.String()))
 					fullText.Reset()
 				} else if firstCall {
 					// No pending text — speak a filler so there's no dead air while the tool
@@ -637,7 +647,21 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		for _, tr := range toolResults {
 			ms.emit(ToolResult, tr)
 		}
-		ms.recordToolExchange(response, toolResults)
+		said := strings.TrimSpace(alreadySaid + " " + saidBeforeCalls.String() + " " + response)
+		ms.recordToolExchange(said, toolResults)
+		if said != "" && ms.orch.allFinalTools(toolResults) {
+			// The model said its words with a call that ends the turn (a goodbye with end_call): they were
+			// spoken and are recorded with the call, so the turn is over (Orchestrator.SetFinalTools).
+			ms.emitBotResponseWithGen(said, gen)
+			ms.logger.Info("Turn ends with its final tool call: no reply asked after it", "gen", gen,
+				"tools", len(toolResults))
+			ms.mu.Lock()
+			if ms.state != StateInterrupted {
+				ms.state = StateIdle
+			}
+			ms.mu.Unlock()
+			return
+		}
 
 		go func() {
 			freshCtx, c := context.WithCancel(ms.ctx)
@@ -785,7 +809,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			}
 			ms.logRunOns(gen, turnTokens)
 			if text == "" {
-				text = "Got it."
+				// In the call's language: this was "Got it." on every call, Spanish ones included.
+				text = gotItForLang(ms.session.GetCurrentLanguage())
 			}
 
 			ms.session.AddMessage("assistant", text)
@@ -861,6 +886,30 @@ func thinkingFillerForLang(lang Language) string {
 		return "Hmm, deixa-me pensar um momento."
 	default:
 		return "Hmm, let me think about that for a second."
+	}
+}
+
+// gotItForLang is the acknowledgement said when the model answers a tool result with no words.
+func gotItForLang(lang Language) string {
+	switch lang {
+	case LanguageEs:
+		return "Vale."
+	case LanguageCa:
+		return "D'acord."
+	case LanguageGl:
+		return "Vale."
+	case LanguageEu:
+		return "Ados."
+	case LanguageFr:
+		return "D'accord."
+	case LanguageDe:
+		return "Alles klar."
+	case LanguageIt:
+		return "Va bene."
+	case LanguagePt:
+		return "Certo."
+	default:
+		return "Got it."
 	}
 }
 

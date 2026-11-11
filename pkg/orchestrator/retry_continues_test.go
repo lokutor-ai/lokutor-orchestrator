@@ -180,3 +180,82 @@ func TestOnlyTheTurnsFirstSentenceIsTheOpener(t *testing.T) {
 		}
 	}
 }
+
+// The model's own words before its calls are recorded with the calls, since the caller heard them; a
+// model that cannot see them says them again after the result (Claude Haiku 5.5, 2026-11-11). The
+// platform's filler is not the model's and is not recorded.
+func TestPreToolWordsRecordedWithTheCalls(t *testing.T) {
+	for _, tc := range []struct{ pre, want string }{
+		{"Vale, le reservo el viernes a las nueve y media.", "Vale, le reservo el viernes a las nueve y media."},
+		{"", ""},
+	} {
+		llm := &MockStreamingLLM{responses: []struct {
+			content   string
+			toolCalls []ToolCallEventData
+		}{
+			{content: tc.pre, toolCalls: []ToolCallEventData{{Name: "lookup", Arguments: `{}`, CallID: "c1"}}},
+			{content: "Hecho.", toolCalls: nil},
+		}}
+		tts := &countingTTS{}
+		orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+		orch.RegisterTool("lookup", func(args string) (string, error) { return `{"ok":true}`, nil })
+		session := NewConversationSession("pre-tool-recorded")
+		session.SetTools([]Tool{{Type: "function", Function: map[string]interface{}{"name": "lookup"}}})
+		ms := orch.NewManagedStream(context.Background(), session)
+		ms.runLLMAndTTS(context.Background(), "el viernes a las nueve y media")
+		found := false
+		for _, m := range session.GetContextCopy() {
+			if m.Role == "assistant" && m.ToolCalls != nil {
+				found = true
+				if m.Content != tc.want {
+					t.Errorf("pre %q: the message carrying the call has %q, want %q", tc.pre, m.Content, tc.want)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("pre %q: no assistant message carries the call", tc.pre)
+		}
+		ms.Close()
+	}
+}
+
+// A goodbye said with a final tool (end_call) ends the turn: the model is not asked again after the result,
+// where it said the goodbye a second time. Said without words, the call is answered as before, so the model
+// can say its goodbye then.
+func TestFinalToolEndsTheTurnWithItsWords(t *testing.T) {
+	for _, tc := range []struct {
+		pre        string
+		wantRounds int
+		wantSaid   string
+	}{
+		{"Hasta el viernes, Carmen. Adiós.", 1, "Hasta el viernes"},
+		{"", 2, "Adiós, que vaya bien"},
+	} {
+		llm := &MockStreamingLLM{responses: []struct {
+			content   string
+			toolCalls []ToolCallEventData
+		}{
+			{content: tc.pre, toolCalls: []ToolCallEventData{{Name: "end_call", Arguments: `{"reason":"user_ended"}`, CallID: "e1"}}},
+			{content: "Adiós, que vaya bien.", toolCalls: nil},
+		}}
+		tts := &countingTTS{}
+		orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+		orch.RegisterTool("end_call", func(args string) (string, error) { return `{"ok":true}`, nil })
+		orch.SetFinalTools("end_call")
+		session := NewConversationSession("final-tool")
+		session.SetTools([]Tool{{Type: "function", Function: map[string]interface{}{"name": "end_call"}}})
+		ms := orch.NewManagedStream(context.Background(), session)
+		ms.runLLMAndTTS(context.Background(), "gracias, adiós")
+		time.Sleep(300 * time.Millisecond) // a reply after the result is asked for in its own goroutine
+		tts.mu.Lock()
+		joined := strings.Join(tts.said, " | ")
+		tts.mu.Unlock()
+		if llm.callCount != tc.wantRounds {
+			t.Errorf("pre %q: the model was asked %d times, want %d (%s)", tc.pre, llm.callCount, tc.wantRounds, joined)
+		}
+		if !strings.Contains(joined, tc.wantSaid) || strings.Count(joined, "Adiós") > 1 {
+			t.Errorf("pre %q: said %s", tc.pre, joined)
+		}
+		ms.Close()
+	}
+}

@@ -24,6 +24,8 @@ type Orchestrator struct {
 	mu     sync.RWMutex
 
 	toolHandlers map[string]ToolHandler
+	// finalTools end the agent's turn when called with words (SetFinalTools).
+	finalTools map[string]bool
 }
 
 // New creates an orchestrator with STT, LLM, TTS providers and config.
@@ -120,6 +122,37 @@ func (o *Orchestrator) RegisterTool(name string, handler ToolHandler) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.toolHandlers[name] = handler
+}
+
+// SetFinalTools names the tools whose call ends the agent's turn, such as hanging up. When the model said
+// words with the call (its goodbye with end_call), the turn ends with them: it is not asked for another
+// reply after the result. When it said nothing with the call, it is asked as for any tool, so it can say
+// its goodbye then. Asked again after a goodbye it had said, Claude Haiku 5.5 said a second goodbye in
+// every simulated call that ended with end_call. Told by the result to say nothing, it said "Got it." or
+// "Call ended.", in English, on Spanish calls (lokutor_tts, 2026-11-11). A round that also calls a tool
+// that is not final is answered as before, since its result may be news for the caller.
+func (o *Orchestrator) SetFinalTools(names ...string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.finalTools = map[string]bool{}
+	for _, n := range names {
+		o.finalTools[n] = true
+	}
+}
+
+// allFinalTools reports whether every call in calls is to a final tool (and there is at least one).
+func (o *Orchestrator) allFinalTools(calls []toolExchange) bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if len(calls) == 0 || len(o.finalTools) == 0 {
+		return false
+	}
+	for _, c := range calls {
+		if !o.finalTools[c.TC.Name] {
+			return false
+		}
+	}
+	return true
 }
 
 // SetRAGProvider registers an optional RAG provider for turn-time knowledge

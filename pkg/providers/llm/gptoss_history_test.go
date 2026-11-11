@@ -84,3 +84,29 @@ func TestSetGptOssToolHistory(t *testing.T) {
 	_, ok = ParseGptOssToolHistory("prompt")
 	assert.False(t, ok, "the fold into the system prompt was measured and not kept")
 }
+
+// gpt-oss is sent the messages carrying tool calls without their words (it garbles the reply after a
+// call otherwise); every other model gets them, and the caller's slice is not changed.
+func TestGptOssCallsWithoutWords(t *testing.T) {
+	calls := []interface{}{map[string]interface{}{"id": "c1", "type": "function",
+		"function": map[string]interface{}{"name": "book_appointment", "arguments": "{}"}}}
+	msgs := []orchestrator.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "el viernes"},
+		{Role: "assistant", Content: "Le reservo el viernes.", ToolCalls: calls},
+		{Role: "tool", Content: `{"booked":true}`, ToolCallID: "c1", Name: "book_appointment"},
+	}
+	got := forGptOss("gpt-oss-120b", msgs, GptOssToolHistoryBeforeLastUser)
+	for _, m := range got {
+		if m.ToolCalls != nil && m.Content != "" {
+			t.Errorf("gpt-oss got words with its calls: %q", m.Content)
+		}
+	}
+	if msgs[2].Content != "Le reservo el viernes." {
+		t.Errorf("the caller's slice was changed: %q", msgs[2].Content)
+	}
+	other := forGptOss("anthropic/claude-haiku-5.5", msgs, GptOssToolHistoryBeforeLastUser)
+	if other[2].Content != "Le reservo el viernes." {
+		t.Errorf("another model lost the words said with its calls: %q", other[2].Content)
+	}
+}
