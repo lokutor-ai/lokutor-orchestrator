@@ -43,6 +43,15 @@ func NewCerebrasLLM(apiKey string, model string) *CerebrasLLM {
 	}
 }
 
+// SetReasoningEffort sets the "reasoning_effort" this provider sends ("" sends none). The default comes
+// from the model name (defaultReasoningEffort: "low" for gpt-oss, nothing otherwise); this is for a
+// reasoning model it does not know, such as Qwen 3.8 on Cerebras, which takes "none", "low", "medium" and
+// "high" and thinks at length by default (lokutor_tts finance/measurements/spoken_register_2026-11-11/:
+// 401 ms to the first word at its default, 192 at "none", 234 at "low", on a short prompt).
+func (l *CerebrasLLM) SetReasoningEffort(effort string) {
+	l.reasoningEffort = strings.ToLower(strings.TrimSpace(effort))
+}
+
 func (l *CerebrasLLM) applyReasoningEffort(ctx context.Context, payload map[string]interface{}) {
 	setReasoningEffort(payload, effortFor(ctx, l.reasoningEffort))
 }
