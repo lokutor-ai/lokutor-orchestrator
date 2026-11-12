@@ -929,7 +929,8 @@ func TestHeldFragmentIsTranscribedTogetherInTheHangover(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.SilenceTimeout = 0
 	cfg.SampleRate = 16000
-	orch := NewWithAllLayers(stt, llm, fixedAudioTTS{}, &silentVAD{}, cfg, &NoOpLogger{})
+	log := &recordingLogger{}
+	orch := NewWithAllLayers(stt, llm, fixedAudioTTS{}, &silentVAD{}, cfg, log)
 	session := NewConversationSession("manolo")
 	session.CurrentLanguage = LanguageEs
 	stream := orch.NewManagedStream(context.Background(), session)
@@ -977,5 +978,17 @@ func TestHeldFragmentIsTranscribedTogetherInTheHangover(t *testing.T) {
 	defer llm.mu.Unlock()
 	if len(llm.users) != 1 {
 		t.Fatalf("model asked %d times (%q): the turn must use the speculative reply", len(llm.users), llm.users)
+	}
+
+	// No caller words in the log: the seed line wrote the earlier fragment ("continues") as it was said, on
+	// every continuation, until 2026-11-12.
+	if !LogCallContent() {
+		log.mu.Lock()
+		defer log.mu.Unlock()
+		for _, line := range log.lines {
+			if strings.Contains(line, "Manuel de") || strings.Contains(line, "Fisioterapia") {
+				t.Fatalf("caller words in the log: %s", line)
+			}
+		}
 	}
 }
