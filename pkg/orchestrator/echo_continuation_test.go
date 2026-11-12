@@ -256,9 +256,9 @@ func replayBromContinuation(t *testing.T, vad VADProvider, log *recordingLogger)
 	stream.SetPlaybackRate(16000)
 	stream.SetTransportPlaysThroughBargeIn(true)
 	stt.byLen = map[int]string{
-		len(audio1): bromFirstHalf,
-		len(audio2): bromSecond,
-		len(joinUtteranceAudio(audio1, audio2, int(stream.inputSampleRate))): bromMerged,
+		len(audio1):                             bromFirstHalf,
+		len(audio2):                             bromSecond,
+		len(joinUtteranceAudio(audio1, audio2)): bromMerged,
 	}
 
 	stream.advanceFarEndEcho(time.Now().Add(-3 * time.Second)) // the caller's speaker: silent for the last 3 s

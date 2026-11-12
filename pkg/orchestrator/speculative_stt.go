@@ -111,6 +111,12 @@ type specSTT struct {
 	// still denoising skips its recognition request (2026-10-16).
 	cancel context.CancelFunc
 
+	// joint is the joint pass over the earlier utterance this one continues and the attempt's snapshot, started
+	// with the attempt (maybeSpeculateSTT) when there was one. processUtterance takes it (takeJoint) when it uses
+	// the attempt's transcript; invalidate cancels it otherwise. It has its own context: the attempt's cancel
+	// (invalidate, called once the turn has its transcript) must not stop a joint pass the turn has taken.
+	joint *jointTranscription
+
 	// attempt numbers the passes begun. A pass finishes only its own attempt: invalidate() lets the
 	// next pause begin another while the old pass is still transcribing, and the old pass landing
 	// then was taken as the new attempt's result. That transcript is short of the words said between
@@ -237,6 +243,8 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 	lang := ms.session.GetCurrentLanguage()
 	// The number this in-flight utterance will carry once onVADEnd commits it.
 	seq := ms.utteranceSeq + 1
+	// The earlier utterance it would continue: the joint pass over it and this snapshot starts with the attempt.
+	base := ms.continuationPeekLocked(time.Now(), seq)
 	ms.mu.Unlock()
 
 	// Measured on the speech alone: the lead-in would otherwise clear this on any blip.
@@ -249,6 +257,16 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 	}
 	if rate := int(ms.inputSampleRate); rate > 0 {
 		ms.specSTT.setSpeechPeak(peakFrameDbfs(snapshot[len(snapshot)-speechLen:], rate/50*2))
+	}
+	// The joint pass runs beside this one, over the earlier utterance and the same snapshot, so the turn has it
+	// when it starts (no wait) and the seed below can ask the model the words the turn will carry. Started here,
+	// before processUtterance can look for it (hasJointFor), and under the stream's context rather than the
+	// attempt's: see specSTT.joint.
+	var joint *jointTranscription
+	if base != nil {
+		joint = ms.startJointTranscription(ms.ctx, base, snapshot)
+		joint.speculative = true
+		ms.specSTT.setJoint(attempt, joint)
 	}
 
 	go func() {
@@ -289,11 +307,22 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		if text == "" {
 			return
 		}
+		// A joint pass over this snapshot is waited for, as the turn would (jointWaitBudget), so the seed is the
+		// words processUtterance will use; past the budget the seed is what the turn does without it. (Held from
+		// its start, not read back from specSTT: the turn may already have taken it.)
+		if joint != nil {
+			select {
+			case <-joint.done:
+			case <-time.After(jointWaitBudget):
+			case <-ctx.Done():
+				return
+			}
+		}
 		// Logged because the win is invisible otherwise: if this never starts,
 		// or starts and is never matched at end-of-turn, llm_ms simply stays at
 		// its normal value and nothing says why.
 		before := ms.speculator.State()
-		seed, history, continues := ms.speculationSeed(text, seq)
+		seed, history, continues := ms.speculationSeed(text, seq, joint)
 		history, tail := ms.seedKnowledgeRequest(ms.ctx, seed, history)
 		ms.speculator.StartFromTranscriptWithTail(ms.ctx, ms.orch, seed, history, tail, ms.session.GetTools())
 		ms.logger.Info("Speculative LLM seeded from hangover transcript", "run", ms.speculator.RunID(),
@@ -303,22 +332,26 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 
 // speculationSeed is what the hangover seed asks the model: the words, and the context, that this
 // utterance's turn will carry once processUtterance has joined it to the utterance it continues
-// (spoken_truth.go). continues is that earlier utterance's transcript, or "".
+// (spoken_truth.go). continues is that earlier utterance's transcript, or "". joint is the joint pass
+// started with this snapshot (nil if none); its text counts only once it has finished.
 //
 // Seeded with the fragment alone, a joined turn never matched its guess (Await compares the run's
 // transcript with the turn's) and paid a whole completion for nothing: 15% of turns were joined, and
 // they used a speculative reply on 2.2% against 11.8% for the rest (14 days of /lokutor/system to
-// 2026-10-01).
+// 2026-10-01). And seeded with the halves joined as text while the turn used the joint pass's words,
+// it matched on 4% of turns spoken over a reply (14 days to 2026-11-12), against 54% of those joined as
+// text.
 //
-//   - A carried fragment is joined as text unless a joint transcription lands in time and is accepted,
-//     usually as the same words. It never reached the context, so the context is unchanged.
-//   - Over a reply, a previous utterance that settled on its own ("Hola.") is joined as text and the
-//     reply it got leaves the context, so the guess is asked against the context without either. When
-//     anything other than replies follows that utterance (a note, a tool call) the turn would be
-//     built differently, and the fragment is asked as before.
-//   - Over a reply, an unsettled utterance joins only through a joint transcription (unknowable here)
-//     or stays a turn of its own; the fragment is the guess for the second.
-func (ms *ManagedStream) speculationSeed(text string, seq int) (seed string, history []Message, continues string) {
+//   - A carried fragment: the joint pass's words when it finished and is accepted, else the two halves
+//     joined as text. The fragment never reached the context, so the context is unchanged.
+//   - Over a reply: the joint pass's words when accepted, else, for a previous utterance that settled on
+//     its own ("Hola."), the halves joined as text; either way that utterance and the reply it got leave
+//     the context, so the guess is asked against the context without them. When anything other than
+//     replies follows that utterance (a note, a tool call) the turn would be built differently, and the
+//     fragment is asked as before.
+//   - Over a reply to an open utterance whose joint pass is not used: it stays a turn of its own, and the
+//     fragment is the guess for it.
+func (ms *ManagedStream) speculationSeed(text string, seq int, joint *jointTranscription) (seed string, history []Message, continues string) {
 	history = ms.session.GetContextCopy()
 	now := time.Now()
 	ms.mu.Lock()
@@ -331,12 +364,32 @@ func (ms *ManagedStream) speculationSeed(text string, seq int) (seed string, his
 		barge = ms.bargeBaseLocked(now, seq, ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen)
 	}
 	ms.mu.Unlock()
+	jointWords := func(base *committedUtterance) string {
+		if joint == nil || joint.base != base {
+			return ""
+		}
+		select {
+		case <-joint.done:
+			return joint.accepted(text, ms.session.GetCurrentLanguage())
+		default:
+			return ""
+		}
+	}
 
 	switch {
 	case carry != nil:
+		if merged := jointWords(carry); merged != "" {
+			return merged, history, carry.transcript
+		}
 		return spaceSentences(strings.TrimSpace(carry.transcript + " " + text)), history, carry.transcript
-	case barge != nil && !needsJointPass(barge.transcript):
-		merged := spaceSentences(strings.TrimSpace(barge.transcript + " " + text))
+	case barge != nil:
+		merged := jointWords(barge)
+		if merged == "" && settledOnItsOwn(barge.transcript) {
+			merged = spaceSentences(strings.TrimSpace(barge.transcript + " " + text))
+		}
+		if merged == "" {
+			break
+		}
 		if revised, ok := replaceLastUserTurn(history, merged); ok {
 			if last := revised[len(revised)-1]; last.Role == "user" && last.Content == merged {
 				return merged, revised[:len(revised)-1], barge.transcript
@@ -464,6 +517,37 @@ func (s *specSTT) setCancel(attempt int, cancel context.CancelFunc) {
 	cancel()
 }
 
+// setJoint keeps j as attempt's joint pass, or cancels it if attempt is no longer the one in flight.
+func (s *specSTT) setJoint(attempt int, j *jointTranscription) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.inFlight && s.attempt == attempt && s.joint == nil {
+		s.joint = j
+		return
+	}
+	j.cancel()
+}
+
+// hasJointFor reports whether the attempt for utterance seq holds a joint pass over base.
+func (s *specSTT) hasJointFor(seq int, base *committedUtterance) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.joint != nil && s.seq == seq && s.joint.base == base
+}
+
+// takeJoint hands the attempt's joint pass over base to the turn for utterance seq (invalidate then leaves
+// it running), or returns nil.
+func (s *specSTT) takeJoint(seq int, base *committedUtterance) *jointTranscription {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j := s.joint
+	if j == nil || s.seq != seq || j.base != base {
+		return nil
+	}
+	s.joint = nil
+	return j
+}
+
 // finish records the result of the attempt in flight.
 func (s *specSTT) finish(res TranscriptionResult, err error) {
 	s.mu.Lock()
@@ -501,6 +585,10 @@ func (s *specSTT) invalidate() {
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
+	}
+	if s.joint != nil {
+		s.joint.cancel()
+		s.joint = nil
 	}
 	if s.inFlight {
 		// Mark it orphaned: finish() will no-op, and the waiter sees no done

@@ -1,8 +1,10 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -278,7 +280,7 @@ func TestSpeculationSeedIsTheJoinedTurn(t *testing.T) {
 	ms := newTruthStream(t)
 	ms.session.AddMessage("user", "Hola.")
 	ms.session.AddMessage("assistant", "¡Hola! ¿En qué te ayudo?")
-	if seed, history, cont := ms.speculationSeed(fragment, 2); seed != fragment || cont != "" || len(history) != len(ms.session.GetContextCopy()) {
+	if seed, history, cont := ms.speculationSeed(fragment, 2, nil); seed != fragment || cont != "" || len(history) != len(ms.session.GetContextCopy()) {
 		t.Fatalf("plain turn: %q %q %d", seed, cont, len(history))
 	}
 
@@ -289,7 +291,7 @@ func TestSpeculationSeedIsTheJoinedTurn(t *testing.T) {
 	ms.mu.Lock()
 	ms.carry = &committedUtterance{transcript: "Hola.", endedAt: now.Add(-time.Second)}
 	ms.mu.Unlock()
-	seed, history, cont := ms.speculationSeed(fragment, 2)
+	seed, history, cont := ms.speculationSeed(fragment, 2, nil)
 	if seed != "Hola. "+fragment || cont != "Hola." || len(history) != before {
 		t.Fatalf("carry: %q %q %d", seed, cont, len(history))
 	}
@@ -312,7 +314,7 @@ func TestSpeculationSeedIsTheJoinedTurn(t *testing.T) {
 		return ms
 	}
 	ms = overReply("Hola.")
-	seed, history, cont = ms.speculationSeed(fragment, 2)
+	seed, history, cont = ms.speculationSeed(fragment, 2, nil)
 	if seed != "Hola. "+fragment || cont != "Hola." {
 		t.Fatalf("over a reply: %q %q", seed, cont)
 	}
@@ -327,14 +329,14 @@ func TestSpeculationSeedIsTheJoinedTurn(t *testing.T) {
 
 	// An unsettled utterance joins only through a joint transcription: the fragment, as before.
 	ms = overReply("Quiero reservar para")
-	if seed, _, cont := ms.speculationSeed(fragment, 2); seed != fragment || cont != "" {
+	if seed, _, cont := ms.speculationSeed(fragment, 2, nil); seed != fragment || cont != "" {
 		t.Fatalf("unsettled: %q %q", seed, cont)
 	}
 
 	// A note after the utterance: the joined turn would keep it after the words, so the fragment.
 	ms = overReply("Hola.")
 	ms.session.AddMessage("system", "Retrieved: horario 9-18.")
-	if seed, _, cont := ms.speculationSeed(fragment, 2); seed != fragment || cont != "" {
+	if seed, _, cont := ms.speculationSeed(fragment, 2, nil); seed != fragment || cont != "" {
 		t.Fatalf("note in the tail: %q %q", seed, cont)
 	}
 }
@@ -626,14 +628,26 @@ func TestAcceptMergedSentencesRunTogether(t *testing.T) {
 	}
 }
 
-func TestNeedsJointPass(t *testing.T) {
+func TestSettledOnItsOwn(t *testing.T) {
 	for frag, want := range map[string]bool{
-		"Hola.": false, "Um.": false, "Vale, sí.": false, "¿Sí?": false,
-		"Hola": true, "I'd like to book a flight to": true, "Mi nombre es Pito,": true, "": false,
+		"Hola.": true, "Um.": true, "Vale, sí.": true, "¿Sí?": true, "": true,
+		"Hola": false, "I'd like to book a flight to": false, "Mi nombre es Pito,": false,
 	} {
-		if got := needsJointPass(frag); got != want {
-			t.Errorf("needsJointPass(%q) = %v, want %v", frag, got, want)
+		if got := settledOnItsOwn(frag); got != want {
+			t.Errorf("settledOnItsOwn(%q) = %v, want %v", frag, got, want)
 		}
+	}
+}
+
+// The two halves are joined with nothing between them: each already carries the caller's real pause, and a
+// block of digital zeros made the recogniser lose the second half (2026-11-12, telnyx: the joint pass came
+// back as the first half's words).
+func TestJoinUtteranceAudioAddsNoSilence(t *testing.T) {
+	prev := []byte{1, 2, 3, 4}
+	next := []byte{5, 6}
+	got := joinUtteranceAudio(prev, next)
+	if string(got) != string([]byte{1, 2, 3, 4, 5, 6}) {
+		t.Fatalf("joined = %v", got)
 	}
 }
 
@@ -661,19 +675,30 @@ func TestMergeCarry(t *testing.T) {
 		return orch.NewManagedStream(context.Background(), NewConversationSession("merge-carry"))
 	}
 
-	// A fragment that settles on its own is joined as text with no second recognition call.
+	// No joint pass for this fragment: joined as text, at once.
 	ms := newStream(&slowSTT{delay: time.Hour})
 	defer ms.Close()
 	short := &committedUtterance{audio: make([]byte, 3200), transcript: "Hola.", endedAt: time.Now()}
 	if got, _ := ms.mergeCarry(context.Background(), short, make([]byte, 3200), "¿Qué hora abre?", nil); got != "Hola. ¿Qué hora abre?" {
-		t.Fatalf("short fragment: %q", got)
+		t.Fatalf("no joint pass: %q", got)
+	}
+
+	// A fragment the recogniser closed with a full stop is transcribed together with its continuation too:
+	// "Manuel de." + "Fisioterapia es Manolo." was joined as text because of that full stop, where the two
+	// halves transcribed together read "Manolo de Fisioterapia es Manolo." (2026-11-11, telnyx).
+	manolo := newStream(&slowSTT{delay: 10 * time.Millisecond, text: "Manolo de Fisioterapia es Manolo."})
+	defer manolo.Close()
+	frag := &committedUtterance{audio: make([]byte, 3200), transcript: "Manuel de.", endedAt: time.Now()}
+	j := manolo.startJointTranscription(context.Background(), frag, make([]byte, 3200))
+	if got, _ := manolo.mergeCarry(context.Background(), frag, make([]byte, 3200), "Fisioterapia es Manolo.", j); got != "Manolo de Fisioterapia es Manolo." {
+		t.Fatalf("closed fragment: %q", got)
 	}
 
 	// A joint pass slower than the budget is not waited for: the two halves are joined as text, and the
 	// first half is kept.
 	slow := newStream(&slowSTT{delay: time.Second, text: "Quería reservar un vuelo a Madrid el viernes."})
 	defer slow.Close()
-	j := slow.startJointTranscription(context.Background(), base, make([]byte, 3200))
+	j = slow.startJointTranscription(context.Background(), base, make([]byte, 3200))
 	start := time.Now()
 	got, _ := slow.mergeCarry(context.Background(), base, make([]byte, 3200), own, j)
 	if got != "Quería reservar un vuelo a Madrid el viernes." {
@@ -697,18 +722,35 @@ func TestMergeBarge(t *testing.T) {
 		orch := New(stt, &MockLLMProvider{completeResult: "ok"}, &MockTTSProvider{}, DefaultConfig())
 		return orch.NewManagedStream(context.Background(), NewConversationSession("merge-barge"))
 	}
+	hola := &committedUtterance{audio: make([]byte, 3200), transcript: "Hola.", endedAt: time.Now()}
 
-	// A previous utterance that settled on its own is joined as text: no recognition call, no wait.
+	// A previous utterance that settled on its own, with no joint pass: joined as text, no wait.
 	ms := newStream(&slowSTT{delay: time.Hour})
 	defer ms.Close()
-	hola := &committedUtterance{audio: make([]byte, 3200), transcript: "Hola.", endedAt: time.Now()}
 	start := time.Now()
 	got, joined, ok := ms.mergeBarge(context.Background(), hola, make([]byte, 3200), "¿Qué hora abre la oficina mañana?", nil)
-	if !ok || got != "Hola. ¿Qué hora abre la oficina mañana?" || len(joined) == 0 {
-		t.Fatalf("settled fragment: %q ok=%v", got, ok)
+	if !ok || got != "Hola. ¿Qué hora abre la oficina mañana?" || len(joined) != 6400 {
+		t.Fatalf("settled fragment: %q ok=%v len=%d", got, ok, len(joined))
 	}
 	if waited := time.Since(start); waited > 50*time.Millisecond {
 		t.Fatalf("settled fragment waited %v", waited)
+	}
+
+	// The same with a joint pass ready in time: its words are used ("Manuel de." over a reply is no more
+	// settled than the same fragment held by the end-of-turn wait).
+	manolo := newStream(&slowSTT{delay: 10 * time.Millisecond, text: "Sí. Manolito Gafotas Gmail. ¿Com?"})
+	defer manolo.Close()
+	si := &committedUtterance{audio: make([]byte, 3200), transcript: "Sí. Manolitografotas.", endedAt: time.Now()}
+	j := manolo.startJointTranscription(context.Background(), si, make([]byte, 3200))
+	if got, _, ok := manolo.mergeBarge(context.Background(), si, make([]byte, 3200), "¿Gmail, com?", j); !ok || got != "Sí. Manolito Gafotas Gmail. ¿Com?" {
+		t.Fatalf("settled fragment with a joint pass: %q ok=%v", got, ok)
+	}
+	// ... and when the joint pass is not used, joined as text as before.
+	rejected := newStream(&slowSTT{delay: 10 * time.Millisecond, text: "Sí."})
+	defer rejected.Close()
+	j = rejected.startJointTranscription(context.Background(), hola, make([]byte, 3200))
+	if got, _, ok := rejected.mergeBarge(context.Background(), hola, make([]byte, 3200), "¿Qué hora abre?", j); !ok || got != "Hola. ¿Qué hora abre?" {
+		t.Fatalf("settled fragment, joint pass not used: %q ok=%v", got, ok)
 	}
 
 	// An open fragment with a joint pass slower than the budget keeps the turns separate, within budget.
@@ -716,7 +758,7 @@ func TestMergeBarge(t *testing.T) {
 	own := "Madrid el viernes."
 	slow := newStream(&slowSTT{delay: time.Second, text: "Quería reservar un vuelo a Madrid el viernes."})
 	defer slow.Close()
-	j := slow.startJointTranscription(context.Background(), base, make([]byte, 3200))
+	j = slow.startJointTranscription(context.Background(), base, make([]byte, 3200))
 	start = time.Now()
 	if _, _, ok := slow.mergeBarge(context.Background(), base, make([]byte, 3200), own, j); ok {
 		t.Fatal("a joint pass past its budget must not be used")
@@ -736,5 +778,204 @@ func TestMergeBarge(t *testing.T) {
 	j = fast.startJointTranscription(context.Background(), base, make([]byte, 3200))
 	if got, _, ok := fast.mergeBarge(context.Background(), base, make([]byte, 3200), own, j); !ok || got != "Quería reservar un vuelo a Madrid, el viernes." {
 		t.Fatalf("fast joint pass: %q ok=%v", got, ok)
+	}
+}
+
+// finishedJoint is a joint pass over base that has already returned text.
+func finishedJoint(base *committedUtterance, text string) *jointTranscription {
+	j := &jointTranscription{base: base, cancel: func() {}, done: make(chan struct{}), text: text, speculative: true}
+	close(j.done)
+	return j
+}
+
+// The hangover seed asks the words the turn will carry when its joint pass has finished and is accepted: seeded
+// with the halves joined as text while the turn used the joint pass's words, a guess over a reply was used on 4%
+// of such turns (14 days to 2026-11-12) against 54% of those joined as text.
+func TestSpeculationSeedUsesTheJointPass(t *testing.T) {
+	now := time.Now()
+
+	// A carried fragment closed by the recogniser ("Manuel de."): the joint pass's words.
+	ms := newTruthStream(t)
+	carry := &committedUtterance{transcript: "Manuel de.", endedAt: now.Add(-time.Second)}
+	ms.mu.Lock()
+	ms.carry = carry
+	ms.mu.Unlock()
+	if seed, _, cont := ms.speculationSeed("Fisioterapia es Manolo.", 2, finishedJoint(carry, "Manolo de Fisioterapia es Manolo.")); seed != "Manolo de Fisioterapia es Manolo." || cont != "Manuel de." {
+		t.Fatalf("carry: %q %q", seed, cont)
+	}
+	// A joint pass that lost the continuation is not the turn's words: the text join, as the turn will do.
+	if seed, _, _ := ms.speculationSeed("Fisioterapia es Manolo.", 2, finishedJoint(carry, "Manuel de.")); seed != "Manuel de. Fisioterapia es Manolo." {
+		t.Fatalf("carry, joint not used: %q", seed)
+	}
+	// One still running is not waited for here.
+	running := &jointTranscription{base: carry, cancel: func() {}, done: make(chan struct{})}
+	if seed, _, _ := ms.speculationSeed("Fisioterapia es Manolo.", 2, running); seed != "Manuel de. Fisioterapia es Manolo." {
+		t.Fatalf("carry, joint running: %q", seed)
+	}
+
+	// Over the reply to an open utterance: joined through the joint pass, asked without that utterance and its reply.
+	ms = newTruthStream(t)
+	ms.session.AddMessage("user", "Quiero reservar para")
+	ms.session.AddMessage("assistant", "¿Para cuándo?")
+	prev := &committedUtterance{transcript: "Quiero reservar para", endedAt: now.Add(-2 * time.Second), gen: 5}
+	ms.mu.Lock()
+	ms.lastUtt = prev
+	ms.payloadGen = 6
+	ms.onset = heardSnapshot{gen: 6, seq: 2, at: now.Add(-time.Second), dur: 400 * time.Millisecond}
+	ms.mu.Unlock()
+	seed, history, cont := ms.speculationSeed("el viernes.", 2, finishedJoint(prev, "Quiero reservar para el viernes."))
+	if seed != "Quiero reservar para el viernes." || cont != "Quiero reservar para" || len(history) != 0 {
+		t.Fatalf("over a reply: %q %q %+v", seed, cont, history)
+	}
+	// Its joint pass not used: a turn of its own, the fragment is the guess.
+	if seed, _, cont := ms.speculationSeed("el viernes.", 2, finishedJoint(prev, "Quiero")); seed != "el viernes." || cont != "" {
+		t.Fatalf("over a reply, joint not used: %q %q", seed, cont)
+	}
+}
+
+// The joint pass the hangover started is the turn's when the turn uses that pass's transcript, and stopped when
+// it does not.
+func TestSpeculativeJointIsHandedToTheTurn(t *testing.T) {
+	base := &committedUtterance{transcript: "Manuel de."}
+	other := &committedUtterance{transcript: "Hola."}
+	cancelled := 0
+	newJoint := func(b *committedUtterance) *jointTranscription {
+		return &jointTranscription{base: b, cancel: func() { cancelled++ }, done: make(chan struct{})}
+	}
+
+	var s specSTT
+	attempt, _ := s.start(100, 2)
+	j := newJoint(base)
+	s.setJoint(attempt, j)
+	if !s.hasJointFor(2, base) || s.hasJointFor(3, base) || s.hasJointFor(2, other) {
+		t.Fatal("hasJointFor must match the utterance and its earlier half")
+	}
+	if s.takeJoint(2, other) != nil || s.takeJoint(2, base) != j || s.takeJoint(2, base) != nil {
+		t.Fatal("takeJoint hands the pass over once, for its own base")
+	}
+	s.invalidate()
+	if cancelled != 0 {
+		t.Fatal("a joint pass the turn took must keep running after the attempt is invalidated")
+	}
+
+	// Not taken: stopped with the attempt.
+	attempt, _ = s.start(100, 3)
+	s.setJoint(attempt, newJoint(base))
+	s.invalidate()
+	if cancelled != 1 || s.hasJointFor(3, base) {
+		t.Fatalf("an untaken joint pass must stop with its attempt (cancelled %d)", cancelled)
+	}
+
+	// For an attempt no longer in flight: stopped at once.
+	s.setJoint(attempt, newJoint(base))
+	if cancelled != 2 {
+		t.Fatal("a joint pass for a stale attempt must be stopped")
+	}
+}
+
+// countingLengthSTT answers by audio length and counts the calls for each length.
+type countingLengthSTT struct {
+	mu    sync.Mutex
+	byLen map[int]string
+	calls map[int]int
+}
+
+func (s *countingLengthSTT) Transcribe(ctx context.Context, audio []byte, lang Language) (TranscriptionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls[len(audio)]++
+	return TranscriptionResult{Text: s.byLen[len(audio)]}, nil
+}
+func (s *countingLengthSTT) Name() string { return "countingLengthSTT" }
+
+// lastUserLLM records the last user message of every request.
+type lastUserLLM struct {
+	mu    sync.Mutex
+	users []string
+	reply string
+}
+
+func (l *lastUserLLM) Complete(ctx context.Context, messages []Message, tools []Tool) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			l.users = append(l.users, messages[i].Content)
+			break
+		}
+	}
+	return l.reply, nil
+}
+func (l *lastUserLLM) Name() string { return "lastUserLLM" }
+
+// A held fragment and its continuation, end to end through the hangover: the joint pass starts with the
+// speculative transcription, the seed asks the model the joint pass's words, and the turn takes that pass
+// (no second joint request, no wait) and answers with the speculative reply.
+func TestHeldFragmentIsTranscribedTogetherInTheHangover(t *testing.T) {
+	const ms16 = 32 // bytes per ms at 16 kHz PCM16
+	carryAudio := bytes.Repeat([]byte{1}, 1200*ms16)
+	leadIn := bytes.Repeat([]byte{2}, 300*ms16)
+	speech := bytes.Repeat([]byte{3}, 900*ms16)
+	snapshot := append(append([]byte(nil), leadIn...), speech...)
+	final := append(append([]byte(nil), snapshot...), make([]byte, 192*ms16)...) // + the hangover's silence
+	const merged = "Manolo de Fisioterapia es Manolo."
+	stt := &countingLengthSTT{calls: map[int]int{}, byLen: map[int]string{
+		len(snapshot):                   "Fisioterapia es Manolo.",
+		len(carryAudio) + len(snapshot): merged,
+		len(final):                      "Fisioterapia es Manolo.",
+		len(carryAudio) + len(final):    merged,
+	}}
+	llm := &lastUserLLM{reply: "Encantada, Manolo."}
+	cfg := DefaultConfig()
+	cfg.SilenceTimeout = 0
+	cfg.SampleRate = 16000
+	orch := NewWithAllLayers(stt, llm, fixedAudioTTS{}, &silentVAD{}, cfg, &NoOpLogger{})
+	session := NewConversationSession("manolo")
+	session.CurrentLanguage = LanguageEs
+	stream := orch.NewManagedStream(context.Background(), session)
+	t.Cleanup(stream.Close)
+	stream.vad = &silentVAD{} // NewManagedStream clones the VAD, and the clone is a plain RMSVAD
+	if !stream.hangoverSeedActive() {
+		t.Fatal("the hangover seed must be active: speculative STT chained into the model")
+	}
+
+	stream.mu.Lock()
+	stream.carry = &committedUtterance{audio: carryAudio, transcript: "Manuel de.", endedAt: time.Now(), seq: 1}
+	stream.utteranceSeq = 1
+	stream.speechLeadIn = leadIn
+	stream.speechAudioBuf = append([]byte(nil), speech...)
+	stream.mu.Unlock()
+
+	stream.maybeSpeculateSTT() // the hangover's first silent frame
+	waitUntil(t, "the hangover seed", 2*time.Second, func() bool {
+		llm.mu.Lock()
+		defer llm.mu.Unlock()
+		return len(llm.users) > 0
+	})
+	llm.mu.Lock()
+	seed := llm.users[0]
+	llm.mu.Unlock()
+	if seed != merged {
+		t.Fatalf("the seed asked %q, want the joint pass's words %q", seed, merged)
+	}
+
+	// End of turn.
+	stream.mu.Lock()
+	stream.state, stream.utteranceSeq, stream.inflightUtterances = StateProcessing, 2, 1
+	stream.mu.Unlock()
+	stream.processUtterance(final, 1092*time.Millisecond, 2)
+	if ev := waitForEventType(t, stream, TranscriptFinal, 3*time.Second); ev.Data != merged {
+		t.Fatalf("TranscriptFinal = %v, want %q", ev.Data, merged)
+	}
+
+	stt.mu.Lock()
+	defer stt.mu.Unlock()
+	if stt.calls[len(carryAudio)+len(snapshot)] != 1 || stt.calls[len(carryAudio)+len(final)] != 0 || stt.calls[len(final)] != 0 {
+		t.Fatalf("recognition calls by length: %v (want the snapshot and its joint pass once each, nothing else)", stt.calls)
+	}
+	llm.mu.Lock()
+	defer llm.mu.Unlock()
+	if len(llm.users) != 1 {
+		t.Fatalf("model asked %d times (%q): the turn must use the speculative reply", len(llm.users), llm.users)
 	}
 }

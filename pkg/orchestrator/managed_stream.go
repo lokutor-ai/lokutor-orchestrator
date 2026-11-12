@@ -1894,21 +1894,18 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	}
 
 	// A carried fragment (the caller paused mid-thought, then carried on), or the utterance whose reply
-	// this one was spoken over, is transcribed together with this utterance. Start that joint pass now,
-	// beside this utterance's own transcription, not after it: see jointWaitBudget. mergeCarry and
-	// mergeBarge below use it only if it is still the same earlier utterance. One that settled on its own
-	// ("Hola.") is joined as text instead, so no pass is started for it.
+	// this one was spoken over, is transcribed together with this utterance, whatever its own words: the
+	// recogniser closes nearly every fragment with a full stop ("Manuel de."), so a fragment's punctuation
+	// says nothing about whether its words are settled (settledOnItsOwn). The joint pass runs beside this
+	// utterance's own transcription, not after it (see jointWaitBudget): the VAD hangover's speculative
+	// pass started one from its snapshot when it found the same earlier utterance, and that one is taken
+	// below if the speculative transcript is the one this turn uses; otherwise it starts now. mergeCarry
+	// and mergeBarge below use it only if it is still the same earlier utterance.
 	var joint *jointTranscription
 	ms.mu.Lock()
-	peek := ms.carry
-	if peek != nil && time.Since(peek.endedAt) > continuationMergeWindow {
-		peek = nil
-	}
-	if peek == nil {
-		peek = ms.bargeBaseLocked(time.Now(), seq, ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen)
-	}
+	peek := ms.continuationPeekLocked(time.Now(), seq)
 	ms.mu.Unlock()
-	if peek != nil && needsJointPass(peek.transcript) {
+	if peek != nil && !ms.specSTT.hasJointFor(seq, peek) {
 		joint = ms.startJointTranscription(ctx, peek, audioData)
 	}
 	defer func() {
@@ -1957,11 +1954,24 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			specUsed = true
 			ms.logger.Info("Using speculative STT from the VAD hangover",
 				"waited_ms", waited.Milliseconds(), "text", ContentForLog(result.Text))
+			// The joint pass over the same snapshot: its words are the ones the hangover seed asked the model.
+			if sj := ms.specSTT.takeJoint(seq, peek); sj != nil {
+				if joint != nil {
+					joint.cancel()
+				}
+				joint = sj
+			}
 		} else if voiced, loudMs := ms.specSTT.heardAfter(); voiced >= specVoicedFramesAfter || loudMs >= specLoudMsAfter {
 			// Costs the turn a full transcription (~100-250 ms); logged so the rate can be read.
 			ms.logger.Info("Speculative STT not used: the caller said more after its snapshot",
 				"voiced_frames_after", voiced, "loud_ms_after", loudMs)
 		}
+	}
+
+	// The speculative pass held this utterance's joint pass, but its transcript is not the one this turn uses:
+	// start the joint pass over the whole utterance, beside its own transcription below.
+	if peek != nil && joint == nil {
+		joint = ms.startJointTranscription(ctx, peek, audioData)
 	}
 
 	// Use batch STT if streaming didn't produce a result (more accurate)

@@ -42,10 +42,6 @@ func continuationMergeMaxHeard() time.Duration {
 // next one: a caller resuming a sentence does so within seconds.
 const continuationMergeWindow = 8 * time.Second
 
-// continuationGap is the silence placed between the two halves of a merged utterance, so the
-// recogniser hears a pause rather than two words run together.
-const continuationGap = 200 * time.Millisecond
-
 type playoutInterval struct{ start, end time.Time }
 
 // spokenSegment is one speakText call (one sentence, usually) on the caller's playout timeline.
@@ -256,12 +252,19 @@ type committedUtterance struct {
 	seq int
 }
 
-// joinUtteranceAudio is prev + a short silence + next, as one recogniser input (16-bit PCM).
-func joinUtteranceAudio(prev, next []byte, sampleRate int) []byte {
-	gap := int(continuationGap.Seconds()*float64(sampleRate)) * 2
-	out := make([]byte, 0, len(prev)+gap+len(next))
+// joinUtteranceAudio is prev followed by next, as one recogniser input (16-bit PCM). Nothing is put between
+// them: each half already carries the caller's real pause, prev the VAD hangover after its last word and next
+// the lead-in before its first, about half a second of the line's own background between the two.
+//
+// It used to insert 200 ms of digital zeros "so the recogniser hears a pause". The recogniser normalises its
+// features causally, from the start of the input, so a block of exact zeros skews everything after it, and it
+// lost or garbled the second half: on 2026-11-12 (telnyx, 12:49:03) the joint pass came back as the first half's
+// words exactly, and replayed against the recognition pool, real phone splits and Spanish sentences cut at a
+// pause read 43.6% and 40.4% word error joined without the zeros against 54.5% and 46.2% with them
+// (finance/measurements/joint_transcription_splits_2026-11-12.json in lokutor_tts).
+func joinUtteranceAudio(prev, next []byte) []byte {
+	out := make([]byte, 0, len(prev)+len(next))
 	out = append(out, prev...)
-	out = append(out, make([]byte, gap)...)
 	out = append(out, next...)
 	return out
 }
@@ -697,6 +700,17 @@ func (ms *ManagedStream) continuationBaseLocked(now time.Time, seq int, pendingB
 	return nil, false
 }
 
+// continuationPeekLocked is the earlier utterance the one numbered seq would continue if it were processed now,
+// without consuming anything (ms.mu held): the carried fragment if recent, else the utterance whose reply this
+// one is spoken over (bargeBaseLocked). It is what the joint pass is started for, in the VAD hangover and in
+// processUtterance; continuationBaseLocked decides, later, which of them the turn takes.
+func (ms *ManagedStream) continuationPeekLocked(now time.Time, seq int) *committedUtterance {
+	if c := ms.carry; c != nil && now.Sub(c.endedAt) <= continuationMergeWindow {
+		return c
+	}
+	return ms.bargeBaseLocked(now, seq, ms.pendingBargeIn && ms.pendingBargeGen == ms.payloadGen)
+}
+
 // takeCarryLocked consumes the fragment the mid-thought wait abandoned, if it is recent.
 func (ms *ManagedStream) takeCarryLocked(now time.Time) *committedUtterance {
 	c := ms.carry
@@ -763,6 +777,10 @@ type jointTranscription struct {
 	done   chan struct{}
 	text   string
 	err    error
+	// speculative: started from the VAD hangover's snapshot beside the speculative transcription
+	// (maybeSpeculateSTT), so it is usually finished before the turn needs it and the hangover seed
+	// already asked the model for these words.
+	speculative bool
 }
 
 // result is the joint pass's text and error once it has finished, and nothing while it is still
@@ -778,18 +796,34 @@ func (j *jointTranscription) result() (string, error) {
 	}
 }
 
-// needsJointPass reports whether a carried fragment gains anything from being transcribed again together
-// with its continuation. A short fragment the recogniser closed as a sentence of its own ("Hola.",
-// "Vale.", "Um.") does not: its words are settled and joining the text is exact, so the second
-// recognition call is skipped. Anything longer or left open may be a phrase cut mid-thought whose words
-// the continuation disambiguates ("Grillo" without "Pito").
-func needsJointPass(fragment string) bool {
+// accepted is the finished joint pass's transcript when it may stand for both halves, or "": it must say
+// more than the continuation alone (acceptMerged), and not less than the earlier half alone -- with an
+// empty continuation (a held turn completed by a lone word the recogniser could not read) the first rule
+// accepts any joint text, and one that lost the held words would replace them. Only call it once done is
+// closed.
+func (j *jointTranscription) accepted(own string, lang Language) string {
+	if j.err != nil || !acceptMerged(j.text, own) || countWords(spaceSentences(j.text)) < countWords(j.base.transcript) {
+		return ""
+	}
+	return restoreQuestionMark(spaceSentences(j.text), lang)
+}
+
+// settledOnItsOwn reports whether an utterance the caller went on from over its reply reads as a sentence
+// of its own: at most two words, closed by the recogniser ("Hola.", "Vale, sí.", "¿Sí?"). It no longer
+// decides whether the joint pass runs -- that pass runs for every continuation, because the recogniser
+// closes nearly every fragment it is given: "Manolo, de Fisioterapias Manolo" split at its comma came back
+// "Manuel de." + "Fisioterapia es Manolo.", the full stop marked the first half settled, the joint pass
+// was skipped and the agent heard "Manuel de. Fisioterapia es Manolo." where the two halves transcribed
+// together read "Manolo de Fisioterapia es Manolo." (2026-11-11, telnyx). It only decides what happens
+// over a reply when the joint pass is not used: a settled utterance is joined as text, as before, and an
+// open one stays a turn of its own.
+func settledOnItsOwn(fragment string) bool {
 	f := strings.TrimSpace(fragment)
 	if f == "" {
-		return false
+		return true
 	}
 	last := f[len(f)-1]
-	return !(countWords(f) <= 2 && (last == '.' || last == '?' || last == '!'))
+	return countWords(f) <= 2 && (last == '.' || last == '?' || last == '!')
 }
 
 // startJointTranscription starts the joint pass now, beside the continuation's own transcription.
@@ -797,7 +831,7 @@ func (ms *ManagedStream) startJointTranscription(ctx context.Context, base *comm
 	jctx, cancel := context.WithCancel(ctx)
 	j := &jointTranscription{
 		base:   base,
-		joined: joinUtteranceAudio(base.audio, audio, int(ms.inputSampleRate)),
+		joined: joinUtteranceAudio(base.audio, audio),
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
@@ -810,6 +844,14 @@ func (ms *ManagedStream) startJointTranscription(ctx context.Context, base *comm
 	return j
 }
 
+// joinedMs is the length of a joined utterance in milliseconds, for the log.
+func (ms *ManagedStream) joinedMs(joined []byte) int {
+	if ms.inputSampleRate <= 0 {
+		return 0
+	}
+	return len(joined) * 1000 / (int(ms.inputSampleRate) * 2)
+}
+
 // mergeCarry makes one turn of a carried fragment and the utterance that continues it: the joint
 // transcription when it is ready within jointWaitBudget and accepted, otherwise the two transcripts
 // joined as text. The fragment is never dropped: when the joint pass was rejected the turn used to be
@@ -817,33 +859,32 @@ func (ms *ManagedStream) startJointTranscription(ctx context.Context, base *comm
 // "Madrid on Friday".
 func (ms *ManagedStream) mergeCarry(ctx context.Context, base *committedUtterance, audio []byte, own string, joint *jointTranscription) (string, []byte) {
 	asText := spaceSentences(strings.TrimSpace(base.transcript + " " + own))
+	joined := joinUtteranceAudio(base.audio, audio)
 	if joint == nil || joint.base != base {
 		if joint != nil {
 			joint.cancel()
 		}
-		reason := "fragment complete on its own"
-		if needsJointPass(base.transcript) {
-			reason = "joint pass not started"
-		}
 		ms.logger.Info("Continuation: joined as text", "previous", ContentForLog(base.transcript), "continuation", ContentForLog(own),
-			"merged", ContentForLog(asText), "reason", reason)
-		return asText, joinUtteranceAudio(base.audio, audio, int(ms.inputSampleRate))
+			"merged", ContentForLog(asText), "reason", "joint pass not started")
+		return asText, joined
 	}
 	merged, why := ms.awaitJoint(ctx, joint, own)
 	if merged == "" {
 		jointText, jointErr := joint.result()
 		ms.logger.Info("Continuation: joint transcription "+why+", joined as text", "previous", ContentForLog(base.transcript),
-			"continuation", ContentForLog(own), "joint", ContentForLog(jointText), "merged", ContentForLog(asText), "error", jointErr)
-		return asText, joint.joined
+			"continuation", ContentForLog(own), "joint", ContentForLog(jointText), "merged", ContentForLog(asText), "error", jointErr,
+			"speculative", joint.speculative)
+		return asText, joined
 	}
 	ms.logger.Info("Continuation: transcribed together with the previous utterance",
 		"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "merged", ContentForLog(merged),
-		"over_reply", false, "joined_ms", len(joint.joined)*1000/(int(ms.inputSampleRate)*2))
-	return merged, joint.joined
+		"over_reply", false, "joined_ms", ms.joinedMs(joined), "speculative", joint.speculative)
+	return merged, joined
 }
 
 // awaitJoint waits at most jointWaitBudget for a joint pass and returns its transcript if it is ready and
-// accepted, or "" and why not. The wait is this turn's gate_join_ms.
+// accepted, or "" and why not. The wait is this turn's gate_join_ms (0 for a speculative pass that
+// finished during the hangover).
 func (ms *ManagedStream) awaitJoint(ctx context.Context, joint *jointTranscription, own string) (merged, why string) {
 	waitStart := time.Now()
 	defer func() {
@@ -860,13 +901,10 @@ func (ms *ManagedStream) awaitJoint(ctx context.Context, joint *jointTranscripti
 		joint.cancel()
 		return "", "cancelled"
 	}
-	// Nor may it say less than the earlier half alone: with an empty continuation (a held turn completed by a lone
-	// word the recogniser could not read) the rule above accepts any joint text, and one that lost the held words
-	// would replace them; the two halves joined as text keep them.
-	if joint.err != nil || !acceptMerged(joint.text, own) || countWords(spaceSentences(joint.text)) < countWords(joint.base.transcript) {
+	if merged = joint.accepted(own, ms.session.GetCurrentLanguage()); merged == "" {
 		return "", "not used"
 	}
-	return restoreQuestionMark(spaceSentences(joint.text), ms.session.GetCurrentLanguage()), ""
+	return merged, ""
 }
 
 // mergeBarge makes one turn of an utterance spoken over the reply to the previous one, when the caller
@@ -874,34 +912,50 @@ func (ms *ManagedStream) awaitJoint(ctx context.Context, joint *jointTranscripti
 // already in context as the caller's turn, so unlike a carried fragment nothing is lost.
 //
 // The joint pass used to start here, after the echo and barge-in checks, and wait for its answer: 1.9 s
-// of a 3.5 s turn at 48 simultaneous callers (2026-09-29), to re-transcribe "Hola." and fail. Now:
-//   - a previous utterance that settled on its own ("Hola.") is joined as text, which is what an
-//     accepted joint pass produced for it, with no second recognition call;
-//   - anything else uses the joint pass started beside this utterance's own transcription
-//     (processUtterance), waiting at most jointWaitBudget for it.
+// of a 3.5 s turn at 48 simultaneous callers (2026-09-29), to re-transcribe "Hola." and fail. It now
+// starts in the VAD hangover beside the speculative transcription (or beside this utterance's own
+// transcription when that was not usable), and this waits at most jointWaitBudget for it. When it is not
+// used, a previous utterance that settled on its own ("Hola.") is joined as text and an open one stays a
+// turn of its own (settledOnItsOwn).
 func (ms *ManagedStream) mergeBarge(ctx context.Context, base *committedUtterance, audio []byte, own string, joint *jointTranscription) (string, []byte, bool) {
-	if !needsJointPass(base.transcript) {
+	joined := joinUtteranceAudio(base.audio, audio)
+	why := "not started"
+	speculative := false
+	if joint != nil && joint.base != base {
+		joint.cancel()
+		joint = nil
+	}
+	if joint != nil {
+		speculative = joint.speculative
+		var merged string
+		if merged, why = ms.awaitJoint(ctx, joint, own); merged != "" {
+			ms.logger.Info("Continuation: transcribed together with the previous utterance",
+				"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "merged", ContentForLog(merged),
+				"over_reply", true, "joined_ms", ms.joinedMs(joined), "speculative", speculative)
+			return merged, joined, true
+		}
+	}
+	var jointText string
+	var jointErr error
+	if joint != nil {
+		jointText, jointErr = joint.result()
+	}
+	if settledOnItsOwn(base.transcript) {
 		merged := spaceSentences(strings.TrimSpace(base.transcript + " " + own))
 		ms.logger.Info("Continuation: joined as text", "previous", ContentForLog(base.transcript), "continuation", ContentForLog(own),
-			"merged", ContentForLog(merged), "over_reply", true, "reason", "previous utterance complete on its own")
-		return merged, joinUtteranceAudio(base.audio, audio, int(ms.inputSampleRate)), true
+			"merged", ContentForLog(merged), "over_reply", true, "reason", "previous utterance complete on its own",
+			"joint_pass", why, "joint", ContentForLog(jointText), "error", jointErr, "speculative", speculative)
+		return merged, joined, true
 	}
-	if joint == nil || joint.base != base {
+	if joint == nil {
 		ms.logger.Info("Continuation: joint pass not started, keeping the two halves separate",
 			"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own))
 		return "", nil, false
 	}
-	merged, why := ms.awaitJoint(ctx, joint, own)
-	if merged == "" {
-		jointText, jointErr := joint.result()
-		ms.logger.Info("Continuation: joint transcription "+why+", keeping the two halves separate",
-			"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "joint", ContentForLog(jointText), "error", jointErr)
-		return "", nil, false
-	}
-	ms.logger.Info("Continuation: transcribed together with the previous utterance",
-		"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "merged", ContentForLog(merged),
-		"over_reply", true, "joined_ms", len(joint.joined)*1000/(int(ms.inputSampleRate)*2))
-	return merged, joint.joined, true
+	ms.logger.Info("Continuation: joint transcription "+why+", keeping the two halves separate",
+		"previous", ContentForLog(base.transcript), "continuation", ContentForLog(own), "joint", ContentForLog(jointText), "error", jointErr,
+		"speculative", speculative)
+	return "", nil, false
 }
 
 // noteSpeechOverPlayout handles the caller starting to speak while a reply whose synthesis has
