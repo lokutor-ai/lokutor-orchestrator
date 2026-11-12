@@ -166,7 +166,6 @@ type ManagedStream struct {
 
 	userSpeakingSince time.Time
 	userSpeechEnd     time.Time
-	lastUserText      string
 
 	vadSpeaking   bool
 	vadDiagChunks int
@@ -244,7 +243,7 @@ type ManagedStream struct {
 	ckShadowMs int64 // through the noise checks and the Turno shadow block
 	ckGateMs   int64 // through the confirmation gate
 	ckBargeMs  int64 // through the echo check and barge-in resolution
-	ckCacheMs  int64 // through the response cache and RAG injection
+	ckCacheMs  int64 // through RAG injection (the name is from the response cache, removed 2026-11-12)
 	// The last two checkpoints, added after a 25-SECOND turn on a live Catalan call whose
 	// turn_gate_ms was 25,264 with every existing checkpoint reading 0 and gate_other_ms carrying
 	// the whole span. Four checkpoints at zero and a twenty-five second gate means the stall lives
@@ -457,9 +456,6 @@ type ManagedStream struct {
 	transportReadyMu sync.Once
 	transportReady   chan struct{}
 
-	// Response cache
-	responseCache *ResponseCache
-
 	// Adaptive pacing
 	speakingRateWindow []float64
 
@@ -594,10 +590,6 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			logger.Warn("Turno turn-completion model not found, shadow disabled",
 				"path", cfg.TurnoTurnModelPath)
 		}
-	}
-
-	if cfg.ResponseCaching {
-		ms.responseCache = NewResponseCache(5*time.Minute, 100)
 	}
 
 	if cfg.SpeculativeLLM && ms.speculator != nil {
@@ -2606,8 +2598,6 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.ckBargeMs = time.Since(ms.sttEndTime).Milliseconds()
 	ms.mu.Unlock()
 
-	ms.lastUserText = transcript
-
 	if ms.userProfile.HasBaseline() {
 		wc := countWords(transcript)
 		ms.userProfile.RecordUtterance(wc, int(duration.Milliseconds()), 0)
@@ -2635,29 +2625,6 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	if currentSeq > seq {
 		ms.logger.Info("Skipping LLM for older utterance",
 			"seq", seq, "currentSeq", currentSeq)
-		return
-	}
-
-	// Check response cache before calling LLM
-	if response, audio, ok := ms.checkResponseCache(transcript); ok {
-		// Mark the LLM stage as taken-but-instant, exactly as the speculative
-		// path does. This branch returns before runLLMAndTTS, so it used to
-		// leave llmStartTime/llmEndTime unset — the turn then logged llm_ms:-1,
-		// llm_to_tts_ms:-1, and everything between STT and playback fell into
-		// unaccounted_ms. That is what an "unexplained" 3-second turn looked
-		// like. A cache hit is a real, measurable zero, not an absence.
-		now := time.Now()
-		ms.llmStartTime = now
-		ms.llmEndTime = now
-		ms.ttsStartTime = now
-		ms.emitBotResponse(response)
-		if audio != nil {
-			frameSize := int(float64(ms.playbackRate)*0.06) * 2
-			if frameSize <= 0 {
-				frameSize = 5292
-			}
-			ms.emitFrames(audio, frameSize, 0)
-		}
 		return
 	}
 
@@ -2820,7 +2787,6 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.responseChunksSent = 0
 	ms.session.AddMessage("assistant", response)
 	ms.emitBotResponse(response)
-	ms.cacheResponse(transcript, response, nil)
 
 	// Full-response TTS (single pass, no sentence pipelining — avoids residual audio on interrupt)
 	ms.speakText(rCtx, response, gen)

@@ -179,9 +179,9 @@ func main() {
 	}
 	
 	fmt.Printf("VAD: ImprovedRMS | Sample Rate: %dHz | Language: %s\n", SampleRate, lang)
-	fmt.Printf("Features: clientVAD=%v tokenTTS=%v specLLM=%v pacing=%v cache=%v sum=%v pool=%d\n",
+	fmt.Printf("Features: clientVAD=%v tokenTTS=%v specLLM=%v pacing=%v sum=%v pool=%d\n",
 		config.ClientVAD, config.TokenLevelTTS, config.SpeculativeLLM,
-		config.AdaptivePacing, config.ResponseCaching, config.ContextSummarization,
+		config.AdaptivePacing, config.ContextSummarization,
 		config.TTSConnectionPoolSize)
 	fmt.Println("Voice Agent Started! Listening to microphone...")
 	fmt.Println("Press Ctrl+C to exit")

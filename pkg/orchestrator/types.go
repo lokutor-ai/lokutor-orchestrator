@@ -130,7 +130,6 @@ const (
 	AudioChunk   EventType = "AUDIO_CHUNK"
 	ToolCall     EventType = "TOOL_CALL"
 	ToolResult   EventType = "TOOL_RESULT"
-	CacheHit     EventType = "CACHE_HIT"
 	ErrorEvent   EventType = "ERROR"
 )
 
@@ -469,9 +468,6 @@ type Config struct {
 	// Adaptive pacing: adjust silence timeout based on user speaking rate
 	AdaptivePacing bool
 
-	// Response caching: cache common responses to skip LLM entirely
-	ResponseCaching bool
-
 	// Backchannels: the agent says "mhm" / "mm" / "hm" while the caller is still talking. Off by
 	// default since 2026-09-25. The clips are synthesised from two or three characters, which the
 	// Versa engine pads to its 0.7 s minimum, so each is mostly sound the model invents, at about the
@@ -613,7 +609,6 @@ func DefaultConfig() Config {
 		SpeculativePrerender:  speculativePrerenderEnabled(),
 		SpeculativeIntervalMs: 300,
 		AdaptivePacing:        true,
-		ResponseCaching:       true,
 		TTSConnectionPoolSize: 3,
 		ContextSummarization:  true,
 		SummarizationPrompt:   "Summarize the following conversation turns in 1-2 sentences, keeping key facts and context:",

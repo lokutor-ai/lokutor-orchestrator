@@ -650,7 +650,6 @@ func (ms *ManagedStream) commitStreamedReply(ctx context.Context, gen int, respo
 		if response != "" {
 			ms.session.AddMessage("assistant", response)
 			ms.emitBotResponseWithGen(response, gen)
-			ms.cacheResponse(userTranscript, response, nil)
 		}
 		return
 	}

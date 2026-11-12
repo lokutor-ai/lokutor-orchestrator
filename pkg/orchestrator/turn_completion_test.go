@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -122,77 +121,4 @@ func TestTurnCompletion_CombinedScoreTemporalWeighting(t *testing.T) {
 	// Incomplete semantics cap the score even with long duration.
 	bad := tca.CombinedCompletionScore("and then we", 4000)
 	assert.Less(t, bad, long, "incomplete endings score below complete ones")
-}
-
-// ---------------------------------------------------------------------------
-// ResponseCache
-// ---------------------------------------------------------------------------
-
-func TestResponseCache_SetGetRoundTrip(t *testing.T) {
-	c := NewResponseCache(time.Minute, 10)
-	key := CacheKeyFor("hello", "")
-
-	c.Set(key, "Hi there!", []byte{1, 2, 3}, time.Minute)
-
-	resp, audio, ok := c.Get(key)
-	assert.True(t, ok)
-	assert.Equal(t, "Hi there!", resp)
-	assert.Equal(t, []byte{1, 2, 3}, audio)
-}
-
-func TestResponseCache_MissAndExpiry(t *testing.T) {
-	c := NewResponseCache(time.Minute, 10)
-
-	_, _, ok := c.Get(CacheKeyFor("nothing", ""))
-	assert.False(t, ok, "unknown key misses")
-
-	// TTL expiry.
-	c.Set(CacheKeyFor("temp", ""), "x", nil, 20*time.Millisecond)
-	time.Sleep(40 * time.Millisecond)
-	_, _, ok = c.Get(CacheKeyFor("temp", ""))
-	assert.False(t, ok, "expired entry must miss")
-}
-
-func TestResponseCache_Invalidate(t *testing.T) {
-	c := NewResponseCache(time.Minute, 10)
-	k1 := CacheKeyFor("a", "")
-	k2 := CacheKeyFor("b", "")
-	c.Set(k1, "A", nil, time.Minute)
-	c.Set(k2, "B", nil, time.Minute)
-
-	c.Invalidate(k1)
-	_, _, ok := c.Get(k1)
-	assert.False(t, ok)
-
-	_, _, ok = c.Get(k2)
-	assert.True(t, ok, "other entries unaffected")
-
-	c.InvalidateAll()
-	_, _, ok = c.Get(k2)
-	assert.False(t, ok)
-}
-
-func TestResponseCache_MaxSizeEviction(t *testing.T) {
-	c := NewResponseCache(time.Minute, 3)
-
-	keys := []string{"k1", "k2", "k3", "k4"}
-	for i, k := range keys {
-		c.Set(CacheKeyFor(k, ""), string(rune('a'+i)), nil, time.Minute)
-	}
-
-	present := 0
-	for _, k := range keys {
-		if _, _, ok := c.Get(CacheKeyFor(k, "")); ok {
-			present++
-		}
-	}
-	assert.LessOrEqual(t, present, 3, "cache never exceeds maxSize")
-}
-
-func TestCacheKeyFor_Format(t *testing.T) {
-	k := CacheKeyFor("what's the weather", "previous question")
-	assert.Equal(t, "q:what's the weather|last:previous question", k)
-
-	// Distinct inputs -> distinct keys.
-	assert.NotEqual(t, CacheKeyFor("a", "b"), CacheKeyFor("b", "a"))
 }

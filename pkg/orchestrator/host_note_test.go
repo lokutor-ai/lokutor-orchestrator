@@ -65,12 +65,3 @@ func TestHostNoteMessages(t *testing.T) {
 		t.Fatal("a host note must keep the agent's tools: it may need to take a message or end the call")
 	}
 }
-
-// A host note is news, never a cached reply.
-func TestHostNoteSkipsTheResponseCache(t *testing.T) {
-	ms := &ManagedStream{responseCache: NewResponseCache(time.Minute, 16), logger: &replayLog{}}
-	ms.cacheResponse(hostNoteTrigger, "cached", nil)
-	if _, _, ok := ms.checkResponseCache(hostNoteTrigger); ok {
-		t.Fatal("a host note was answered from the cache")
-	}
-}

@@ -274,7 +274,6 @@ func (ms *ManagedStream) trySpeculativeResponse(ctx context.Context, transcript 
 	ms.mu.Unlock()
 	ms.session.AddMessage("assistant", response)
 	ms.emitBotResponseWithGen(response, gen)
-	ms.cacheResponse(transcript, response, nil)
 
 	ms.logger.Info("Speculative LLM response used", "transcript", ContentForLog(transcript))
 	ms.speakResponse(rCtx, response, gen)

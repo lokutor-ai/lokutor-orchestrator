@@ -324,7 +324,6 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 		}
 		ms.session.AddMessage("assistant", text)
 		ms.emitBotResponse(text)
-		ms.cacheResponse(userTranscript, text, nil)
 		ms.speakResponse(ctx, text, gen)
 		return
 	}
@@ -824,27 +823,6 @@ func (ms *ManagedStream) getState() StreamState {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	return ms.state
-}
-
-func (ms *ManagedStream) checkResponseCache(transcript string) (string, []byte, bool) {
-	if ms.responseCache == nil || transcript == hostNoteTrigger { // a host note is news: never a cached reply
-		return "", nil, false
-	}
-	key := CacheKeyFor(transcript, ms.lastUserText)
-	response, audio, ok := ms.responseCache.Get(key)
-	if ok {
-		ms.logger.Info("Response cache hit", "key", ContentForLog(key))
-		ms.emit(CacheHit, key)
-	}
-	return response, audio, ok
-}
-
-func (ms *ManagedStream) cacheResponse(transcript, response string, audio []byte) {
-	if ms.responseCache == nil || transcript == hostNoteTrigger {
-		return
-	}
-	key := CacheKeyFor(transcript, ms.lastUserText)
-	ms.responseCache.Set(key, response, audio, 5*time.Minute)
 }
 
 // estimateTokens approximates token count for a string (~4 chars/token on average
