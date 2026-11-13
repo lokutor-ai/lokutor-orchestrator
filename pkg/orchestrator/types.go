@@ -77,6 +77,23 @@ type TTSProvider interface {
 	Name() string
 }
 
+// Viseme is one mouth shape of synthesised speech (the 15 Oculus / MPEG-4 visemes: 0 sil, 1 PP, 2 FF, 3 TH, 4 DD,
+// 5 kk, 6 CH, 7 SS, 8 nn, 9 RR, 10 aa, 11 E, 12 ih, 13 oh, 14 ou). Start and End are seconds: from the synthesis'
+// first sample when a VisemeTTSProvider hands it over, from the reply's first sample in a Visemes event.
+type Viseme struct {
+	ID    int     `json:"id"`
+	Name  string  `json:"name"`
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+}
+
+// VisemeTTSProvider is a TTSProvider that can also time the mouth shapes of what it says (optional). onVisemes is
+// called as they are decided, from the synthesis goroutine, possibly before the audio they belong to.
+type VisemeTTSProvider interface {
+	StreamSynthesizeVisemes(ctx context.Context, text string, voice Voice, lang Language, onChunk func([]byte) error,
+		onVisemes func([]Viseme)) error
+}
+
 type VADProvider interface {
 	Process(chunk []byte) (*VADEvent, error)
 	IsSpeaking() bool
@@ -128,9 +145,12 @@ const (
 	// confirmed; transports that pause or stop at the onset can ignore it.
 	StopPlayback EventType = "STOP_PLAYBACK"
 	AudioChunk   EventType = "AUDIO_CHUNK"
-	ToolCall     EventType = "TOOL_CALL"
-	ToolResult   EventType = "TOOL_RESULT"
-	ErrorEvent   EventType = "ERROR"
+	// Visemes: []Viseme for the reply's audio, timed from its first sample (SetVisemes; only with a
+	// VisemeTTSProvider). Emitted in order with the AudioChunk events of the same generation.
+	Visemes    EventType = "VISEMES"
+	ToolCall   EventType = "TOOL_CALL"
+	ToolResult EventType = "TOOL_RESULT"
+	ErrorEvent EventType = "ERROR"
 )
 
 type ToolCallEventData struct {

@@ -313,7 +313,10 @@ type ManagedStream struct {
 	ttsStartTime      time.Time
 	ttsFirstChunkTime time.Time
 	// Audio for the opening segment, rendered during the hangover. See prerender.go.
-	prerender        prerendered
+	prerender prerendered
+	// wantVisemes: the client asked for mouth shapes (SetVisemes); each spoken segment's are emitted as a Visemes
+	// event, timed from the reply's first sample, when the TTS provider can time them.
+	wantVisemes      atomic.Bool
 	ttsEndTime       time.Time
 	botSpeakStart    time.Time
 	lastAudioSentAt  time.Time
@@ -3023,8 +3026,26 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	// that the work happened before the turn was confirmed rather than after, which is the entire
 	// saving. See prerender.go.
 	var err error
-	if pre := ms.prerender.take(text, voice, lang); pre != nil {
+	// Mouth shapes for this segment, moved from its own first sample to the reply's: the turn's audio before it
+	// (bytesBefore, PCM16 at the playback rate), so they line up with the audio the client plays.
+	var onVis func([]Viseme)
+	if ms.wantVisemes.Load() && ms.playbackRate > 0 {
+		base := float64(bytesBefore) / float64(2*ms.playbackRate)
+		onVis = func(v []Viseme) {
+			out := make([]Viseme, len(v))
+			for i, x := range v {
+				x.Start += base
+				x.End += base
+				out[i] = x
+			}
+			ms.emitWithGen(Visemes, out, gen)
+		}
+	}
+	if pre, preVis := ms.prerender.take(text, voice, lang); pre != nil {
 		ms.logger.Info("Speaking pre-rendered opening segment", "chunks", len(pre), "chars", len(text))
+		if onVis != nil && len(preVis) > 0 {
+			onVis(preVis)
+		}
 		for _, c := range pre {
 			if sCtx.Err() != nil {
 				break
@@ -3035,7 +3056,7 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 			}
 		}
 	} else {
-		err = ms.orch.SynthesizeStream(sCtx, text, voice, lang, onChunk)
+		err = ms.orch.SynthesizeStreamVisemes(sCtx, text, voice, lang, onChunk, onVis)
 	}
 	ms.ttsMu.Unlock()
 	ms.logTTSSegment(probe, text, string(lang), segIdx, bytesBefore, prevTrail, segStart, sCtx.Err() != nil)

@@ -37,40 +37,42 @@ type prerendered struct {
 	voice  Voice    // conditioning it was rendered with
 	lang   Language //
 	chunks [][]byte
-	at     time.Time
-	cancel context.CancelFunc
+	// visemes: the segment's mouth shapes, timed from its first sample (only when the stream asked, SetVisemes)
+	visemes []Viseme
+	at      time.Time
+	cancel  context.CancelFunc
 }
 
 // take returns the audio for `text` if it was rendered for this exact segment, voice and language,
 // and clears it either way — a rendered opening is good for exactly one turn.
-func (p *prerendered) take(text string, voice Voice, lang Language) [][]byte {
+func (p *prerendered) take(text string, voice Voice, lang Language) ([][]byte, []Viseme) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	got := p.chunks
+	got, vis := p.chunks, p.visemes
 	at, hadText, hadVoice, hadLang := p.at, p.text, p.voice, p.lang
-	p.text, p.chunks, p.cancel = "", nil, nil
+	p.text, p.chunks, p.visemes, p.cancel = "", nil, nil, nil
 	if got == nil || hadText == "" {
-		return nil
+		return nil, nil
 	}
 	if !strings.EqualFold(strings.TrimSpace(hadText), strings.TrimSpace(text)) {
-		return nil
+		return nil, nil
 	}
 	// Voice and language are part of the audio, not of the request: a caller who switched voice
 	// mid-call must not hear one sentence in the old one.
 	if hadVoice != voice || hadLang != lang {
-		return nil
+		return nil, nil
 	}
 	if time.Since(at) > prerenderMaxAge {
-		return nil
+		return nil, nil
 	}
-	return got
+	return got, vis
 }
 
 // discard drops any pending render and stops one still in flight.
 func (p *prerendered) discard() {
 	p.mu.Lock()
 	cancel := p.cancel
-	p.text, p.chunks, p.cancel = "", nil, nil
+	p.text, p.chunks, p.visemes, p.cancel = "", nil, nil, nil
 	p.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -105,18 +107,23 @@ func (ms *ManagedStream) prerenderFirstSegment(response string) {
 	if old := ms.prerender.cancel; old != nil {
 		old() // a newer speculation supersedes the last
 	}
-	ms.prerender.text, ms.prerender.chunks, ms.prerender.cancel = "", nil, cancel
+	ms.prerender.text, ms.prerender.chunks, ms.prerender.visemes, ms.prerender.cancel = "", nil, nil, cancel
 	ms.prerender.voice, ms.prerender.lang, ms.prerender.at = voice, lang, time.Now()
 	ms.prerender.mu.Unlock()
 
 	var chunks [][]byte
+	var vis []Viseme
+	var onVis func([]Viseme)
+	if ms.wantVisemes.Load() {
+		onVis = func(v []Viseme) { vis = append(vis, v...) }
+	}
 	start := time.Now()
-	err := ms.orch.SynthesizeStream(ctx, first, voice, lang, func(chunk []byte) error {
+	err := ms.orch.SynthesizeStreamVisemes(ctx, first, voice, lang, func(chunk []byte) error {
 		c := make([]byte, len(chunk))
 		copy(c, chunk)
 		chunks = append(chunks, c)
 		return nil
-	})
+	}, onVis)
 	if err != nil || ctx.Err() != nil || len(chunks) == 0 {
 		cancel()
 		ms.prerender.mu.Lock()
@@ -131,7 +138,7 @@ func (ms *ManagedStream) prerenderFirstSegment(response string) {
 	// Only publish if this render is still the current one — a newer speculation may have
 	// superseded it while this was synthesising.
 	if ms.prerender.cancel != nil {
-		ms.prerender.text, ms.prerender.chunks = first, chunks
+		ms.prerender.text, ms.prerender.chunks, ms.prerender.visemes = first, chunks, vis
 	}
 	ms.prerender.mu.Unlock()
 	ms.logger.Info("Pre-rendered opening segment during hangover",
@@ -146,3 +153,7 @@ func speculativePrerenderEnabled() bool {
 	v := strings.TrimSpace(os.Getenv("SPECULATIVE_PRERENDER"))
 	return v == "1" || strings.EqualFold(v, "true")
 }
+
+// SetVisemes asks for the mouth shapes of everything this stream speaks from now on (a Visemes event per segment,
+// timed from the reply's first sample), when the TTS provider can time them (VisemeTTSProvider). Off by default.
+func (ms *ManagedStream) SetVisemes(on bool) { ms.wantVisemes.Store(on) }

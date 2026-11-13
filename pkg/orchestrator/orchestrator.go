@@ -270,6 +270,16 @@ func (o *Orchestrator) SynthesizeStream(ctx context.Context, text string, voice 
 	return o.tts.StreamSynthesize(ctx, text, voice, lang, onChunk)
 }
 
+// SynthesizeStreamVisemes is SynthesizeStream that also asks for the mouth shapes when onVisemes is set and the TTS
+// provider can time them (VisemeTTSProvider); otherwise it is SynthesizeStream.
+func (o *Orchestrator) SynthesizeStreamVisemes(ctx context.Context, text string, voice Voice, lang Language,
+	onChunk func([]byte) error, onVisemes func([]Viseme)) error {
+	if vp, ok := o.tts.(VisemeTTSProvider); ok && onVisemes != nil {
+		return vp.StreamSynthesizeVisemes(ctx, text, voice, lang, onChunk, onVisemes)
+	}
+	return o.tts.StreamSynthesize(ctx, text, voice, lang, onChunk)
+}
+
 func (o *Orchestrator) SetTTSRate(rate float64) {
 	type rateSetter interface {
 		SetSpeechRate(float64)
