@@ -33,6 +33,30 @@ func TestPlayoutTimeline_HeardIsWhatHadPlayed(t *testing.T) {
 	}
 }
 
+// Talking over the last fraction of a second of a question is answering it, not interrupting it: the sentence
+// counts as heard, so the model does not ask it again (2026-11-16: "…or would you rather pick a topic?" was
+// recorded as "…pick a…" and asked twice more).
+func TestPlayoutTimeline_TalkingOverTheLastWordStillHeardTheSentence(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	var p playoutTimeline
+	p.schedule(3, 1, "I didn't tell you a story, but I'd be happy to tell you one now.", t0, 3*time.Second)
+	p.schedule(3, 2, "Want a short one, or would you rather pick a topic?", t0, 2600*time.Millisecond)
+	text, _, complete := p.heard(t0.Add(5400 * time.Millisecond)) // 200 ms before the question ends
+	if !complete || !strings.HasSuffix(text, "pick a topic?") {
+		t.Fatalf("the caller answered as the question ended: got %q complete=%v", text, complete)
+	}
+	text, _, complete = p.heard(t0.Add(4500 * time.Millisecond)) // 1.1 s before: a real interruption
+	if complete || strings.HasSuffix(text, "topic?") {
+		t.Fatalf("cut in mid-question: got %q complete=%v", text, complete)
+	}
+	// A short segment keeps most of itself: a third at most is forgiven.
+	var q playoutTimeline
+	q.schedule(1, 1, "Okay.", t0, 300*time.Millisecond)
+	if _, _, complete := q.heard(t0.Add(150 * time.Millisecond)); complete {
+		t.Fatal("half of a 300 ms word counted as heard")
+	}
+}
+
 func TestPlayoutTimeline_LateChunkLeavesAGapNotHeardAudio(t *testing.T) {
 	t0 := time.Unix(1000, 0)
 	var p playoutTimeline

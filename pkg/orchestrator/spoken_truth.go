@@ -42,6 +42,22 @@ func continuationMergeMaxHeard() time.Duration {
 // next one: a caller resuming a sentence does so within seconds.
 const continuationMergeWindow = 8 * time.Second
 
+// segmentTailGrace is how much of a segment's end the caller may talk over and still have heard it: 400 ms
+// (SPOKEN_TAIL_GRACE_MS), never more than a third of the segment, never less than 20 ms (clock and chunk slack).
+func segmentTailGrace(total time.Duration) time.Duration {
+	g := 400 * time.Millisecond
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SPOKEN_TAIL_GRACE_MS"))); err == nil && v >= 0 {
+		g = time.Duration(v) * time.Millisecond
+	}
+	if g > total/3 {
+		g = total / 3
+	}
+	if g < 20*time.Millisecond {
+		g = 20 * time.Millisecond
+	}
+	return g
+}
+
 type playoutInterval struct{ start, end time.Time }
 
 // spokenSegment is one speakText call (one sentence, usually) on the caller's playout timeline.
@@ -173,8 +189,11 @@ func (p *playoutTimeline) heard(at time.Time) (text string, heardDur time.Durati
 		if total <= 0 {
 			continue
 		}
-		// A few milliseconds short of the end is the end: chunk boundaries and clock reads are not exact.
-		if h >= total-20*time.Millisecond {
+		// A few milliseconds short of the end is the end: chunk boundaries and clock reads are not exact. So is the
+		// last fraction of a second: people start answering as a question ends (a caller cut in over "…pick a
+		// topic?" 200 ms before its end), and recording the sentence as cut off ("…pick a…") made the model ask it
+		// again, twice in a row (2026-11-16).
+		if h >= total-segmentTailGrace(total) {
 			if t := strings.TrimSpace(seg.text); t != "" {
 				parts = append(parts, t)
 			}
