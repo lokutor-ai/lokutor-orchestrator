@@ -418,6 +418,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	}
 
 	var toolWg sync.WaitGroup
+	// fillerWg is the platform's filler said while a tool runs ("Let me check that."), spoken on its own goroutine.
+	var fillerWg sync.WaitGroup
 
 	// Soft-timeout filler: if the LLM hasn't produced a first token within ~3s,
 	// speak a short filler to avoid dead air (ElevenLabs pattern). Fires once.
@@ -551,7 +553,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					// one, back to back.
 					fillerPhrase := ms.toolFiller()
 					if fillerPhrase != "" {
+						fillerWg.Add(1)
 						go func(t string) {
+							defer fillerWg.Done()
 							sCtx, sCancel := context.WithCancel(ctx)
 							defer sCancel()
 							ms.speakText(sCtx, t, gen)
@@ -662,6 +666,11 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			return
 		}
 
+		// The filler is synthesised under this turn's context, which ends when this function returns (the reply
+		// after the tools runs on its own below). A tool that answers in milliseconds, as a client tool does, let it
+		// return while "Let me check that" was 35 ms into synthesis: the caller heard 255 ms of it (2026-11-16).
+		waitGroupFor(&fillerWg, 3*time.Second)
+		toolTurnGen := gen
 		go func() {
 			freshCtx, c := context.WithCancel(ms.ctx)
 			defer c()
@@ -814,6 +823,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 			ms.session.AddMessage("assistant", text)
 			ms.emitBotResponse(text)
+			// And it starts once the words before it have played: its new generation makes the client drop what
+			// is still playing of the old one, so a reply ready before "Let me check that" had played out cut it.
+			ms.waitPlayedOut(rCtx, toolTurnGen, 8*time.Second)
 			ms.speakResponse(rCtx, text, gen)
 		}()
 	}
@@ -902,4 +914,36 @@ func (ms *ManagedStream) IsClientVAD() bool {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	return ms.clientVAD
+}
+
+// waitGroupFor waits for wg, at most d.
+func waitGroupFor(wg *sync.WaitGroup, d time.Duration) {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+	}
+}
+
+// waitPlayedOut returns once gen's audio has played on the caller's side (the playout timeline), at most max later, or
+// when ctx ends (the caller spoke and a newer turn took over).
+func (ms *ManagedStream) waitPlayedOut(ctx context.Context, gen int, max time.Duration) {
+	ms.mu.Lock()
+	var end time.Time
+	if ms.playout.gen == gen {
+		end = ms.playout.end
+	}
+	ms.mu.Unlock()
+	d := time.Until(end)
+	if d <= 0 {
+		return
+	}
+	if d > max {
+		d = max
+	}
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
 }

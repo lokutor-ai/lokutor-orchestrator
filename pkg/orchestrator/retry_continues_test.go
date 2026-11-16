@@ -259,3 +259,66 @@ func TestFinalToolEndsTheTurnWithItsWords(t *testing.T) {
 		ms.Close()
 	}
 }
+
+// slowTTS takes 300 ms to synthesise each sentence, in ten chunks, and records which ones were cut off by their context.
+type slowTTS struct {
+	countingTTS
+	cut []string
+}
+
+func (s *slowTTS) StreamSynthesize(ctx context.Context, text string, voice Voice, lang Language, onChunk func([]byte) error) error {
+	s.mu.Lock()
+	s.said = append(s.said, text)
+	s.mu.Unlock()
+	for i := 0; i < 10; i++ {
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			s.cut = append(s.cut, text)
+			s.mu.Unlock()
+			return ctx.Err()
+		case <-time.After(30 * time.Millisecond):
+		}
+		if err := onChunk(make([]byte, 4410)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A tool that answers at once (a client tool, a fast handler) must not cut the filler said while it runs: the reply
+// after the result cancelled the turn's pipeline while "Let me check that" was being synthesised, and the caller heard
+// 255 ms of it (lokutor.com demo, 2026-11-16).
+func TestFastToolDoesNotCutTheFiller(t *testing.T) {
+	llm := &MockStreamingLLM{responses: []struct {
+		content   string
+		toolCalls []ToolCallEventData
+	}{
+		{content: "", toolCalls: []ToolCallEventData{{Name: "lookup", Arguments: `{}`, CallID: "c1"}}},
+		{content: "Ya está.", toolCalls: nil},
+	}}
+	tts := &slowTTS{}
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+	orch.RegisterTool("lookup", func(args string) (string, error) { return `{"ok":true}`, nil })
+	session := NewConversationSession("fast-tool-filler")
+	session.SetTools([]Tool{{Type: "function", Function: map[string]interface{}{"name": "lookup"}}})
+	ms := orch.NewManagedStream(context.Background(), session)
+	defer ms.Close()
+	ms.runLLMAndTTS(context.Background(), "mira mi cita")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		tts.mu.Lock()
+		said, cut := append([]string(nil), tts.said...), append([]string(nil), tts.cut...)
+		tts.mu.Unlock()
+		if strings.Contains(strings.Join(said, " | "), "Ya está") || time.Now().After(deadline) {
+			if len(said) < 2 {
+				t.Fatalf("expected a filler and the reply, got %v", said)
+			}
+			if len(cut) > 0 {
+				t.Fatalf("cut off mid-synthesis: %v (said %v)", cut, said)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
