@@ -117,10 +117,6 @@ type ManagedStream struct {
 	// echoHeldPlayThroughAt is the onset of the barge-in for which play-through was kept going
 	// because the speech matched the agent's own audio (logged once per barge-in).
 	echoHeldPlayThroughAt time.Time
-	// echoVetoes counts the barge-ins of this call that turned out to be the agent's own voice
-	// (settleEchoVeto). Once there has been one, play-through waits playThroughEchoStopAfter before a
-	// timed stop, so the transcript's echo check decides before anything is cut.
-	echoVetoes int
 
 	cmdChan       chan []byte
 	interruptChan chan struct{}

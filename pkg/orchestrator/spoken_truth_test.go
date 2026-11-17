@@ -619,30 +619,6 @@ func TestManagedStream_PlayThrough_SustainedSpeechStopsPlayback(t *testing.T) {
 	}
 }
 
-// 29N demo on laptop speakers (2026-11-17): once a barge-in has turned out to be the agent's own voice,
-// speech over the reply no longer stops it at the normal window, so the next echo can be vetoed while
-// the reply still plays; a caller who keeps talking past the longer window still stops it.
-func TestManagedStream_PlayThrough_EchoProneCallWaitsLongerBeforeStopping(t *testing.T) {
-	t.Setenv("BARGE_IN_PLAYTHROUGH_MS", "150")
-	t.Setenv("BARGE_IN_PLAYTHROUGH_ECHO_MS", "600")
-	stream := playThroughStream(t)
-	stream.mu.Lock()
-	stream.echoVetoes = 1
-	stream.mu.Unlock()
-	stream.onVADStart(StateIdle)
-
-	time.Sleep(200 * time.Millisecond)
-	stream.stopPlayThroughIfDue(time.Now())
-	if _, ok := drainUntil(stream, 100*time.Millisecond)[StopPlayback]; ok {
-		t.Fatalf("an echo-prone call stopped the reply at the normal window")
-	}
-	time.Sleep(450 * time.Millisecond)
-	stream.stopPlayThroughIfDue(time.Now())
-	if _, ok := drainUntil(stream, 300*time.Millisecond)[StopPlayback]; !ok {
-		t.Fatalf("a caller talking past the echo window did not stop the reply")
-	}
-}
-
 // 2026-09-23, English web session: "Okay." said with the floor was discarded as noise, and so was
 // every repeat. With nothing to resume it is the caller's turn.
 func TestProcessUtterance_EnglishShortReplyWithTheFloorIsATurn(t *testing.T) {
