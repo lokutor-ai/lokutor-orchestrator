@@ -370,10 +370,17 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	ttsQueue := make(chan string, 16)
 	ttsWg := sync.WaitGroup{}
 	ttsWg.Add(1)
+	// One reply id for the turn's sentences (WithReply): a provider that keeps a reply in one stream appends each to the
+	// last, and is told when the turn has no more (ReplyEnder) so it frees what it held.
+	replyID := newReplyID()
 	go func() {
 		defer ttsWg.Done()
+		rctx := WithReply(ctx, replyID)
 		for text := range ttsQueue {
-			ms.speakText(ctx, text, gen)
+			ms.speakText(rctx, text, gen)
+		}
+		if e, ok := ms.orch.tts.(ReplyEnder); ok {
+			e.EndReply(replyID)
 		}
 	}()
 
