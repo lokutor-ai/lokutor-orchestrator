@@ -431,6 +431,23 @@ func playThroughStopAfter() time.Duration {
 	return 400 * time.Millisecond
 }
 
+// playThroughEchoStopAfter replaces playThroughStopAfter on a call whose barge-ins have already turned
+// out to be the agent's own voice coming back through the caller's speakers (echoVetoes). On laptop
+// speakers the browser's echo canceller leaves an echo the acoustic check below does not match, so the
+// timed stop cut the reply at 400 ms, the transcript's echo check then found it was the agent's own words
+// with nothing left to resume, the rest was said again from the cut sentence, and its echo cut that
+// too: the same opening sentence started four times in fourteen seconds (29N demo,
+// agent_1794933398568424737, 2026-11-17). Waiting longer lets the echo's utterance end and be vetoed
+// while the reply still plays (resumed, nothing lost); a caller who really talks over the agent still
+// stops it, after this long or as soon as their words are transcribed and confirmed. Env
+// BARGE_IN_PLAYTHROUGH_ECHO_MS.
+func playThroughEchoStopAfter() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("BARGE_IN_PLAYTHROUGH_ECHO_MS")); err == nil && v >= 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return 2000 * time.Millisecond
+}
+
 // stopPlayThroughIfDue tells a play-through transport to stop once the caller has kept talking over
 // the reply for playThroughStopAfter (StopPlayback). The transport discards what it holds, so what
 // was heard is settled at this moment — as it is at the onset for a transport that stops outright,
@@ -438,9 +455,15 @@ func playThroughStopAfter() time.Duration {
 func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
 	ms.mu.Lock()
 	gen := ms.payloadGen
+	wait := playThroughStopAfter()
+	if ms.echoVetoes > 0 {
+		if w := playThroughEchoStopAfter(); w > wait {
+			wait = w
+		}
+	}
 	if !ms.playsThroughBargeIn || !ms.pendingBargeIn || ms.pendingBargeGen != gen ||
 		ms.onset.gen != gen || ms.onset.at.IsZero() || ms.onset.stopped ||
-		now.Sub(ms.onset.at) < playThroughStopAfter() {
+		now.Sub(ms.onset.at) < wait {
 		ms.mu.Unlock()
 		return
 	}
@@ -1082,6 +1105,7 @@ func (ms *ManagedStream) settleEchoVeto(ctx context.Context, seq, gen int, pendi
 	}
 	joinable := !resumable && lost != "" && !textEcho && !carried && ms.bargeBaseLocked(now, seq, pendingBarge) != nil
 	superseded := ms.utteranceSeq != seq || ms.vadSpeaking
+	ms.echoVetoes++
 	ms.mu.Unlock()
 
 	outcome := "said_again"
