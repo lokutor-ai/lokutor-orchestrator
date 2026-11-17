@@ -1083,6 +1083,10 @@ func (ms *ManagedStream) settleEchoVeto(ctx context.Context, seq, gen int, pendi
 	joinable := !resumable && lost != "" && !textEcho && !carried && ms.bargeBaseLocked(now, seq, pendingBarge) != nil
 	superseded := ms.utteranceSeq != seq || ms.vadSpeaking
 	ms.mu.Unlock()
+	if textEcho && acoustic.score >= echoTextAcousticFloor {
+		// the agent's own words, and its sound at this delay: the call's echo path (acousticEchoCheck)
+		ms.learnEchoLag(acoustic.lagMs)
+	}
 
 	outcome := "said_again"
 	switch {

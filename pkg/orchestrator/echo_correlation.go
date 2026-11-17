@@ -83,6 +83,47 @@ var echoChanceP99 = []struct {
 }{{3, 1.0}, {5, 0.999}, {8, 0.994}, {10, 0.99}, {12, 0.984}, {16, 0.98}, {20, 0.976}, {25, 0.972}, {30, 0.967},
 	{40, 0.943}, {50, 0.917}, {60, 0.853}, {80, 0.776}, {100, 0.729}}
 
+// echoKnownLagP99 is echoChanceP99 at ONE alignment (a known echo delay, +-1 frame) instead of the peak over 75: how
+// well a real caller's voice correlates with the agent's by chance at a fixed delay, 99th percentile, by the near
+// end's length in 20 ms frames. Measured 2026-11-17 the same way (TEN-VAD test set human speech against comb2 Versa
+// renders, 3,000 windows per length; the 75-alignment peak reproduced echoChanceP99: 0.980 at 20 frames, 0.966 at 30).
+// A call whose echo was confirmed at a delay (laptop speakers, 29N demo: 0.91-0.92 at 140 ms every time, under the
+// searched bar of 0.95-0.96, so each echo stopped the reply and it was said again from the top, four times) has its
+// later echoes judged at that delay against this table: a real caller is still taken for echo one time in a hundred,
+// as with the searched bar, so a caller who talks over the agent stops it as before.
+var echoKnownLagP99 = []struct {
+	frames int
+	p99    float64
+}{{10, 0.949}, {16, 0.881}, {20, 0.875}, {25, 0.846}, {30, 0.819}, {40, 0.744}, {50, 0.680}}
+
+// echoKnownLagThresholdFor is echoKnownLagP99 for an n-frame near end (linear between the lengths measured, never
+// under echoCorrelationThreshold); below the shortest length measured, 1.0 (never).
+func echoKnownLagThresholdFor(n int) float64 {
+	tab := echoKnownLagP99
+	if n < tab[0].frames {
+		return 1.0
+	}
+	t := tab[len(tab)-1].p99
+	for i := 1; i < len(tab); i++ {
+		if n <= tab[i].frames {
+			lo, hi := tab[i-1], tab[i]
+			t = lo.p99 + (hi.p99-lo.p99)*float64(n-lo.frames)/float64(hi.frames-lo.frames)
+			break
+		}
+	}
+	if t < echoCorrelationThreshold {
+		t = echoCorrelationThreshold
+	}
+	return t
+}
+
+// learnEchoLag records the delay of an echo confirmed by its words and its sound (settleEchoVeto).
+func (ms *ManagedStream) learnEchoLag(lagMs int) {
+	ms.echoMu.Lock()
+	ms.echoLagKnown, ms.echoLagFrames = true, lagMs/20
+	ms.echoMu.Unlock()
+}
+
 // echoThresholdFor is the correlation an n-frame near end needs to be called the agent's echo on the envelope alone:
 // what a real caller reaches by chance one time in a hundred (echoChanceP99, linear between the lengths measured),
 // and never under echoCorrelationThreshold. A real echo of the agent at a level that passes the phone's echo gate,
@@ -410,6 +451,7 @@ func (ms *ManagedStream) acousticEchoCheck(gen int) (r acousticEchoReading) {
 	}
 	far := make([]byte, len(farSrc))
 	copy(far, farSrc)
+	lagKnown, knownLag := ms.echoLagKnown, ms.echoLagFrames
 	ms.echoMu.Unlock()
 
 	nearEnv := rmsEnvelope(near, echoFrameBytes)
@@ -445,5 +487,20 @@ func (ms *ManagedStream) acousticEchoCheck(gen int) (r acousticEchoReading) {
 	r.lagMs = lagFrames * 20
 	r.threshold = echoThresholdFor(len(nearEnv))
 	r.echo = peak >= r.threshold
+	if !r.echo && lagKnown {
+		// The call's echo path is known: the agent's audio at that delay (+-1 frame) against the one-alignment bar.
+		tail := len(farEnv) - len(nearEnv)
+		best := 0.0
+		for d := -1; d <= 1; d++ {
+			if start := tail - (knownLag + d); start >= 0 && start+len(nearEnv) <= len(farEnv) {
+				if c := pearson(nearEnv, farEnv[start:start+len(nearEnv)]); c > best {
+					best = c
+				}
+			}
+		}
+		if t := echoKnownLagThresholdFor(len(nearEnv)); best >= t {
+			r.echo, r.score, r.threshold, r.lagMs = true, best, t, knownLag*20
+		}
+	}
 	return r
 }

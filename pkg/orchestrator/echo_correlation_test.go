@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"math"
+	"math/rand"
 	"testing"
 	"time"
 )
@@ -401,4 +402,59 @@ func TestShortWindowNeedsMoreThanChanceToBeEcho(t *testing.T) {
 		t.Fatalf("a caller at %.3f over %d frames was called the agent's echo (threshold %.3f)", r.score, r.nearFrames, r.threshold)
 	}
 	t.Logf("caller %.3f over %d frames, threshold %.3f", r.score, r.nearFrames, r.threshold)
+}
+
+// envelopePCM is PCM16 whose 20 ms frames carry the given RMS envelope (a 1 kHz tone per frame).
+func envelopePCM(env []float64) []byte {
+	out := make([]byte, 0, len(env)*echoFrameBytes)
+	for _, a := range env {
+		out = append(out, tone(320, 2*math.Pi*1000/16000, a*math.Sqrt2)...)
+	}
+	return out
+}
+
+// 29N demo on laptop speakers (2026-11-17): the agent's echo matched its audio at 0.91-0.92, every time at 140 ms,
+// under the searched-delay bar (0.95-0.96), so each echo stopped the reply. Once the call's echo is confirmed at a
+// delay, the same match at that delay is echo; without a known delay it is not, and the known delay gives no echo
+// to speech that does not follow the agent's audio there.
+func TestAcousticEcho_KnownLagCatchesTheCallsOwnEcho(t *testing.T) {
+	stream := NewWithVAD(&MockSTTProvider{}, &MockLLMProvider{}, &MockTTSProvider{}, NewRMSVAD(0.05, 50*time.Millisecond),
+		DefaultConfig()).NewManagedStream(context.Background(), NewConversationSession("known-lag"))
+	defer stream.Close()
+	rng := rand.New(rand.NewSource(3))
+	far := make([]float64, 200)
+	for i := range far {
+		far[i] = 300 + 3000*rng.Float64()
+	}
+	const lag, n = 7, 20 // 140 ms, a 400 ms near end
+	near := make([]float64, n)
+	for i := range near {
+		near[i] = 0.4*far[len(far)-n-lag+i] + 150*rng.NormFloat64()
+		if near[i] < 50 {
+			near[i] = 50
+		}
+	}
+	other := make([]float64, n)
+	for i := range other {
+		other[i] = 300 + 3000*rng.Float64()
+	}
+	set := func(nearEnv []float64) {
+		stream.echoMu.Lock()
+		stream.echoFarEndBuf, stream.echoNearEndBuf, stream.echoNearEndGen = envelopePCM(far), envelopePCM(nearEnv), 0
+		stream.echoMu.Unlock()
+	}
+	set(near)
+	r := stream.acousticEchoCheck(0)
+	if r.echo || r.score < echoKnownLagThresholdFor(n) || r.score >= echoThresholdFor(n) {
+		t.Fatalf("set-up: want a match between the known-lag bar %.3f and the searched bar %.3f, got %+v",
+			echoKnownLagThresholdFor(n), echoThresholdFor(n), r)
+	}
+	stream.learnEchoLag(lag * 20)
+	if r = stream.acousticEchoCheck(0); !r.echo || r.lagMs != lag*20 {
+		t.Fatalf("the call's own echo at its known delay was not taken for echo: %+v", r)
+	}
+	set(other)
+	if r = stream.acousticEchoCheck(0); r.echo {
+		t.Fatalf("speech unrelated to the agent's audio was taken for echo once the delay was known: %+v", r)
+	}
 }
