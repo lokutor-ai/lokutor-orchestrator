@@ -456,9 +456,9 @@ func echoAfterHeard(t *testing.T, heardMs, after int, said string, log *recordin
 }
 
 // The agent's own words came back after the caller had heard 1.6 s of the reply, and the transport
-// had already been told to stop: the rest of the reply is said again, from the start of the sentence
-// that was cut, with no model call. It used to be lost, and the caller heard nothing until the
-// silence check-in.
+// had already been told to stop: the rest of the reply is said again, from the word that was cut
+// (2026-11-19; from the start of its sentence before, which let an echo loop repeat a greeting), with
+// no model call. It used to be lost, and the caller heard nothing until the silence check-in.
 func TestEchoVeto_NothingToResumeSaysTheRestAgain(t *testing.T) {
 	log := &recordingLogger{}
 	stream, llm := echoAfterHeard(t, 1600, transportStopped, "Bring your warmest cloak.", log)
@@ -466,8 +466,14 @@ func TestEchoVeto_NothingToResumeSaysTheRestAgain(t *testing.T) {
 		return log.has("INFO Barge-in looks like an echo of the bot's own speech", "")
 	})
 	ev := waitForEventType(t, stream, BotResponse, 3*time.Second)
-	if want := bromReply1 + " " + bromReply2; ev.Data != want {
-		t.Fatalf("BotResponse = %q, want the reply again from the cut sentence: %q", ev.Data, want)
+	whole := bromReply1 + " " + bromReply2
+	again, _ := ev.Data.(string)
+	// 1.6 s of a 2 s sentence counts as heard (segmentTailGrace), so the replay starts at the second sentence.
+	if again != bromReply2 {
+		t.Fatalf("BotResponse = %q, want the reply again from the first word not heard: %q (of %q)", again, bromReply2, whole)
+	}
+	if !log.has("INFO Saying the lost reply again: resume from word", "") {
+		t.Fatalf("the resume point was not logged:\n%s", log.dump())
 	}
 	waitForEventType(t, stream, AudioChunk, 3*time.Second)
 	if !log.has("INFO Barge-in looks like an echo of the bot's own speech", "said_again") {
@@ -487,7 +493,7 @@ func TestEchoVeto_NothingToResumeSaysTheRestAgain(t *testing.T) {
 		}
 	}
 	if len(tail) != 3 || tail[0] != "user: "+bromFirstHalf || !strings.HasSuffix(tail[1], interruptionMark) ||
-		tail[2] != "assistant: "+bromReply1+" "+bromReply2 {
+		tail[2] != "assistant: "+again {
 		t.Fatalf("context = %q, want the caller's turn, what they heard of the reply, and the reply said again", tail)
 	}
 }

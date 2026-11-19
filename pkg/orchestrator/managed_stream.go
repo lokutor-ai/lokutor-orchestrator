@@ -117,6 +117,10 @@ type ManagedStream struct {
 	// echoHeldPlayThroughAt is the onset of the barge-in for which play-through was kept going
 	// because the speech matched the agent's own audio (logged once per barge-in).
 	echoHeldPlayThroughAt time.Time
+	// echoLoop: an echo that keeps cutting the replay of the same lost reply (echo_loop.go), under mu.
+	echoLoop echoLoopState
+	// resumeFromWord is the word of the cut sentence the last lost reply starts from (lostReplyLocked), under mu.
+	resumeFromWord int
 	// echoLagKnown / echoLagFrames: the delay at which this call's own echo was confirmed by its words and its sound
 	// (settleEchoVeto), guarded by echoMu. Speech over a later reply that matches the agent's audio at that same delay
 	// is judged against echoKnownLagThresholdFor, not the searched-delay bar (acousticEchoCheck).

@@ -78,6 +78,20 @@ func (s *spokenSegment) total() time.Duration {
 	return d
 }
 
+// heardWords is how many of the segment's words had been played by at, on the same proportional estimate
+// heard() uses, against the whole length scheduled for it (cutAt shortens the intervals to what played).
+func (s *spokenSegment) heardWords(at time.Time) int {
+	if s.sched <= 0 {
+		return 0
+	}
+	words := strings.Fields(s.text)
+	n := int(float64(len(words)) * float64(s.heardBefore(at)) / float64(s.sched))
+	if n > len(words) {
+		n = len(words)
+	}
+	return n
+}
+
 func (s *spokenSegment) heardBefore(at time.Time) time.Duration {
 	var d time.Duration
 	for _, iv := range s.intervals {
@@ -453,7 +467,20 @@ func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
 	// its queue — and the echo check after transcription used to run only once this had already
 	// cut the reply. Checked on every frame until the barge-in resolves, so real speech mixed in
 	// with the echo (which breaks the match) still stops playback.
-	if echo, score, lagMs, _ := ms.isLikelyAcousticEcho(gen); echo {
+	echo, score, lagMs, _ := ms.isLikelyAcousticEcho(gen)
+	if !echo && ms.echoLoop.protectGen == gen && score >= ms.echoLoop.floor() {
+		// A replay of a reply the same echo has already cut twice (noteEchoLoop): speech that sounds like that
+		// confirmed echo plays through. Anything else, a caller saying other words over it, breaks the match and
+		// stops playback here exactly as on any other reply.
+		if !ms.echoHeldPlayThroughAt.Equal(ms.onset.at) {
+			ms.echoHeldPlayThroughAt = ms.onset.at
+			ms.logger.Info("echo loop: replay protected, playing through the same echo",
+				"score", score, "floor", ms.echoLoop.floor(), "lag_ms", lagMs, "talked_ms", now.Sub(ms.onset.at).Milliseconds())
+		}
+		ms.mu.Unlock()
+		return
+	}
+	if echo {
 		if !ms.echoHeldPlayThroughAt.Equal(ms.onset.at) {
 			ms.echoHeldPlayThroughAt = ms.onset.at
 			ms.logger.Info("Speech over playout matches the agent's own audio: playing through",
@@ -1037,13 +1064,38 @@ func (ms *ManagedStream) replyResumableLocked(now time.Time) bool {
 func (ms *ManagedStream) lostReplyLocked(gen int, now time.Time) string {
 	var sent []string
 	first := 0
+	heardWords := 0
 	if ms.playout.gen == gen {
 		first = ms.playout.firstUnheard(now)
 		for _, s := range ms.playout.segs {
 			sent = append(sent, strings.TrimSpace(s.text))
 		}
+		if first < len(ms.playout.segs) {
+			heardWords = ms.playout.segs[first].heardWords(now)
+			// What the caller heard when the transport was told to stop (the same words spoken truth recorded):
+			// the timeline itself is cut back to the onset once the barge-in settles.
+			if ms.onset.gen == gen && ms.onset.stopped {
+				before := 0
+				for _, t := range sent[:first] {
+					before += len(strings.Fields(t))
+				}
+				if n := len(strings.Fields(ms.onset.text)) - before; n > heardWords {
+					heardWords = n
+				}
+			}
+		}
 	}
 	lost := strings.Fields(strings.Join(sent[first:], " "))
+	// From the word that was cut, not from the start of its sentence (2026-11-19): an echo that cuts the
+	// same sentence at the same point every time made each resay start over, and ed25f07d's greeting
+	// ("Hola Samuel…") was said six times without ever getting further. Every resay now gets further than
+	// the last, so an echo loop always ends.
+	if heardWords > 0 && heardWords < len(lost) {
+		ms.resumeFromWord = heardWords
+		lost = lost[heardWords:]
+	} else {
+		ms.resumeFromWord = 0
+	}
 	sentWords := strings.Fields(strings.Join(sent, " "))
 	whole := ""
 	switch {
@@ -1120,6 +1172,7 @@ func (ms *ManagedStream) settleEchoVeto(ctx context.Context, seq, gen int, pendi
 	}
 	ms.resolvePendingBargeInFor(true)
 	if outcome == "said_again" {
+		ms.noteEchoLoop(gen, textEcho, transcript, acoustic.score)
 		ms.resayLostReply(ctx, gen, lost)
 	}
 	return false
@@ -1160,6 +1213,19 @@ func (ms *ManagedStream) resayLostReply(ctx context.Context, gen int, text strin
 	ms.payloadGen++
 	newGen := ms.payloadGen
 	ms.responseTrigger = "resay"
+	ms.echoLoop.resayGen = newGen
+	protect := ms.echoLoop.count >= 2
+	if protect {
+		ms.echoLoop.protectGen = newGen
+	}
+	floor, from, confirmed := ms.echoLoop.floor(), ms.resumeFromWord, ms.echoLoop.count
+	ms.mu.Unlock()
+	ms.logger.Info("Saying the lost reply again: resume from word", "word", from, "gen", newGen, "text_len", len(text))
+	if protect {
+		ms.logger.Info("echo loop: replay protected", "gen", newGen, "echo_confirmed", confirmed,
+			"score_floor", floor)
+	}
+	ms.mu.Lock()
 	ms.turnTokens = nil
 	ms.discardStart = time.Time{}
 	ms.mu.Unlock()
