@@ -127,7 +127,7 @@ type ManagedStream struct {
 	echoLagKnown  bool
 	echoLagFrames int
 
-	cmdChan       chan []byte
+	cmdChan       chan audioIn
 	interruptChan chan struct{}
 	state         StreamState
 
@@ -543,7 +543,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		ctx:             mCtx,
 		cancel:          mCancel,
 		events:          make(chan OrchestratorEvent, 1024),
-		cmdChan:         make(chan []byte, 512),
+		cmdChan:         make(chan audioIn, 512),
 		interruptChan:   make(chan struct{}, 1),
 		transportReady:  make(chan struct{}),
 		vad:             streamVAD,
@@ -742,14 +742,14 @@ func (ms *ManagedStream) audioProcessor() {
 			return
 		case <-ms.interruptChan:
 			ms.handleInterrupt()
-		case chunk := <-ms.cmdChan:
+		case in := <-ms.cmdChan:
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						ms.logger.Error("audioProcessor: recovered panic in handleAudio", "panic", r)
 					}
 				}()
-				ms.handleAudio(chunk)
+				ms.handleAudioIn(in.raw, in.vad)
 			}()
 		case ctrl := <-ms.controlChan:
 			func() {
@@ -785,10 +785,24 @@ func (ms *ManagedStream) closeConfirmationGateIfOpen() {
 	ms.mu.Unlock()
 }
 
-func (ms *ManagedStream) handleAudio(chunk []byte) {
+func (ms *ManagedStream) handleAudio(chunk []byte) { ms.handleAudioIn(chunk, nil) }
+
+// handleAudioIn takes one chunk of the caller's audio. vadIn, when given (WriteDual), is what the VAD and every
+// barge-in decision see instead (the phone path's echo gate zeroes frames it takes for the agent's own echo); the
+// speech buffers, the lead-in and streaming STT always get chunk, the caller's audio as it arrived, so a caller who
+// talks over the agent is transcribed from their whole voice, not from what was left after the gate.
+func (ms *ManagedStream) handleAudioIn(chunk, vadIn []byte) {
 	// While a backchannel plays the rest of this function gets silence in place of the microphone; when its
 	// window closes on a caller who is talking, their kept audio goes through first (backchannel.go).
+	orig := chunk
 	chunk, replay := ms.backchannelAudioIn(chunk, time.Now())
+	if len(chunk) > 0 && len(orig) > 0 && &chunk[0] != &orig[0] {
+		vadIn = chunk // held for the backchannel window: the VAD hears its silence too
+	}
+	vadChunk := chunk
+	if len(vadIn) == len(chunk) && vadIn != nil {
+		vadChunk = vadIn
+	}
 	if len(replay) > 0 {
 		ms.bc.mu.Lock()
 		ms.bc.replaying = true
@@ -838,7 +852,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		return
 	}
 
-	event, err := ms.vad.Process(chunk)
+	event, err := ms.vad.Process(vadChunk)
 	if err != nil {
 		ms.logger.Warn("VAD process error", "error", err)
 		return
@@ -862,9 +876,9 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 
 	// Echo correlation's near-end feed runs regardless of whether Turno is loaded, same reasoning
 	// as noteFarEndEcho in emitFrames — resample once, feed both.
-	audioChunk16k := chunk
+	audioChunk16k := vadChunk
 	if ms.inputSampleRate != 16000 {
-		audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
+		audioChunk16k = resampleTo16k(vadChunk, ms.inputSampleRate)
 	}
 	ms.backchannelShadowAudio(audioChunk16k, time.Now())
 	ms.advanceFarEndEcho(time.Now())
@@ -934,7 +948,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	// currently reports, specifically so a brief in-utterance gap can
 	// trigger speculation well before the real VAD's ~448ms hangover would
 	// ever say the user stopped talking.
-	ms.updatePauseSpeculationTrigger(chunk)
+	ms.updatePauseSpeculationTrigger(vadChunk)
 
 	// Turno early end. Speculation above only pre-computes; the hangover is
 	// still what commits the turn, so it is the hangover that has to shrink
@@ -962,7 +976,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		ms.onVADEnd(state)
 	}
 
-	ms.backchannelAfterVAD(chunk, isSpeaking, time.Now())
+	ms.backchannelAfterVAD(vadChunk, isSpeaking, time.Now())
 
 	if isSpeaking {
 		ms.updateActivity()
@@ -3321,9 +3335,37 @@ func (ms *ManagedStream) Write(chunk []byte) error {
 	buf := make([]byte, len(chunk))
 	copy(buf, chunk)
 	select {
-	case ms.cmdChan <- buf:
+	case ms.cmdChan <- audioIn{raw: buf}:
 	default:
 		ms.logger.Warn("Write dropped audio", "len", len(chunk), "cmdChanFull", true)
+	}
+	return nil
+}
+
+// audioIn is one chunk of caller audio on its way to the audio processor: raw is what arrived, vad (optional, same
+// length) is what the VAD and the barge-in logic see instead.
+type audioIn struct {
+	raw, vad []byte
+}
+
+// WriteDual feeds the caller's audio as it arrived (raw: transcription, lead-in, speech buffers) together with the
+// version the VAD and barge-in logic should judge (vad, the same length): the phone path's echo gate zeroes frames it
+// takes for the agent's echo in vad only. When a interruption is detected, what the recogniser hears is the caller's
+// whole voice from the lead-in on, not the gate's leftovers (2026-11-19: once a quiet caller could interrupt, their
+// words over the agent came back as "De Yes.", "Yeo.", "El al.", and the agent decided the line was bad).
+func (ms *ManagedStream) WriteDual(raw, vad []byte) error {
+	if ms.held.Load() {
+		ms.heldDropped.Add(1)
+		return nil
+	}
+	in := audioIn{raw: append([]byte(nil), raw...)}
+	if len(vad) == len(raw) {
+		in.vad = append([]byte(nil), vad...)
+	}
+	select {
+	case ms.cmdChan <- in:
+	default:
+		ms.logger.Warn("Write dropped audio", "len", len(raw), "cmdChanFull", true)
 	}
 	return nil
 }

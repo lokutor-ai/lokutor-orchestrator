@@ -11,7 +11,7 @@ func TestManagedStream_LatencyBreakdown(t *testing.T) {
 		events:        make(chan OrchestratorEvent, 10),
 		session:       &ConversationSession{ID: "test"},
 		ctx:           context.Background(),
-		cmdChan:       make(chan []byte, 10),
+		cmdChan:       make(chan audioIn, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 
@@ -63,7 +63,7 @@ func TestManagedStream_EndToEndLatency(t *testing.T) {
 		events:        make(chan OrchestratorEvent, 10),
 		session:       &ConversationSession{ID: "test"},
 		ctx:           context.Background(),
-		cmdChan:       make(chan []byte, 10),
+		cmdChan:       make(chan audioIn, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 
@@ -81,7 +81,7 @@ func TestManagedStream_ExportLastUserAudio(t *testing.T) {
 		events:        make(chan OrchestratorEvent, 10),
 		session:       &ConversationSession{ID: "test"},
 		ctx:           context.Background(),
-		cmdChan:       make(chan []byte, 10),
+		cmdChan:       make(chan audioIn, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 
@@ -147,7 +147,7 @@ func TestManagedStream_StaleAudioDiscard(t *testing.T) {
 		events:        make(chan OrchestratorEvent, 10),
 		session:       &ConversationSession{ID: "test"},
 		ctx:           context.Background(),
-		cmdChan:       make(chan []byte, 10),
+		cmdChan:       make(chan audioIn, 10),
 		interruptChan: make(chan struct{}, 1),
 	}
 

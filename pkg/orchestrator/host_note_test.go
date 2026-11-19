@@ -10,7 +10,7 @@ import (
 // counted, so the hold leaves a trace in the log.
 func TestHoldDropsCallerAudioAndCountsIt(t *testing.T) {
 	log := &replayLog{}
-	ms := &ManagedStream{logger: log, cmdChan: make(chan []byte, 4)}
+	ms := &ManagedStream{logger: log, cmdChan: make(chan audioIn, 4)}
 	ms.Hold(true)
 	for i := 0; i < 3; i++ {
 		_ = ms.Write([]byte{1, 2})
