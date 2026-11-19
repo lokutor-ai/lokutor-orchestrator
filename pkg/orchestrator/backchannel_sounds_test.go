@@ -78,8 +78,8 @@ func TestBackchannelSoundsMadeFromCarriers(t *testing.T) {
 	if err != nil || b == nil {
 		t.Fatalf("bank %v err %v", b, err)
 	}
-	if requests != 12 || tts.calls != 12 {
-		t.Fatalf("%d requests (%d calls), want 6 items x 2 takes", requests, tts.calls)
+	if requests != 18 || tts.calls != 18 {
+		t.Fatalf("%d requests (%d calls), want 6 items x 3 takes", requests, tts.calls)
 	}
 	if tts.maxIn > backchannelGenInFlight {
 		t.Fatalf("%d requests at once, want at most %d", tts.maxIn, backchannelGenInFlight)

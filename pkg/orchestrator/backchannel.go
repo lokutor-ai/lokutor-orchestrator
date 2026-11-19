@@ -51,6 +51,7 @@ const (
 	backchannelPickGap     = 1500 * time.Millisecond // and at most one pick request this often
 	backchannelMaxTokens   = 4
 	backchannelMaxHeld     = 3 * time.Second
+	backchannelHeardReset  = time.Second      // agent audio heard this long starts the caller's turn over
 	backchannelBankRetry   = 30 * time.Second // a voice whose bank was not there yet (being built) is asked again after this
 	backchannelBankTimeout = 3 * time.Minute  // a first build on the synthesis pool takes seconds; the request may wait for it
 )
@@ -136,7 +137,9 @@ type backchannelState struct {
 	turnText   string // the caller's finals since the agent last spoke
 
 	// the trigger
-	speech      time.Duration // caller speech since the agent spoke or the last backchannel
+	speech      time.Duration // caller speech since the agent was last heard or the last backchannel
+	agentFrom   time.Time     // the agent's audio has been playing since (zero: not playing)
+	agentTo     time.Time
 	lastAt      time.Time
 	firedPause  time.Time // the pause (its lastVoicedAt) already given a sound
 	guardUntil  time.Time
@@ -332,13 +335,6 @@ func (ms *ManagedStream) refreshBackchannelPick(text string) {
 	ms.logger.Info("Backchannel pick", "pick", pick, "ms", time.Since(started).Milliseconds(), "words", countWords(text))
 }
 
-// resetBackchannelTurn: the agent spoke, so the caller's next words start a new turn.
-func (ms *ManagedStream) resetBackchannelTurn() {
-	ms.bc.mu.Lock()
-	ms.bc.speech, ms.bc.turnText, ms.bc.latestText, ms.bc.pick, ms.bc.pickText = 0, "", "", "", ""
-	ms.bc.mu.Unlock()
-}
-
 // lastAgentLine is the agent's most recent message in the conversation, or "".
 func (ms *ManagedStream) lastAgentLine() string {
 	if ms.session == nil {
@@ -403,36 +399,74 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 	// is usually there before the caller's first long turn; until it lands nothing plays.
 	ms.ensureBackchannelBank()
 	ms.mu.Lock()
-	agentAudio := ms.state == StateSpeaking || ms.playout.end.After(now) || ms.pendingBargeIn
+	playing := ms.playout.end.After(now) // the agent's audio is playing to the caller
+	pending := ms.pendingBargeIn
 	voiced := ms.lastVoicedAt
 	rate := int(ms.inputSampleRate)
 	ms.mu.Unlock()
-	if agentAudio {
-		ms.resetBackchannelTurn()
-		return
-	}
 	silent := true
 	if sf, ok := ms.vad.(silenceFramesProvider); ok && isSpeaking && sf.SilenceFrames() == 0 {
 		silent = false
 	}
 	ms.bc.mu.Lock()
+	// The caller's turn starts over only once the agent has been HEARD: its audio played for backchannelHeardReset.
+	// A reply discarded before playback, or one the caller cut off within that, never reached them and leaves the
+	// count alone (2026-11-19: replies started in every mid-thought pause and cut off reset it each time, so a
+	// backchannel was only ever reached at a real turn end).
+	if playing {
+		if ms.bc.agentFrom.IsZero() {
+			ms.bc.agentFrom = now
+		}
+		ms.bc.agentTo = now
+	} else if !ms.bc.agentFrom.IsZero() {
+		if ms.bc.agentTo.Sub(ms.bc.agentFrom) >= backchannelHeardReset {
+			ms.bc.speech, ms.bc.turnText, ms.bc.latestText, ms.bc.pick, ms.bc.pickText = 0, "", "", "", ""
+		}
+		ms.bc.agentFrom, ms.bc.agentTo = time.Time{}, time.Time{}
+	}
 	if !silent && rate > 0 {
 		ms.bc.speech += time.Duration(len(chunk)/2) * time.Second / time.Duration(rate)
 		ms.bc.mu.Unlock()
 		return
 	}
 	pause := now.Sub(voiced)
-	if voiced.IsZero() || pause < backchannelPauseDelay || pause > backchannelLatePause || ms.bc.firedPause.Equal(voiced) ||
-		ms.bc.speech < backchannelMinSpeech || (!ms.bc.lastAt.IsZero() && now.Sub(ms.bc.lastAt) < backchannelMinInterval) {
+	if voiced.IsZero() || pause < backchannelPauseDelay || ms.bc.firedPause.Equal(voiced) {
 		ms.bc.mu.Unlock()
 		return
 	}
+	// This pause is considered once: it either plays or says why not.
 	ms.bc.firedPause = voiced
+	reason := ""
+	switch {
+	case playing:
+		reason = "agent_audio_playing"
+	case pending:
+		reason = "caller_over_agent"
+	case pause > backchannelLatePause:
+		reason = "pause_too_long"
+	case ms.bc.speech < backchannelMinSpeech:
+		reason = "too_little_speech"
+	case !ms.bc.lastAt.IsZero() && now.Sub(ms.bc.lastAt) < backchannelMinInterval:
+		reason = "too_soon_after_last"
+	}
+	speechMs, sinceLast := ms.bc.speech.Milliseconds(), int64(-1)
+	if !ms.bc.lastAt.IsZero() {
+		sinceLast = now.Sub(ms.bc.lastAt).Milliseconds()
+	}
 	pick, pickText, latest := ms.bc.pick, ms.bc.pickText, ms.bc.latestText
 	ms.bc.mu.Unlock()
+	skip := func(why string) {
+		ms.logger.Info("Backchannel not played", "reason", why, "pause_ms", pause.Milliseconds(), "speech_ms", speechMs,
+			"since_last_ms", sinceLast, "pick", pick)
+	}
+	if reason != "" {
+		skip(reason)
+		return
+	}
 
 	bank := ms.ensureBackchannelBank()
 	if bank == nil {
+		skip("no_sounds_yet")
 		return
 	}
 	cat := pick
@@ -440,7 +474,7 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 		cat = BackchannelNeutral
 	}
 	if cat == BackchannelNone {
-		ms.logger.Info("Backchannel: none fits here", "pause_ms", pause.Milliseconds())
+		skip("pick_none")
 		ms.bc.mu.Lock()
 		ms.bc.lastAt, ms.bc.speech = now, 0
 		ms.bc.mu.Unlock()
@@ -451,6 +485,7 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 		cat, clips = BackchannelNeutral, bank.Clips[BackchannelNeutral]
 	}
 	if len(clips) == 0 {
+		skip("no_sound_for_category")
 		return
 	}
 	ms.bc.mu.Lock()

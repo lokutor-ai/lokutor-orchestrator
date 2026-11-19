@@ -477,3 +477,43 @@ func TestBackchannelBankAskedAgainAfterNone(t *testing.T) {
 		t.Fatal("the bank was not asked for again after the retry delay")
 	}
 }
+
+// A reply the caller never heard (discarded, or cut off within a second) leaves their speech count; one they heard
+// for a second or more starts it over.
+func TestBackchannelCountSurvivesUnheardReplies(t *testing.T) {
+	ms, vad := bcStream(t, &bcPickLLM{})
+	vad.mu.Lock()
+	vad.speaking, vad.silent = true, 0
+	vad.mu.Unlock()
+	ms.bc.mu.Lock()
+	ms.bc.speech = 2 * time.Second
+	ms.bc.mu.Unlock()
+	now := time.Now()
+	// 500 ms of agent audio, then cut off.
+	ms.mu.Lock()
+	ms.playout.end = now.Add(500 * time.Millisecond)
+	ms.mu.Unlock()
+	ms.backchannelAfterVAD(make([]byte, 640), true, now)
+	ms.backchannelAfterVAD(make([]byte, 640), true, now.Add(480*time.Millisecond))
+	ms.backchannelAfterVAD(make([]byte, 640), true, now.Add(520*time.Millisecond))
+	ms.bc.mu.Lock()
+	sp := ms.bc.speech
+	ms.bc.mu.Unlock()
+	if sp < 2*time.Second {
+		t.Fatalf("speech %v after an unheard reply, want the 2 s kept (plus the chunks)", sp)
+	}
+	// 1.5 s heard.
+	now = now.Add(time.Second)
+	ms.mu.Lock()
+	ms.playout.end = now.Add(1500 * time.Millisecond)
+	ms.mu.Unlock()
+	ms.backchannelAfterVAD(make([]byte, 640), true, now)
+	ms.backchannelAfterVAD(make([]byte, 640), true, now.Add(1400*time.Millisecond))
+	ms.backchannelAfterVAD(make([]byte, 640), true, now.Add(1600*time.Millisecond))
+	ms.bc.mu.Lock()
+	sp = ms.bc.speech
+	ms.bc.mu.Unlock()
+	if sp > 100*time.Millisecond {
+		t.Fatalf("speech %v after a heard reply, want it started over", sp)
+	}
+}

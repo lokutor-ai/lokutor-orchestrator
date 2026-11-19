@@ -17,13 +17,13 @@ import (
 // prosody. The cut runs from the first sound to the quietest point before the next word (the first silence the
 // timings mark; without timings, the take's voiced stretches). Each take is checked (length, level, one sound and not
 // part of a word, the pitch shape its category needs: surprise rising, sympathy not) and the best per item kept, at
-// its category's level. 6 items x 2 takes, at most backchannelGenInFlight requests at once.
+// its category's level. 6 items x 3 takes, at most backchannelGenInFlight requests at once.
 //
 // The sounds live in memory for the call; a small per-process cache keyed by voice and language reuses them for the
 // next call with the same voice (nothing is stored anywhere). A language change regenerates them for the new one.
 
 const (
-	backchannelGenTakes    = 2
+	backchannelGenTakes    = 3
 	backchannelGenInFlight = 3
 	backchannelGenTimeout  = 20 * time.Second
 	backchannelCacheMax    = 64
