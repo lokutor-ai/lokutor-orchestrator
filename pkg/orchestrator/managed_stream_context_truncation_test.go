@@ -149,17 +149,17 @@ type interSentenceGapLLM struct {
 }
 
 func (m *interSentenceGapLLM) Complete(ctx context.Context, messages []Message, tools []Tool) (string, error) {
-	return "First sentence. Second sentence.", nil
+	return "This is the first sentence. Second sentence.", nil
 }
 func (m *interSentenceGapLLM) StreamComplete(ctx context.Context, messages []Message, tools []Tool, onChunk func(string) error, onToolCall func(ToolCallEventData) error) (string, error) {
 	if onChunk != nil {
-		onChunk("First sentence. ")
+		onChunk("This is the first sentence. ")
 	}
 	time.Sleep(m.gap)
 	if onChunk != nil {
 		onChunk("Second sentence.")
 	}
-	return "First sentence. Second sentence.", nil
+	return "This is the first sentence. Second sentence.", nil
 }
 func (m *interSentenceGapLLM) Name() string { return "InterSentenceGapLLM" }
 

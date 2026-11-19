@@ -4009,7 +4009,7 @@ func (ms *ManagedStream) monitorInactivity() {
 // which is where a speaker pauses anyway — unlike cutting the opening chunk mid-sentence, which
 // was tried, sounded like the agent stopping dead after five words, and is deliberately off.
 func (ms *ManagedStream) speakResponse(ctx context.Context, text string, gen int) {
-	for _, seg := range splitSentences(text) {
+	for _, seg := range joinShortOpenerSegments(splitSentences(text)) {
 		if ctx.Err() != nil {
 			return // interrupted between sentences; speakText would refuse anyway
 		}

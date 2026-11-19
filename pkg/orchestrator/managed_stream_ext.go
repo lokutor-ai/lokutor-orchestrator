@@ -376,7 +376,16 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	go func() {
 		defer ttsWg.Done()
 		rctx := WithReply(ctx, replyID)
+		first := true
 		for text := range ttsQueue {
+			if first {
+				// A lone "Vale." opening the reply is spoken with the sentence after it (short_opener.go).
+				first = false
+				if joined, merged := joinShortOpener(ctx, text, ttsQueue, shortOpenerWait); merged {
+					ms.logger.Info("Short opener spoken with the next sentence", "gen", gen, "opener_len", len(text), "text_len", len(joined))
+					text = joined
+				}
+			}
 			ms.speakText(rctx, text, gen)
 		}
 		if e, ok := ms.orch.tts.(ReplyEnder); ok {

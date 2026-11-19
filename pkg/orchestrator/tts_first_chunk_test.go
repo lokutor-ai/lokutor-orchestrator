@@ -17,18 +17,18 @@ import (
 type gappedTwoSentenceLLM struct{}
 
 func (m *gappedTwoSentenceLLM) Complete(ctx context.Context, messages []Message, tools []Tool) (string, error) {
-	return "First sentence. Second sentence.", nil
+	return "This is the first sentence. Second sentence.", nil
 }
 
 func (m *gappedTwoSentenceLLM) StreamComplete(ctx context.Context, messages []Message, tools []Tool, onChunk func(string) error, onToolCall func(ToolCallEventData) error) (string, error) {
 	if onChunk != nil {
-		onChunk("First sentence. ")
+		onChunk("This is the first sentence. ")
 	}
 	time.Sleep(250 * time.Millisecond) // simulated slow token arrival gap
 	if onChunk != nil {
 		onChunk("Second sentence.")
 	}
-	return "First sentence. Second sentence.", nil
+	return "This is the first sentence. Second sentence.", nil
 }
 func (m *gappedTwoSentenceLLM) Name() string { return "GappedTwoSentenceLLM" }
 
