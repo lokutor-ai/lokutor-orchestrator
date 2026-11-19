@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -516,4 +517,33 @@ func TestBackchannelCountSurvivesUnheardReplies(t *testing.T) {
 	if sp > 100*time.Millisecond {
 		t.Fatalf("speech %v after a heard reply, want it started over", sp)
 	}
+}
+
+// With a model configured, a backchannel call runs the predictor on the caller's audio and logs its summary at close;
+// a missing model leaves the call untouched.
+func TestBackchannelShadowRunsOnlyWithAModel(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Backchannels = true
+	cfg.BackchannelPredictorPath = "/nonexistent/bc.onnx"
+	orch := NewWithVAD(&MockSTTProvider{}, &bcPickLLM{}, &bcTTS{}, &bcVAD{}, cfg)
+	ms := orch.NewManagedStream(context.Background(), NewConversationSession("shadow-none"))
+	if ms.bcShadow != nil {
+		t.Fatal("a shadow predictor without a model")
+	}
+	ms.Close()
+	path := os.Getenv("BC_PREDICTOR_TEST_MODEL")
+	if path == "" {
+		t.Skip("BC_PREDICTOR_TEST_MODEL not set")
+	}
+	cfg.BackchannelPredictorPath = path
+	orch = NewWithVAD(&MockSTTProvider{}, &bcPickLLM{}, &bcTTS{}, &bcVAD{}, cfg)
+	ms = orch.NewManagedStream(context.Background(), NewConversationSession("shadow"))
+	if ms.bcShadow == nil {
+		t.Fatal("no shadow predictor with a model")
+	}
+	ms.backchannelShadowAudio(bcClip(3000, 500), time.Now())
+	if ms.bcShadow.frames != 25 {
+		t.Fatalf("%d frames from 500 ms", ms.bcShadow.frames)
+	}
+	ms.Close()
 }

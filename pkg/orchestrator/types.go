@@ -494,6 +494,12 @@ type Config struct {
 	// agent opts in. Replaces the pitch-triggered clips that were switched off on 2026-09-25.
 	Backchannels bool
 
+	// BackchannelPredictorPath: the learned backchannel-opportunity model (ONNX), run in SHADOW on calls with
+	// Backchannels on: it logs where it would fire beside the current rule and plays nothing (backchannel_shadow.go).
+	// Empty: not run. BackchannelPredictorThreshold: its lexical-head probability that counts as a fire (0.5 if unset).
+	BackchannelPredictorPath      string
+	BackchannelPredictorThreshold float64
+
 	// TTS connection pool size
 	TTSConnectionPoolSize int
 

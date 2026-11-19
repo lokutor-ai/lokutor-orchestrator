@@ -199,6 +199,8 @@ type ManagedStream struct {
 	bc          backchannelState // listener sounds at the caller's pauses (backchannel.go), when Config.Backchannels
 	// backchannelEnd is when the last backchannel finishes playing (ms.mu): a reply's audio is scheduled after it.
 	backchannelEnd time.Time
+	// bcShadow is the learned backchannel predictor run in shadow (backchannel_shadow.go), or nil.
+	bcShadow *bcShadow
 
 	playbackRate    int
 	inputSampleRate int
@@ -566,6 +568,7 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 	// logging never affects behavior, and the barge-in assist only ever
 	// relaxes a gate the STT-confirmation path would reach anyway — so a
 	// load failure just leaves both disabled (logged, not fatal).
+	ms.startBackchannelShadow(cfg)
 	if cfg.TurnoModelPath != "" {
 		if _, err := os.Stat(cfg.TurnoModelPath); err == nil {
 			g, err := turno.NewRuntime(cfg.TurnoModelPath)
@@ -859,6 +862,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	if ms.inputSampleRate != 16000 {
 		audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
 	}
+	ms.backchannelShadowAudio(audioChunk16k, time.Now())
 	ms.advanceFarEndEcho(time.Now())
 	ms.mu.Lock()
 	pendingGenForEcho := ms.pendingBargeGen
@@ -3632,6 +3636,7 @@ func (ms *ManagedStream) Close() {
 		if ms.turnoTurn != nil {
 			ms.turnoTurn.Destroy()
 		}
+		ms.stopBackchannelShadow()
 
 		// Closing under eventsMu (the same lock emit/emitBackchannel/
 		// drainAudioChunks hold across their isClosed-recheck-and-send) makes
