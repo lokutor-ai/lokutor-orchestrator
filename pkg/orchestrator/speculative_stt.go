@@ -300,6 +300,10 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		// Guessing wrong costs one LLM call on an otherwise idle CPU: Await
 		// returns a response only when its transcript matches the confirmed
 		// one, so a guess made on a half-finished sentence is discarded.
+		if err == nil {
+			// The words so far, at this pause: the backchannel pick follows them (backchannel.go).
+			ms.noteCallerText(res.Text, false)
+		}
 		if err != nil || !ms.specLLMFromTranscriptEnabled() {
 			return
 		}

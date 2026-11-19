@@ -110,3 +110,20 @@ func TestOpenRouterHTTPErrorIsAnError(t *testing.T) {
 		t.Fatalf("err = %v, want status 402", err)
 	}
 }
+
+// A max-tokens cap on the context reaches the request only when the model answers without reasoning first: a
+// reasoning model would spend it thinking and return nothing.
+func TestOpenRouterMaxTokensOnlyWithoutReasoning(t *testing.T) {
+	ctx := orchestrator.WithMaxTokens(context.Background(), 16)
+	off := NewOpenRouterLLM("k", "anthropic/claude-haiku-5.5", nil, "none")
+	if got := off.withMaxTokens(ctx, off.payload(nil, nil, false))["max_tokens"]; got != 16 {
+		t.Fatalf("reasoning off: max_tokens %v, want 16", got)
+	}
+	if _, ok := off.withMaxTokens(context.Background(), off.payload(nil, nil, false))["max_tokens"]; ok {
+		t.Fatal("max_tokens sent without a cap on the context")
+	}
+	on := NewOpenRouterLLM("k", "deepseek/deepseek-v4.1-flash", nil, "")
+	if _, ok := on.withMaxTokens(ctx, on.payload(nil, nil, false))["max_tokens"]; ok {
+		t.Fatal("max_tokens sent to a model that may reason")
+	}
+}

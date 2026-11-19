@@ -196,7 +196,9 @@ type ManagedStream struct {
 	prosody     *prosody.AdaptiveProcessor
 	userProfile *prosody.UserSpeechProfile
 	turnComp    *TurnCompletionAnalyzer
-	backch      *BackchannelDetector
+	bc          backchannelState // listener sounds at the caller's pauses (backchannel.go), when Config.Backchannels
+	// backchannelEnd is when the last backchannel finishes playing (ms.mu): a reply's audio is scheduled after it.
+	backchannelEnd time.Time
 
 	playbackRate    int
 	inputSampleRate int
@@ -622,25 +624,8 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 		}
 	}
 
-	// Backchannels only when configured (Config.Backchannels). With ms.backch nil every backchannel
-	// path is a no-op and no clips are synthesised at session start.
-	if o != nil && o.config.Backchannels {
-		// The detector reads the CALLER's audio, which reaches the stream at 16 kHz on both the web
-		// and the phone path (phone audio is upsampled 8 -> 16 kHz before it gets here). It was
-		// constructed at 44100, the playback rate, so every pitch it measured was 2.76x too high.
-		detector := NewBackchannelDetector(DefaultBackchannelConfig(), backchannelInputRate, func(raw []byte) {
-			ms.emitBackchannel(raw)
-		})
-		detector.clips = make([][]byte, 0)
-		ms.backch = detector
-	}
-
 	go ms.audioProcessor()
 	go ms.monitorInactivity()
-
-	if ms.backch != nil && o.tts != nil {
-		go ms.generateBackchannelClips(o)
-	}
 
 	if o != nil && o.config.FirstSpeaker == FirstSpeakerBot {
 		// Signal-driven wait: fire as soon as the transport can deliver audio.
@@ -794,6 +779,21 @@ func (ms *ManagedStream) closeConfirmationGateIfOpen() {
 }
 
 func (ms *ManagedStream) handleAudio(chunk []byte) {
+	// While a backchannel plays the rest of this function gets silence in place of the microphone; when its
+	// window closes on a caller who is talking, their kept audio goes through first (backchannel.go).
+	chunk, replay := ms.backchannelAudioIn(chunk, time.Now())
+	if len(replay) > 0 {
+		ms.bc.mu.Lock()
+		ms.bc.replaying = true
+		ms.bc.mu.Unlock()
+		for _, c := range replay {
+			ms.handleAudio(c)
+		}
+		ms.bc.mu.Lock()
+		ms.bc.replaying = false
+		ms.bc.mu.Unlock()
+	}
+
 	ms.mu.Lock()
 	state := ms.state
 	clientVAD := ms.clientVAD
@@ -811,7 +811,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 	ms.mu.Unlock()
 
 	// In client VAD mode, the client sends control frames for speech boundaries.
-	// The audio processor only buffers audio and runs backchannel detection.
+	// The audio processor only buffers audio.
 	if clientVAD {
 		isSpeaking := ms.vadSpeaking
 		if isSpeaking {
@@ -819,14 +819,6 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 			ms.userAudio = append(ms.userAudio, chunk...)
 			ms.speechAudioBuf = append(ms.speechAudioBuf, chunk...)
 			ms.maybePrimeSTT()
-		}
-
-		if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
-			samples := make([]int16, len(chunk)/2)
-			for i := range samples {
-				samples[i] = int16(chunk[i*2]) | int16(chunk[i*2+1])<<8
-			}
-			ms.backch.ProcessAudio(samples, time.Now())
 		}
 
 		if isSpeaking {
@@ -962,13 +954,7 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		ms.onVADEnd(state)
 	}
 
-	if ms.backch != nil && isSpeaking && len(chunk) >= 80 {
-		samples := make([]int16, len(chunk)/2)
-		for i := range samples {
-			samples[i] = int16(chunk[i*2]) | int16(chunk[i*2+1])<<8
-		}
-		ms.backch.ProcessAudio(samples, time.Now())
-	}
+	ms.backchannelAfterVAD(chunk, isSpeaking, time.Now())
 
 	if isSpeaking {
 		ms.updateActivity()
@@ -1366,10 +1352,6 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	}
 	ms.mu.Unlock()
 
-	if ms.backch != nil {
-		ms.backch.UserStarted()
-	}
-
 	ms.mu.Lock()
 	ms.state = StateListening
 	if ms.clientVAD {
@@ -1751,11 +1733,6 @@ func (ms *ManagedStream) onVADEnd(prevState StreamState) {
 		ms.vadSpeaking = false
 	}
 	ms.mu.Unlock()
-
-	if ms.backch != nil {
-		ms.backch.UserStarted()
-		ms.backch.UserStopped()
-	}
 
 	duration := ms.userSpeechEnd.Sub(ms.userSpeakingSince)
 	audioData := ms.userAudio
@@ -2243,6 +2220,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"eou_text":         eouTextOrNil(result),
 			}, nil)
 	}
+
+	// The caller's words so far refresh the backchannel pick (backchannel.go), in the background.
+	ms.noteCallerText(transcript, true)
 
 	// Turno hold: the transcript reads as finished, but prosody says the
 	// speaker is not. Without this a sentence that merely *ends* — "I ordered
@@ -3597,32 +3577,6 @@ func (ms *ManagedStream) SubmitToolResult(callID string, result string) {
 	}
 }
 
-func (ms *ManagedStream) RegenerateBackchannelClips(o *Orchestrator) {
-	if o == nil || o.tts == nil || ms.backch == nil {
-		return
-	}
-	go func() {
-		voice, lang := ms.backchannelVoiceLang(o)
-
-		clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
-			out := make([][]byte, 0, len(backchannelPhrases))
-			for _, phrase := range backchannelPhrases {
-				// The call's own voice AND language: the language selects the reference pack, so
-				// synthesising under a fixed one hums in a different speaker. See backchannelLangFor.
-				audio, err := o.GenerateSilent(c, phrase, voice, lang)
-				if err == nil && len(audio) > 100 {
-					out = append(out, audio)
-				}
-			}
-			return out
-		})
-
-		if len(clips) > 0 {
-			ms.backch.SetClips(clips)
-		}
-	}()
-}
-
 // splitSentences splits text into segments to synthesise, one per sentence, preserving the
 // punctuation. Returns at least one segment.
 //
@@ -3904,9 +3858,9 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 	// The channel is full. This used to fall straight through to `default:` and
 	// discard the event without a word, which for an AudioChunk means the caller
 	// loses that slice of the reply — or, if it is the first chunk, the whole
-	// reply — with nothing anywhere to say so. The backchannel sender two
-	// functions down has always logged this case; the audio path never did, so
-	// the one that matters was the one that was invisible.
+	// reply — with nothing anywhere to say so. The old backchannel sender
+	// always logged this case; the audio path never did, so the one that
+	// matters was the one that was invisible.
 	//
 	// A dropped chunk is also unrecoverable in a way a dropped status is not, so
 	// audio gets a short blocking retry first. 1024 events is ample for a reply
@@ -3934,136 +3888,6 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		ms.logger.Warn("event channel full — DROPPING events",
 			"type", eventType, "gen", gen, "cap", cap(ms.events),
 			"note", "consumer stalled; an AudioChunk lost here is silence the caller hears")
-	}
-}
-
-func (ms *ManagedStream) emitBackchannel(data []byte) {
-	defer func() {
-		if r := recover(); r != nil {
-		}
-	}()
-
-	if len(data) == 0 {
-		return
-	}
-
-	// Apply 50% volume reduction to backchannel audio
-	reduced := make([]byte, len(data))
-	for i := 0; i < len(data)-1; i += 2 {
-		sample := int16(data[i]) | int16(data[i+1])<<8
-		sample = int16(float64(sample) * 0.5)
-		reduced[i] = byte(sample)
-		reduced[i+1] = byte(sample >> 8)
-	}
-
-	if ms.isClosed.Load() {
-		return
-	}
-
-	ms.mu.Lock()
-	gen := ms.payloadGen
-	ms.mu.Unlock()
-
-	event := OrchestratorEvent{
-		Type:       AudioChunk,
-		Data:       reduced,
-		Generation: gen,
-	}
-
-	// eventsMu serializes this send against Close()'s close(ms.events) — see
-	// the eventsMu field comment and emitWithGen.
-	ms.eventsMu.Lock()
-	defer ms.eventsMu.Unlock()
-	if ms.isClosed.Load() {
-		return
-	}
-	select {
-	case ms.events <- event:
-	default:
-		ms.logger.Warn("backchannel drop (channel full)")
-	}
-}
-
-// backchannelPhrases are the little sounds the agent makes while the caller is still talking.
-//
-// One list, no language switch, and that is the point. This used to be a 30-language table where
-// each entry ended in a real word — "sí", "oui", "ja", "sim", "bai", "yeah" — and the trouble with
-// a word is that it is only right in one language. Any gap in the table fell through to the
-// English default, so a Catalan conversation got "yeah"; any language served by a near-miss got a
-// word a native speaker would notice. Adding a language meant remembering to add a row, and
-// forgetting was silent.
-//
-// These are not words in any language. A nasal hum and an open vowel are what listeners produce to
-// say "go on, I'm still here" across essentially every language, and none of them is lexical, so
-// none can be wrong in one. That removes the failure mode rather than widening the table.
-//
-// Deliberately excluded: "uh-huh" and "yeah" (English interjections, unmistakable in a Spanish
-// call) and "aha" (reads as recognition — "I see" — rather than mere attention, and in several
-// languages it lands as surprise).
-var backchannelPhrases = []string{"mhm", "mm", "hm"}
-
-// The phrases are shared across languages; the SYNTHESIS follows the call. These are two separate
-// decisions and conflating them shipped a bug.
-//
-// This used to synthesise under a fixed LanguageEn, on the argument that English is the model's
-// unmarked base case and that prefixing [es] to a nasal hum asks the text encoder for a
-// pronunciation prior on something with no pronunciation in it. That argument is about the
-// language TOKEN, and it overlooked what else the language argument does: Versa's resolveVoice
-// picks the reference pack from it, and a legacy voice id — which is what essentially every agent
-// in the database still stores — resolves to en_f1 under "en" and es_f1 under "es". Different
-// packs are different speakers. A caller on a Spanish call heard the agent hum in someone else's
-// voice between its own sentences, which is far more noticeable than any pronunciation prior on
-// "mhm".
-//
-// So the caller's language goes in, and the clips match the reply in voice, reference and
-// language. backchannelLangFor centralises that and keeps the auto-detect case honest: an empty
-// language means the session has not pinned one, and passing it through unchanged resolves to the
-// same unmarked default the reply path uses, rather than guessing at a pack the reply will not use.
-func backchannelLangFor(lang Language) Language { return lang }
-
-// backchannelInputRate is the rate of the caller audio the backchannel detector analyses.
-const backchannelInputRate = 16000
-
-func backchannelPhrasesForLang(Language) []string { return backchannelPhrases }
-
-// backchannelVoiceLang picks the (voice, language) pair the clips must be synthesised under — the
-// same pair the reply path uses, so the hum is the same speaker as the sentence around it.
-func (ms *ManagedStream) backchannelVoiceLang(o *Orchestrator) (Voice, Language) {
-	voice := VoiceF1
-	if ms.session != nil && ms.session.GetCurrentVoice() != "" {
-		voice = ms.session.GetCurrentVoice()
-	} else if o != nil && o.config.VoiceStyle != "" {
-		voice = o.config.VoiceStyle
-	}
-
-	var lang Language
-	if ms.session != nil {
-		lang = ms.session.GetCurrentLanguage()
-	}
-	return voice, backchannelLangFor(lang)
-}
-
-func (ms *ManagedStream) generateBackchannelClips(o *Orchestrator) {
-	voice, lang := ms.backchannelVoiceLang(o)
-
-	// Once per process per (voice, language) — not once per session. See backchannel_cache.go:
-	// regenerating identical audio at every session start took a synthesis slot from the caller's
-	// first sentence and pushed it over real-time, which is heard as a gap.
-	clips := cachedBackchannelClips(ms.ctx, voice, lang, func(c context.Context) [][]byte {
-		out := make([][]byte, 0, len(backchannelPhrases))
-		for _, phrase := range backchannelPhrases {
-			// The call's own voice AND language: the language selects the reference pack, so
-			// synthesising under a fixed one hums in a different speaker. See backchannelLangFor.
-			audio, err := o.GenerateSilent(c, phrase, voice, lang)
-			if err == nil && len(audio) > 100 {
-				out = append(out, audio)
-			}
-		}
-		return out
-	})
-
-	if len(clips) > 0 && ms.backch != nil {
-		ms.backch.SetClips(clips)
 	}
 }
 

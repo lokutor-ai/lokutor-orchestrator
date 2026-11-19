@@ -82,6 +82,20 @@ func (l *OpenRouterLLM) payload(messages []orchestrator.Message, tools []orchest
 	return p
 }
 
+// withMaxTokens adds the cap a caller set with orchestrator.WithMaxTokens, only when this model does not reason
+// first (reasoning explicitly off, as the natural talker runs): a model that may reason would spend the cap thinking.
+func (l *OpenRouterLLM) withMaxTokens(ctx context.Context, p map[string]interface{}) map[string]interface{} {
+	n := orchestrator.MaxTokensFrom(ctx)
+	if n <= 0 {
+		return p
+	}
+	switch strings.ToLower(strings.TrimSpace(l.reasoning)) {
+	case "none", "off":
+		p["max_tokens"] = n
+	}
+	return p
+}
+
 func (l *OpenRouterLLM) do(ctx context.Context, payload map[string]interface{}) (*http.Response, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -108,7 +122,7 @@ func (l *OpenRouterLLM) do(ctx context.Context, payload map[string]interface{}) 
 }
 
 func (l *OpenRouterLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
-	resp, err := l.do(ctx, l.payload(messages, tools, false))
+	resp, err := l.do(ctx, l.withMaxTokens(ctx, l.payload(messages, tools, false)))
 	if err != nil {
 		return "", err
 	}
@@ -138,7 +152,7 @@ func (l *OpenRouterLLM) Complete(ctx context.Context, messages []orchestrator.Me
 }
 
 func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
-	resp, err := l.do(ctx, l.payload(messages, tools, true))
+	resp, err := l.do(ctx, l.withMaxTokens(ctx, l.payload(messages, tools, true)))
 	if err != nil {
 		return "", err
 	}

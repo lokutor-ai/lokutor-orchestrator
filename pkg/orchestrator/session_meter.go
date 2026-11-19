@@ -35,6 +35,8 @@ const (
 	TokensReply       = "reply"
 	TokensSpeculative = "speculative"
 	TokensSummary     = "summary"
+	// TokensBackchannel: the short request that picks a listener sound while the caller pauses mid-thought (backchannel.go).
+	TokensBackchannel = "backchannel"
 )
 
 // NewSessionMeter returns an empty meter.

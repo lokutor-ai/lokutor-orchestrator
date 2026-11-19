@@ -570,7 +570,7 @@ func composeSystemPrompt(basePrompt string, lang Language, mem, callerRecord str
 
 func (o *Orchestrator) SetVoice(session *ConversationSession, voice Voice) {
 	// Under the mutex: GetCurrentVoice reads this under RLock, and one of its readers is the
-	// backchannel warm-up running on its own goroutine, so an unguarded write here is a live race.
+	// backchannel synthesis running on its own goroutine, so an unguarded write here is a live race.
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.CurrentVoice = voice

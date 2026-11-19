@@ -488,13 +488,10 @@ type Config struct {
 	// Adaptive pacing: adjust silence timeout based on user speaking rate
 	AdaptivePacing bool
 
-	// Backchannels: the agent says "mhm" / "mm" / "hm" while the caller is still talking. Off by
-	// default since 2026-09-25. The clips are synthesised from two or three characters, which the
-	// Versa engine pads to its 0.7 s minimum, so each is mostly sound the model invents, at about the
-	// loudness of speech (0.5-1.3x the reply's RMS on the 754k voices); and the detector was fed
-	// 16 kHz caller audio labelled 44.1 kHz, reading every pitch 2.8x high. Turning it back on needs
-	// clips that are short, quiet and real (recorded, or trimmed to their voiced part), not just
-	// this flag.
+	// Backchannels: while the caller is held mid-thought (the open end-of-turn hold), the agent may make the
+	// listener's sound that fits what they are saying ("mhm", "vaya", "¿en serio?"), picked by a small request to
+	// its own model and spoken in its voice; the hold's timing is unchanged (backchannel.go). Off by default: an
+	// agent opts in. Replaces the pitch-triggered clips that were switched off on 2026-09-25.
 	Backchannels bool
 
 	// TTS connection pool size

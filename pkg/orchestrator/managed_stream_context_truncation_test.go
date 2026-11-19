@@ -15,15 +15,8 @@ import (
 // cancelled, delivering NO audio at all. This lets a test interrupt a later
 // turn deterministically before a single byte has been synthesized for it.
 //
-// Keyed on text rather than call order deliberately: NewManagedStream always
-// spawns a background generateBackchannelClips goroutine that independently
-// calls this same TTS provider for a few filler phrases ("mhm", "yeah", ...)
-// — an earlier, call-count-based version of this mock raced with that
-// goroutine and could consume the "first call" slot on a backchannel phrase
-// instead of the test's own turn 1, deadlocking the test. Matching on the
-// exact response text sidesteps that entirely: the backchannel phrases never
-// match a turn's real response text, so they just block harmlessly on
-// ms.ctx.Done() until the test's deferred stream.Close() cancels it.
+// Keyed on text rather than call order: any other synthesis on the same provider (an earlier
+// warm-up goroutine once raced the first-call slot) never matches a turn's real response text.
 type blockingAfterFirstTTS struct {
 	allowText string
 }

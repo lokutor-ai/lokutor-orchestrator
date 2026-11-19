@@ -384,6 +384,10 @@ func (ms *ManagedStream) scheduleAudioLocked(gen, n int, now time.Time) {
 		return
 	}
 	dur := time.Duration(n) * time.Second / time.Duration(int64(ms.playbackRate)*2)
+	// A backchannel still playing is ahead of this audio in the transport's queue: the reply starts after it.
+	if ms.backchannelEnd.After(now) {
+		now = ms.backchannelEnd
+	}
 	id, text := -1, ""
 	if ms.curSeg.gen == gen {
 		id, text = ms.curSeg.id, ms.curSeg.text
