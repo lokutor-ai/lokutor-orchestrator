@@ -378,7 +378,7 @@ const (
 // caller's first utterance: their microphone picked up the agent's own voice heardMs into the reply,
 // and the transport then did what after says. The microphone heard an attenuated copy of what had
 // played, 160 ms late, transcribed as said; the VAD ends the utterance and its turn is in flight.
-func echoAfterHeard(t *testing.T, heardMs, after int, said string, log *recordingLogger) (*ManagedStream, *chunkedLLM) {
+func echoAfterHeard(t *testing.T, heardMs, after int, said string, log *recordingLogger, opts ...func(*Config)) (*ManagedStream, *chunkedLLM) {
 	t.Helper()
 	first := voiced(syllables(100, 0.9), 0.37)
 	second := voiced(syllables(50, 2.0), 0.37)
@@ -387,6 +387,9 @@ func echoAfterHeard(t *testing.T, heardMs, after int, said string, log *recordin
 	cfg := DefaultConfig()
 	cfg.SilenceTimeout = 0
 	cfg.SampleRate = 16000
+	for _, o := range opts {
+		o(&cfg)
+	}
 	llm := &chunkedLLM{script: [][]string{{bromReply1 + " ", bromReply2}, {bromAnswer}}}
 	stt := &lengthSTT{byLen: map[int]string{len(audio1): bromFirstHalf}}
 	orch := NewWithAllLayers(stt, llm, &scriptedTTS{first: first, later: [][]byte{second}}, webVAD(), cfg, log)
@@ -537,5 +540,17 @@ func TestEchoVeto_NothingLostIsDropped(t *testing.T) {
 	defer llm.mu.Unlock()
 	if len(llm.requests) != 1 {
 		t.Fatalf("the model was asked %d times", len(llm.requests))
+	}
+}
+
+// Phone sessions (2026-11-19, the owner's call): DisableEchoVeto skips the echo check entirely. The same echo that
+// TestEchoVeto_ReplyStillPlayingIsResumed vetoes is taken as the caller's turn, and nothing is logged as an echo.
+func TestEchoVeto_DisabledTakesItAsATurn(t *testing.T) {
+	log := &recordingLogger{}
+	stream, _ := echoAfterHeard(t, 1600, transportPlaying, "Bring your warmest cloak.", log,
+		func(c *Config) { c.DisableEchoVeto = true })
+	waitForEventType(t, stream, TranscriptFinal, 3*time.Second)
+	if log.count("INFO Echo check") != 0 || log.count("INFO Barge-in looks like an echo") != 0 {
+		t.Fatalf("the echo check ran with DisableEchoVeto:\n%s", log.dump())
 	}
 }

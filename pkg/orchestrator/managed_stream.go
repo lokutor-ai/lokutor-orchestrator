@@ -2534,24 +2534,26 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		// speech an echo when the agent was silent while it began (correlateEnvelopesFrom), and a
 		// veto never drops the caller into silence: settleEchoVeto resumes the reply, joins the
 		// utterance to the one before it, or says again what the echo cost.
-		ms.mu.Lock()
-		currentlySpeaking := ms.lastResponseText
-		replySoFar := ""
-		if ms.echoReplyGen == pendingGen {
-			replySoFar = ms.echoReplyText
-		}
-		ms.mu.Unlock()
-		acoustic := ms.acousticEchoCheck(pendingGen)
-		textEcho := isLikelyEcho(ownTranscript, currentlySpeaking) || isLikelyEcho(ownTranscript, replySoFar)
-		ms.logger.Info("Echo check",
-			"acoustic_echo", acoustic.echo, "acoustic_score", acoustic.score,
-			"acoustic_lag_ms", acoustic.lagMs, "acoustic_near_frames", acoustic.nearFrames, "acoustic_threshold", acoustic.threshold,
-			"acoustic_unsourced_score", acoustic.unsourcedScore,
-			"text_echo", textEcho, "transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
-		if echo, method := echoVerdict(acoustic.echo, acoustic.score, textEcho); echo {
-			if !ms.settleEchoVeto(ctx, seq, pendingGen, pendingBarge, carryBase != nil, method, acoustic, textEcho,
-				ownTranscript, currentlySpeaking) {
-				return
+		if !ms.orch.config.DisableEchoVeto {
+			ms.mu.Lock()
+			currentlySpeaking := ms.lastResponseText
+			replySoFar := ""
+			if ms.echoReplyGen == pendingGen {
+				replySoFar = ms.echoReplyText
+			}
+			ms.mu.Unlock()
+			acoustic := ms.acousticEchoCheck(pendingGen)
+			textEcho := isLikelyEcho(ownTranscript, currentlySpeaking) || isLikelyEcho(ownTranscript, replySoFar)
+			ms.logger.Info("Echo check",
+				"acoustic_echo", acoustic.echo, "acoustic_score", acoustic.score,
+				"acoustic_lag_ms", acoustic.lagMs, "acoustic_near_frames", acoustic.nearFrames, "acoustic_threshold", acoustic.threshold,
+				"acoustic_unsourced_score", acoustic.unsourcedScore,
+				"text_echo", textEcho, "transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
+			if echo, method := echoVerdict(acoustic.echo, acoustic.score, textEcho); echo {
+				if !ms.settleEchoVeto(ctx, seq, pendingGen, pendingBarge, carryBase != nil, method, acoustic, textEcho,
+					ownTranscript, currentlySpeaking) {
+					return
+				}
 			}
 		}
 	}

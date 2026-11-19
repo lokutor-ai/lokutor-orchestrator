@@ -306,8 +306,13 @@ type Config struct {
 	BargeInVADThreshold      float64
 	BargeInVADTrailWindow    time.Duration
 	EchoSuppressionThreshold float64
-	FirstSpeaker             FirstSpeaker
-	SilenceTimeout           time.Duration
+	// DisableEchoVeto turns off the orchestrator's own echo handling for a session: the acoustic and text echo
+	// checks on a barge-in, and with them the echo veto's resume/rejoin/re-say (settleEchoVeto) and the echo-loop
+	// replay protection that builds on it. For transports where the caller's device cancels its own echo (2026-11-19:
+	// phone calls, the owner's call: they worked with the handset's own echo cancellation before ours was added).
+	DisableEchoVeto bool
+	FirstSpeaker    FirstSpeaker
+	SilenceTimeout  time.Duration
 
 	// TurnoEarlyEndThreshold, when > 0, lets Turno's horizon head cut the VAD
 	// hangover short. The hangover (~448ms) exists to be certain a pause is
