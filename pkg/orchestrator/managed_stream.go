@@ -870,13 +870,16 @@ func (ms *ManagedStream) handleAudio(chunk []byte) {
 		audioChunk16k = resampleTo16k(chunk, ms.inputSampleRate)
 	}
 	ms.backchannelShadowAudio(audioChunk16k, time.Now())
-	ms.advanceFarEndEcho(time.Now())
 	ms.mu.Lock()
 	pendingGenForEcho := ms.pendingBargeGen
 	pendingForEcho := ms.pendingBargeIn
+	echoNeeded := ms.echoReferenceNeededLocked()
 	ms.mu.Unlock()
-	if pendingForEcho {
-		ms.noteNearEndEcho(audioChunk16k, pendingGenForEcho)
+	if echoNeeded {
+		ms.advanceFarEndEcho(time.Now())
+		if pendingForEcho {
+			ms.noteNearEndEcho(audioChunk16k, pendingGenForEcho)
+		}
 	}
 	ms.noteUnconfirmedSpeech(audioChunk16k, isSpeaking, time.Now())
 	if ms.turno != nil {
@@ -3824,7 +3827,7 @@ func (ms *ManagedStream) emitWithGen(eventType EventType, data interface{}, gen 
 		// caller's playout clock (spoken_truth.go).
 		if chunk, ok := data.([]byte); ok {
 			ms.scheduleAudioLocked(gen, len(chunk), time.Now())
-			if ms.playout.gen == gen && ms.playbackRate > 0 {
+			if ms.playout.gen == gen && ms.playbackRate > 0 && ms.echoReferenceNeededLocked() {
 				dur := time.Duration(len(chunk)) * time.Second / time.Duration(int64(ms.playbackRate)*2)
 				far := chunk
 				if ms.playbackRate != 16000 {
