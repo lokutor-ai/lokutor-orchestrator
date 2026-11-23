@@ -147,7 +147,7 @@ func (ms *ManagedStream) speakReplyWithArrivals(ctx, rctx context.Context, arr S
 				text = joined
 			}
 		}
-		ms.speakTextWith(rctx, text, gen, &arrivalFeed{arr: arr, src: src, texts: []string{text}})
+		ms.speakTextWith(rctx, text, gen, &arrivalFeed{arr: arr, src: src, texts: []string{text}}, nil)
 	}
 }
 

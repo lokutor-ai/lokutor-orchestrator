@@ -68,6 +68,10 @@ type spokenSegment struct {
 	// sched is all the audio ever scheduled for it. cutAt shortens intervals to what played; sched
 	// keeps the whole length, so a sentence cut short can still be told from one that played out.
 	sched time.Duration
+	// marks (a word-pointer reply's) say exactly which words had been heard after how much of its audio; heard and
+	// heardWords use them instead of the proportional estimate. Its text grows as the reply's words are appended,
+	// ahead of their audio, so without them the end of the audio scheduled so far would read as the whole text.
+	marks *wordMarks
 }
 
 func (s *spokenSegment) total() time.Duration {
@@ -85,6 +89,13 @@ func (s *spokenSegment) heardWords(at time.Time) int {
 		return 0
 	}
 	words := strings.Fields(s.text)
+	if s.marks != nil {
+		h := s.heardBefore(at)
+		if s.marks.done && h >= s.sched-20*time.Millisecond {
+			return len(words)
+		}
+		return min(s.marks.heard(h), len(words))
+	}
 	n := int(float64(len(words)) * float64(s.heardBefore(at)) / float64(s.sched))
 	if n > len(words) {
 		n = len(words)
@@ -202,6 +213,22 @@ func (p *playoutTimeline) heard(at time.Time) (text string, heardDur time.Durati
 		heardDur += h
 		if total <= 0 {
 			continue
+		}
+		if seg.marks != nil {
+			// a word-pointer reply: the words the pool said it had finished by then, exactly; the whole text only once
+			// the reply has ended and its audio played (the tail grace as below)
+			if seg.marks.done && h >= total-segmentTailGrace(total) {
+				if t := strings.TrimSpace(seg.text); t != "" {
+					parts = append(parts, t)
+				}
+				continue
+			}
+			complete = false
+			words := strings.Fields(seg.text)
+			if n := min(seg.marks.heard(h), len(words)); n > 0 {
+				parts = append(parts, strings.Join(words[:n], " "))
+			}
+			break
 		}
 		// A few milliseconds short of the end is the end: chunk boundaries and clock reads are not exact. So is the
 		// last fraction of a second: people start answering as a question ends (a caller cut in over "…pick a
@@ -352,6 +379,8 @@ func replaceLastUserTurn(msgs []Message, merged string) ([]Message, bool) {
 type segmentRef struct {
 	gen, id int
 	text    string
+	// marks: a word-pointer reply's finished words on its audio (word_pointer.go), nil for any other segment
+	marks *wordMarks
 }
 
 // heardSnapshot is what the caller had heard of generation gen when they started speaking over it.
@@ -403,10 +432,14 @@ func (ms *ManagedStream) scheduleAudioLocked(gen, n int, now time.Time) {
 		now = ms.backchannelEnd
 	}
 	id, text := -1, ""
+	var marks *wordMarks
 	if ms.curSeg.gen == gen {
-		id, text = ms.curSeg.id, ms.curSeg.text
+		id, text, marks = ms.curSeg.id, ms.curSeg.text, ms.curSeg.marks
 	}
 	ms.playout.schedule(gen, id, text, now, dur)
+	if n := len(ms.playout.segs); marks != nil && n > 0 && ms.playout.segs[n-1].id == id {
+		ms.playout.segs[n-1].marks = marks
+	}
 }
 
 // snapshotHeardAtOnsetLocked records what the caller had heard of the current reply at now, the

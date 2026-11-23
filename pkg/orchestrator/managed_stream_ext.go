@@ -373,10 +373,18 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	// One reply id for the turn's sentences (WithReply): a provider that keeps a reply in one stream appends each to the
 	// last, and is told when the turn has no more (ReplyEnder) so it frees what it held.
 	replyID := newReplyID()
+	// Word-pointer synthesis (word_pointer.go): the LLM's text goes to the pool as it is written, word by word, instead
+	// of sentence by sentence through ttsQueue. Decided once for the turn.
+	var words *wordStream
+	if ms.wordPointerOn() {
+		words = newWordStream()
+	}
 	go func() {
 		defer ttsWg.Done()
 		rctx := WithReply(ctx, replyID)
-		if wholeReply {
+		if words != nil {
+			ms.speakPointerReplies(rctx, words, gen, "", true)
+		} else if wholeReply {
 			// The reply's sentences as one synthesis (whole_reply.go).
 			ms.speakWholeReply(ctx, rctx, ttsQueue, gen)
 		} else if arr, ok := ms.orch.tts.(SentenceArriver); ok && arr.ArrivalsEnabled() {
@@ -437,7 +445,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		if s == "" {
 			return
 		}
-		ttsQueue <- s
+		if words == nil {
+			ttsQueue <- s
+		}
 		pendingSentence.Reset()
 	}
 
@@ -494,8 +504,20 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		saidBeforeCalls.Reset()
 		_, err = provider.StreamComplete(tryCtx, messages, ms.toolsOffered(userTranscript),
 			func(chunk string) error {
+				if words != nil && !hasToolCalls {
+					// The words go to the voice as they are written, so the check a sentence gets before it is spoken
+					// (below) runs on the sentence so far, before this chunk can be taken (the reply holds back its
+					// last TTS_POINTER_GUARD_WORDS words, so a phrase is seen whole before its first word goes).
+					if reason := unspeakableReply(pendingSentence.String()+chunk, tools); reason != "" {
+						unspeakable = reason
+						return errUnspeakableReply
+					}
+				}
 				fullText.WriteString(chunk)
 				pendingSentence.WriteString(chunk)
+				if words != nil {
+					words.write(chunk)
+				}
 
 				// Signal first token arrival (stops the filler timer)
 				select {
@@ -539,7 +561,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 						return errUnspeakableReply
 					}
 					if seg != "" {
-						ttsQueue <- seg
+						if words == nil {
+							ttsQueue <- seg
+						}
 						spokenThisTry = append(spokenThisTry, seg)
 						firstChunkDone = true
 					}
@@ -568,7 +592,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					// the tail a third way at the end of the turn: "Un momento, lo miro." was heard twice, a
 					// goodbye before end_call twice (2026-10-16, TestPreToolWordsSpokenOnce).
 					flushSentence()
-					if wholeReply {
+					if words != nil {
+						words.mark() // the reply ends after the words before the call; the one after the tool continues it
+					} else if wholeReply {
 						ttsQueue <- replyFlushMark // the words before a tool call are spoken while it runs
 					}
 					saidBeforeCalls.WriteString(" " + strings.TrimSpace(fullText.String()))
@@ -613,7 +639,14 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			"reason", unspeakable, "attempt", attempt, "gen", gen, "text", ContentForLog(fullText.String()))
 		fullText.Reset()
 		pendingSentence.Reset()
-		if wholeReply && len(spokenThisTry) > 0 {
+		if words != nil {
+			// what the voice was given of this try was said (whole words); the rest of it is dropped, and the reply
+			// ends there: the next try's words open a reply that continues it
+			spokenThisTry = nil
+			if said := words.retry(); said != "" {
+				spokenThisTry = []string{said}
+			}
+		} else if wholeReply && len(spokenThisTry) > 0 {
 			ttsQueue <- replyFlushMark // what this try had queued is spoken; the next try continues from it
 		}
 		if said := strings.TrimSpace(strings.Join(spokenThisTry, " ")); said != "" {
@@ -635,6 +668,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	flushSentence()
 	close(ttsQueue)
+	if words != nil {
+		words.close()
+	}
 	ttsWg.Wait()
 	ms.logRunOns(gen, turnTokens)
 
@@ -858,7 +894,8 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			// And it starts once the words before it have played: its new generation makes the client drop what
 			// is still playing of the old one, so a reply ready before "Let me check that" had played out cut it.
 			ms.waitPlayedOut(rCtx, toolTurnGen, 8*time.Second)
-			ms.speakResponse(rCtx, text, gen)
+			// with a word-pointer pool it continues the reply said before the tool (word_pointer.go)
+			ms.speakResponse(withPointerContinue(rCtx, toolTurnGen), text, gen)
 		}()
 	}
 }

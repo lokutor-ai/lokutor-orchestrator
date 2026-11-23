@@ -402,6 +402,8 @@ type ManagedStream struct {
 	inflightUtterances int
 	curSeg             segmentRef
 	segSeq             int
+	// lastPointer is the word-pointer reply spoken last (word_pointer.go): the reply after a tool call continues it.
+	lastPointer pointerLast
 	// echoReplyGen / echoReplyText: every sentence of the current reply begun so far, for the text echo check.
 	// lastResponseText is the sentence being synthesised, which runs ahead of what is playing while the echo
 	// arrives behind it, so an echo of the sentence before ("Hey there." over "What are you building today?")
@@ -2813,13 +2815,14 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
-	ms.speakTextWith(ctx, text, gen, nil)
+	ms.speakTextWith(ctx, text, gen, nil, nil)
 }
 
 // speakTextWith is speakText; feed (non-nil only with mid-sentence arrivals, arrivals.go) is the stream's arrival
 // feeder: once the provider's stream has delivered its first audio, the reply's next sentences are handed to it while
-// it speaks, and its audio is placed on those sentences for spoken truth.
-func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int, feed *arrivalFeed) {
+// it speaks, and its audio is placed on those sentences for spoken truth. marks (non-nil only for a word-pointer reply,
+// word_pointer.go) are the reply's finished words on its audio, which spoken truth reads instead of its estimate.
+func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int, feed *arrivalFeed, marks *wordMarks) {
 	// A multi-sentence response is queued and spoken one sentence per
 	// speakText call. If the turn's pipeline was already cancelled (e.g. the
 	// user interrupted during the gap between two sentences — see
@@ -2953,6 +2956,7 @@ func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int
 	// that's what's actually audible at any given moment.
 	ms.lastResponseText = text
 	ms.beginSegmentLocked(gen, text)
+	ms.curSeg.marks = marks
 	ms.mu.Unlock()
 
 	ms.emitWithGen(BotSpeaking, nil, gen)
@@ -3063,7 +3067,14 @@ func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int
 			ms.emitWithGen(Visemes, out, gen)
 		}
 	}
-	if pre, preVis := ms.prerender.take(text, voice, lang); pre != nil {
+	// A word-pointer reply is never pre-rendered: it is one stream the pool must open, to take the words after it.
+	pointerReply := PointerReplyFrom(sCtx)
+	var pre [][]byte
+	var preVis []Viseme
+	if pointerReply == nil {
+		pre, preVis = ms.prerender.take(text, voice, lang)
+	}
+	if pre != nil {
 		ms.logger.Info("Speaking pre-rendered opening segment", "chunks", len(pre), "chars", len(text))
 		if onVis != nil && len(preVis) > 0 {
 			onVis(preVis)
@@ -3092,6 +3103,14 @@ func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int
 		}
 		segText, arrived = feed.joined(), feed.arrived()
 	}
+	if marks != nil {
+		// a word-pointer reply: the segment is its whole text, the opening and every piece appended to it
+		ms.mu.Lock()
+		if ms.curSeg.marks == marks {
+			segText = ms.curSeg.text
+		}
+		ms.mu.Unlock()
+	}
 	ms.logTTSSegment(probe, segText, string(lang), segIdx, bytesBefore, prevTrail, segStart, sCtx.Err() != nil, arrived)
 
 	if !started && len(jitterBuf) > 0 {
@@ -3100,6 +3119,9 @@ func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int
 
 	if err != nil && sCtx.Err() == nil {
 		ms.emit(ErrorEvent, fmt.Sprintf("TTS error: %v", err))
+	}
+	if pointerReply != nil && err != nil && sCtx.Err() == nil {
+		pointerReply.setErr(err)
 	}
 
 	ms.mu.Lock()
@@ -4047,6 +4069,12 @@ func (ms *ManagedStream) monitorInactivity() {
 // which is where a speaker pauses anyway — unlike cutting the opening chunk mid-sentence, which
 // was tried, sounded like the agent stopping dead after five words, and is deliberately off.
 func (ms *ManagedStream) speakResponse(ctx context.Context, text string, gen int) {
+	if ms.wordPointerOn() {
+		// one word-pointer reply (or a few, cut at sentence ends past TTS_POINTER_MAX_CHARS), continuing the turn's
+		// last one: the words said before a tool call (word_pointer.go)
+		ms.speakPointerResponse(ctx, text, gen)
+		return
+	}
 	segs := joinShortOpenerSegments(splitSentences(text))
 	if wholeReply {
 		segs = groupWholeReply(splitSentences(text), wholeReplyMaxChars) // whole_reply.go
