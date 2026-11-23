@@ -1263,6 +1263,15 @@ func resampleTo16k(audio []byte, inputSampleRate int) []byte {
 
 	out := make([]byte, outLen)
 	inSamples := len(audio) / 2
+	if inSamples < 2 {
+		// One sample upsampled (an 8 kHz chunk or last frame of 2 or 3 bytes): there is nothing to interpolate
+		// towards, and the clamp below set srcIdx to -1, an index panic. In emitWithGen that panic was swallowed by
+		// its recover while ms.mu was held, which would freeze the stream. Hold the one sample instead.
+		for i := 0; i+1 < outLen; i += 2 {
+			out[i], out[i+1] = audio[0], audio[1]
+		}
+		return out
+	}
 
 	for i := 0; i < outLen/2; i++ {
 		srcPos := float64(i) / ratio
