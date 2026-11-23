@@ -22,6 +22,9 @@ type pointerTTS struct {
 	// failAfter: reply number (1-based) -> words said before it fails with failReason
 	failAfter  map[int]int
 	failReason string
+	// halfFail: in the first reply, the written word with this index is said as two spoken words, and the reply fails
+	// after the first of them (the written word half said)
+	halfFail int
 	// refuse: an append the pool refuses for room (by reply number and append number, 1-based)
 	refuseRoom map[[2]int]bool
 	terms      []string
@@ -45,7 +48,7 @@ type fakeReply struct {
 }
 
 func newPointerTTS() *pointerTTS {
-	return &pointerTTS{enabled: true, pointer: true, rate: 44100, wordDelay: 2 * time.Millisecond,
+	return &pointerTTS{enabled: true, pointer: true, rate: 44100, wordDelay: 2 * time.Millisecond, halfFail: -1,
 		failAfter: map[int]int{}, refuseRoom: map[[2]int]bool{}, started: make(chan struct{})}
 }
 
@@ -121,6 +124,14 @@ func (p *pointerTTS) StreamSynthesize(ctx context.Context, text string, voice Vo
 			pr.Failed(p.failReason)
 			return fmt.Errorf("versa2: stream read failed: unexpected EOF")
 		}
+		if n == 1 && r.said == p.halfFail && r.said < len(words) {
+			idx := r.said
+			p.mu.Unlock()
+			_ = onChunk(p.chunk())
+			pr.Word(PointerWord{Index: idx, EndMs: float64(idx+1) * 100, TextEnd: words[idx], TextStart: -1, WrittenDone: false})
+			pr.Failed("watchdog")
+			return fmt.Errorf("versa2: pointer reply failed (watchdog)")
+		}
 		if r.said < len(words) {
 			w := words[r.said]
 			r.said++
@@ -133,7 +144,7 @@ func (p *pointerTTS) StreamSynthesize(ctx context.Context, text string, voice Vo
 				return err
 			}
 			p.startOnce.Do(func() { close(p.started) })
-			pr.Word(PointerWord{Index: idx, StartMs: float64(idx) * 100, EndMs: float64(idx+1) * 100, TextEnd: w})
+			pr.Word(PointerWord{Index: idx, StartMs: float64(idx) * 100, EndMs: float64(idx+1) * 100, TextEnd: w, TextStart: -1, WrittenDone: true})
 			time.Sleep(p.wordDelay)
 			continue
 		}
@@ -625,5 +636,22 @@ func TestPointer_OffIsTodaysPath(t *testing.T) {
 	replies, plain := tts.snapshot()
 	if len(replies) != 0 || len(plain) != 3 {
 		t.Fatalf("want three plain sentences and no pointer reply, got %d replies, plain %q", len(replies), plain)
+	}
+}
+
+// A written word the pool had half said ("twenty" of "25") when it failed is neither heard nor skipped: the next reply
+// says it again from its start.
+func TestPointer_AHalfSaidWordIsSaidAgainWhole(t *testing.T) {
+	tts := newPointerTTS()
+	text := "Claro, te lo miro: a las 10:30 de la mañana."
+	tts.halfFail = 6 // "10:30"
+	ms := runPointerTurn(t, tts, &chunkedLLM{script: [][]string{{text}}}, nil)
+	defer ms.Close()
+	replies, _ := tts.snapshot()
+	if len(replies) != 2 {
+		t.Fatalf("want the failed reply and its continuation, got %d", len(replies))
+	}
+	if got := strings.TrimSpace(joined(replies[1])); got != "10:30 de la mañana." {
+		t.Fatalf("the continuation opens with %q", got)
 	}
 }

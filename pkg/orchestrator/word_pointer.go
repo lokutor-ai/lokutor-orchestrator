@@ -86,6 +86,13 @@ type PointerWord struct {
 	// TextEnd is where the word ends in the reply's own text (its opening text, then every appended text, in runes as
 	// handed to the provider); -1 when the pool did not say.
 	TextEnd int
+	// TextStart is where the WRITTEN word this spoken word belongs to begins (-1 unknown). A written word that is said
+	// as several ("25", "twenty five") has the same TextStart and TextEnd on each: a caption lights it from the first
+	// one's StartMs to the last one's EndMs.
+	TextStart int
+	// WrittenDone: this is the last spoken word of its written word, which is now said in full. Spoken truth and the
+	// point a failed reply is said again from count only written words said in full.
+	WrittenDone bool
 }
 
 // PointerAppendFunc sends the reply's next text (end: no more after it) to the pod speaking it.
@@ -149,7 +156,7 @@ func (r *PointerReply) Word(w PointerWord) {
 	if len(r.seen) < 4096 {
 		r.seen = append(r.seen, w)
 	}
-	if w.TextEnd > r.lastEnd {
+	if w.WrittenDone && w.TextEnd > r.lastEnd {
 		r.lastEnd = w.TextEnd
 	}
 	cb := r.onWord
@@ -893,8 +900,8 @@ func (ms *ManagedStream) speakPointerReply(ctx context.Context, ws *wordStream, 
 		}
 	}
 	pr.onWord = func(w PointerWord) {
-		if w.TextEnd < 0 {
-			return
+		if w.TextEnd < 0 || !w.WrittenDone {
+			return // a written word half said ("twenty" of "25") is not claimed as heard
 		}
 		rt := f.replyText()
 		rr := []rune(rt)
