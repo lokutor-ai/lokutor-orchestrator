@@ -10,9 +10,9 @@ import (
 
 func withWholeReply(t *testing.T, maxChars int, wait time.Duration) {
 	t.Helper()
-	on, mc, w := wholeReply, wholeReplyMaxChars, wholeReplyWait
-	wholeReply, wholeReplyMaxChars, wholeReplyWait = true, maxChars, wait
-	t.Cleanup(func() { wholeReply, wholeReplyMaxChars, wholeReplyWait = on, mc, w })
+	on, mc, w, fw := wholeReply, wholeReplyMaxChars, wholeReplyWait, wholeReplyFirstWait
+	wholeReply, wholeReplyMaxChars, wholeReplyWait, wholeReplyFirstWait = true, maxChars, wait, wait
+	t.Cleanup(func() { wholeReply, wholeReplyMaxChars, wholeReplyWait, wholeReplyFirstWait = on, mc, w, fw })
 }
 
 func TestGatherReplyUntilTheReplyEnds(t *testing.T) {
@@ -115,6 +115,68 @@ func TestWholeReply_BeforeArrivals(t *testing.T) {
 	runReply(t, tts, []string{s1 + " ", s2})
 	got := tts.snapshot()
 	if len(got) != 1 || len(got[0]) != 1 || got[0][0] != s1+" "+s2 {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// slowLLM streams a reply's chunks with a pause before each.
+type slowLLM struct {
+	chunks []string
+	gap    time.Duration
+}
+
+func (l *slowLLM) Complete(ctx context.Context, m []Message, t []Tool) (string, error) {
+	return strings.Join(l.chunks, ""), nil
+}
+func (l *slowLLM) Name() string { return "slowLLM" }
+func (l *slowLLM) StreamComplete(ctx context.Context, m []Message, t []Tool, onChunk func(string) error, onTool func(ToolCallEventData) error) (string, error) {
+	for i, c := range l.chunks {
+		if i > 0 {
+			time.Sleep(l.gap)
+		}
+		if err := onChunk(c); err != nil {
+			return "", err
+		}
+	}
+	return strings.Join(l.chunks, ""), nil
+}
+
+func runSlowReply(t *testing.T, tts TTSProvider, llm *slowLLM) {
+	t.Helper()
+	orch := NewWithAllLayers(&MockSTTProvider{transcribeResult: "x"}, llm, tts, nil, DefaultConfig(), &NoOpLogger{})
+	ms := orch.NewManagedStream(context.Background(), NewConversationSession("whole"))
+	done := make(chan struct{})
+	go func() { ms.runLLMAndTTS(context.Background(), "hola"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reply did not finish")
+	}
+}
+
+// With a short first wait the reply is two pieces: what was written when the first sentence was ready, then
+// everything written while that was being synthesised. First audio does not wait for the reply.
+func TestWholeReply_TwoPiecesWithoutWaitingForTheReply(t *testing.T) {
+	withWholeReply(t, 0, 0)
+	wholeReplyFirstWait = 5 * time.Millisecond
+	tts := newArriverTTS(false)
+	tts.perSentence, tts.delay = 10, 20*time.Millisecond // the first piece takes 200 ms to synthesise
+	runSlowReply(t, tts, &slowLLM{chunks: []string{s1 + " ", s2 + " ", s3 + " ", s4}, gap: 40 * time.Millisecond})
+	got := tts.snapshot()
+	if len(got) != 2 || got[0][0] != s1 || got[1][0] != s2+" "+s3+" "+s4 {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// A short opener still waits for its sentence when the first wait runs out.
+func TestWholeReply_ShortOpenerWaitsForItsSentence(t *testing.T) {
+	withWholeReply(t, 0, 0)
+	wholeReplyFirstWait = 5 * time.Millisecond
+	tts := newArriverTTS(false)
+	tts.perSentence, tts.delay = 10, 20*time.Millisecond
+	runSlowReply(t, tts, &slowLLM{chunks: []string{"Vale. ", s2 + " ", s3 + " ", s4}, gap: 40 * time.Millisecond})
+	got := tts.snapshot()
+	if len(got) != 2 || got[0][0] != "Vale. "+s2 || got[1][0] != s3+" "+s4 {
 		t.Fatalf("got %q", got)
 	}
 }
