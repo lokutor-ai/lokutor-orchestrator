@@ -4050,6 +4050,14 @@ func (ms *ManagedStream) speakResponse(ctx context.Context, text string, gen int
 	segs := joinShortOpenerSegments(splitSentences(text))
 	if wholeReply {
 		segs = groupWholeReply(splitSentences(text), wholeReplyMaxChars) // whole_reply.go
+		if ReplyID(ctx) == "" {
+			// A reply of its own (the provider marks a turn's requests by their reply id).
+			id := newReplyID()
+			ctx = WithReply(ctx, id)
+			if e, ok := ms.orch.tts.(ReplyEnder); ok {
+				defer e.EndReply(id)
+			}
+		}
 	}
 	for _, seg := range segs {
 		if ctx.Err() != nil {
