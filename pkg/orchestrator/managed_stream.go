@@ -2825,6 +2825,13 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 }
 
 func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
+	ms.speakTextWith(ctx, text, gen, nil)
+}
+
+// speakTextWith is speakText; feed (non-nil only with mid-sentence arrivals, arrivals.go) is the stream's arrival
+// feeder: once the provider's stream has delivered its first audio, the reply's next sentences are handed to it while
+// it speaks, and its audio is placed on those sentences for spoken truth.
+func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int, feed *arrivalFeed) {
 	// A multi-sentence response is queued and spoken one sentence per
 	// speakText call. If the turn's pipeline was already cancelled (e.g. the
 	// user interrupted during the gap between two sentences — see
@@ -3001,6 +3008,9 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 	bytesBefore, segIdx, prevTrail := ms.turnAudioBytes, ms.segIdx, ms.segPrevTrailMs
 	ms.segIdx++
 	ms.mu.Unlock()
+	// providerStream: the audio comes from the provider's stream (not a pre-rendered opening), which is what an arrival
+	// joins. Set before the synthesis starts, read only in onChunk.
+	providerStream := false
 	onChunk := func(chunk []byte) error {
 		probe.add(chunk)
 		ms.mu.Lock()
@@ -3013,7 +3023,13 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 			ms.spokenTextPrefix = text
 			ms.spokenTextLocked = true
 		}
+		if feed != nil && providerStream {
+			feed.attributeLocked(ms, gen, len(chunk))
+		}
 		ms.mu.Unlock()
+		if feed != nil && providerStream {
+			feed.start(ms, sCtx, gen, voice, lang)
+		}
 
 		if ms.ttsFirstChunkTime.IsZero() {
 			ms.ttsFirstChunkTime = time.Now()
@@ -3074,10 +3090,21 @@ func (ms *ManagedStream) speakText(ctx context.Context, text string, gen int) {
 			}
 		}
 	} else {
+		providerStream = true
 		err = ms.orch.SynthesizeStreamVisemes(sCtx, text, voice, lang, onChunk, onVis)
 	}
 	ms.ttsMu.Unlock()
-	ms.logTTSSegment(probe, text, string(lang), segIdx, bytesBefore, prevTrail, segStart, sCtx.Err() != nil)
+	segText, arrived := text, 0
+	if feed != nil {
+		feed.finish(sCtx.Err() != nil)
+		if err == nil && sCtx.Err() == nil {
+			ms.mu.Lock()
+			feed.settleLocked(ms, gen)
+			ms.mu.Unlock()
+		}
+		segText, arrived = feed.joined(), feed.arrived()
+	}
+	ms.logTTSSegment(probe, segText, string(lang), segIdx, bytesBefore, prevTrail, segStart, sCtx.Err() != nil, arrived)
 
 	if !started && len(jitterBuf) > 0 {
 		ms.emitFrames(jitterBuf, frameSize, gen)
@@ -4032,7 +4059,19 @@ func (ms *ManagedStream) monitorInactivity() {
 // which is where a speaker pauses anyway — unlike cutting the opening chunk mid-sentence, which
 // was tried, sounded like the agent stopping dead after five words, and is deliberately off.
 func (ms *ManagedStream) speakResponse(ctx context.Context, text string, gen int) {
-	for _, seg := range joinShortOpenerSegments(splitSentences(text)) {
+	segs := joinShortOpenerSegments(splitSentences(text))
+	if wholeReply {
+		segs = groupWholeReply(splitSentences(text), wholeReplyMaxChars) // whole_reply.go
+		if ReplyID(ctx) == "" {
+			// A reply of its own (the provider marks a turn's requests by their reply id).
+			id := newReplyID()
+			ctx = WithReply(ctx, id)
+			if e, ok := ms.orch.tts.(ReplyEnder); ok {
+				defer e.EndReply(id)
+			}
+		}
+	}
+	for _, seg := range segs {
 		if ctx.Err() != nil {
 			return // interrupted between sentences; speakText would refuse anyway
 		}

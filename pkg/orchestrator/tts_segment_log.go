@@ -82,7 +82,7 @@ func (p *segmentProbe) trailingMs() int64 {
 }
 
 // logTTSSegment writes the segment's line and keeps its trailing silence for the next segment's line.
-func (ms *ManagedStream) logTTSSegment(p *segmentProbe, text, lang string, idx int, bytesBefore, prevTrailMs int64, started time.Time, interrupted bool) {
+func (ms *ManagedStream) logTTSSegment(p *segmentProbe, text, lang string, idx int, bytesBefore, prevTrailMs int64, started time.Time, interrupted bool, arrivals int) {
 	if p.bytes == 0 {
 		return
 	}
@@ -107,5 +107,5 @@ func (ms *ManagedStream) logTTSSegment(p *segmentProbe, text, lang string, idx i
 	ms.logger.Info("tts_segment", "lang", lang, "seg_idx", idx, "chars", len([]rune(text)), "audio_ms", p.ms(p.bytes),
 		"synth_ms", time.Since(started).Milliseconds(), "first_audio_since_turn_start_ms", startMs, "prev_audio_end_ms", prevEndMs,
 		"underrun_ms", underrun, "leading_silence_ms", p.leadingMs(), "prev_trailing_silence_ms", prevTrailMs, "trailing_silence_ms", trail,
-		"est_audible_gap_ms", est, "interrupted", interrupted)
+		"est_audible_gap_ms", est, "interrupted", interrupted, "arrivals", arrivals)
 }
