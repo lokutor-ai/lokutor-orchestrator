@@ -134,6 +134,8 @@ func (r *streamedRound) StreamComplete(ctx context.Context, messages []Message, 
 				sink := TokenUsageFrom(ctx)
 				sink.Record(p, c, t)
 				sink.SetAnsweredBy(r.round.tokens.AnsweredBy())
+				sink.RecordCache(r.round.tokens.Cache())
+				sink.SetUpstream(r.round.tokens.Upstream())
 			}
 			return text.String(), streamErr
 		}

@@ -620,8 +620,11 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 			if !ok {
 				p, c = -1, -1
 			}
+			cache := r.Tokens.Cache()
 			ms.logger.Info("Speculative LLM run", "run", r.ID, "source", r.Source, "outcome", r.Outcome, "ms", r.Ms,
-				"prompt_tokens", p, "completion_tokens", c, "answered_by", r.Tokens.AnsweredBy(), "transcript_chars", len(r.Transcript))
+				"prompt_tokens", p, "completion_tokens", c, "cached_tokens", cache.CachedTokens,
+				"cache_write_tokens", cache.CacheWriteTokens, "cost_usd", cache.CostUSD,
+				"answered_by", r.Tokens.AnsweredBy(), "upstream", r.Tokens.Upstream(), "transcript_chars", len(r.Transcript))
 		})
 		if cfg.SpeculativePrerender {
 			// Render the opening segment's audio as soon as the speculative reply exists, which is
@@ -1129,7 +1132,7 @@ func (ms *ManagedStream) logTurnLatency() {
 		}
 		ms.logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
 			ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm,
-			turnTokens.AnsweredBy(), promptTok, completionTok, totalTok, trimmed, folded,
+			turnTokens.AnsweredBy(), turnTokens.Upstream(), promptTok, completionTok, totalTok, turnTokens.Cache(), trimmed, folded,
 			llmToTTS, ttsFirst, discarded, unaccounted, ttfa, sttSpeculative, gen)
 	})
 }
@@ -1156,7 +1159,7 @@ func whenTokensSettled(u *TokenUsage, log func()) {
 
 func (ms *ManagedStream) logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
 	ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm int64,
-	provider string, promptTok, completionTok, totalTok, trimmed, folded int,
+	provider, upstream string, promptTok, completionTok, totalTok int, cache TokenCache, trimmed, folded int,
 	llmToTTS, ttsFirst, discarded, unaccounted, ttfa int64, sttSpeculative bool, gen int) {
 	ms.logger.Info("turn latency",
 		// The turn's generation, as on "Turn tokens after tools": the token counts below are the turn's
@@ -1204,9 +1207,17 @@ func (ms *ManagedStream) logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, 
 		"llm_ms", llm,
 		// What the language model actually charged us for this turn. -1 = not reported.
 		"llm_provider", provider,
+		// The host behind a router (OpenRouter's "provider": "Google", "Amazon Bedrock") that served the
+		// turn's last request; "" where the provider names none.
+		"llm_upstream", upstream,
 		"llm_prompt_tokens", promptTok,
 		"llm_completion_tokens", completionTok,
 		"llm_total_tokens", totalTok,
+		// Of llm_prompt_tokens, what the provider's prompt cache served and wrote, and the provider's
+		// price for the turn's requests in USD (0 where it reports none). Ours to pay, not the customer's.
+		"llm_cached_tokens", cache.CachedTokens,
+		"llm_cache_write_tokens", cache.CacheWriteTokens,
+		"llm_cost_usd", cache.CostUSD,
 		// Conversation dropped WITHOUT a summary (only past the hard ceiling): history the model can
 		// no longer see in any form. Must read 0; see context_budget.go.
 		"context_trimmed_msgs", trimmed,

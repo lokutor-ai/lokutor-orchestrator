@@ -703,8 +703,10 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				if !ok {
 					p, c, t = -1, -1, -1
 				}
+				cache := turnTokens.Cache()
 				ms.logger.Info("Turn tokens after tools", "gen", gen, "prompt_tokens", p, "completion_tokens", c,
-					"total_tokens", t, "answered_by", turnTokens.AnsweredBy())
+					"total_tokens", t, "cached_tokens", cache.CachedTokens, "cache_write_tokens", cache.CacheWriteTokens,
+					"cost_usd", cache.CostUSD, "answered_by", turnTokens.AnsweredBy())
 			})
 
 			ms.mu.Lock()

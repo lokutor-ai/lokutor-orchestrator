@@ -30,6 +30,13 @@ type TokenUsage struct {
 	completionTokens int
 	totalTokens      int
 	reported         bool
+	// cache is what of promptTokens the provider's prompt cache served or wrote, and what the provider
+	// says the requests cost (OpenRouter's usage.cost), where it reports them. promptTokens stays the
+	// whole prompt, cached or not: it is what the customer is billed (the rate card does not see the cache).
+	cache TokenCache
+	// upstream is the host behind a router that served the last request ("Google", "Amazon Bedrock"
+	// on OpenRouter), where the provider reports one.
+	upstream string
 	// answeredBy is the provider a chain's turn came from. Since 2026-09-29 the second provider is a
 	// different model at a different price, so which one answered is part of what a turn cost and said.
 	answeredBy string
@@ -171,6 +178,57 @@ func (u *TokenUsage) Record(prompt, completion, total int) {
 		u.totalTokens += prompt + completion
 	}
 	u.reported = true
+}
+
+// TokenCache is the prompt-cache side of a provider's report: CachedTokens of the prompt were read from
+// the cache (billed to us at a tenth of the input price on Anthropic models), CacheWriteTokens written
+// to it (1.25x), and CostUSD the provider's own price for the requests, 0 where it gives none.
+type TokenCache struct {
+	CachedTokens     int
+	CacheWriteTokens int
+	CostUSD          float64
+}
+
+// RecordCache adds a report's cache counts and cost; like Record, later calls accumulate.
+func (u *TokenUsage) RecordCache(c TokenCache) {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.cache.CachedTokens += c.CachedTokens
+	u.cache.CacheWriteTokens += c.CacheWriteTokens
+	u.cache.CostUSD += c.CostUSD
+}
+
+// SetUpstream records the host that served a request; a later request overwrites, as SetAnsweredBy.
+func (u *TokenUsage) SetUpstream(name string) {
+	if u == nil || name == "" {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.upstream = name
+}
+
+// Upstream is the host recorded by SetUpstream, or "".
+func (u *TokenUsage) Upstream() string {
+	if u == nil {
+		return ""
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.upstream
+}
+
+// Cache returns the accumulated cache counts and cost.
+func (u *TokenUsage) Cache() TokenCache {
+	if u == nil {
+		return TokenCache{}
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.cache
 }
 
 // Snapshot returns the accumulated counts. ok is false when no provider reported anything, which is

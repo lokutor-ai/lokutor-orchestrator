@@ -92,6 +92,8 @@ func (r *replayedRound) StreamComplete(ctx context.Context, messages []Message, 
 		sink := TokenUsageFrom(ctx)
 		sink.Record(p, c, t)
 		sink.SetAnsweredBy(r.tokens.AnsweredBy())
+		sink.RecordCache(r.tokens.Cache())
+		sink.SetUpstream(r.tokens.Upstream())
 	}
 	if r.text != "" && onChunk != nil {
 		if err := onChunk(r.text); err != nil {

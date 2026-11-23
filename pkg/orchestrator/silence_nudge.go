@@ -155,6 +155,9 @@ func (ms *ManagedStream) logBotInitiatedLatency(trigger string) {
 			"llm_prompt_tokens", promptTok,
 			"llm_completion_tokens", completionTok,
 			"llm_total_tokens", totalTok,
+			"llm_cached_tokens", turnTokens.Cache().CachedTokens,
+			"llm_cache_write_tokens", turnTokens.Cache().CacheWriteTokens,
+			"llm_cost_usd", turnTokens.Cache().CostUSD,
 			"llm_to_tts_ms", llmToTTS,
 			"tts_first_chunk_ms", ttsFirst,
 		)

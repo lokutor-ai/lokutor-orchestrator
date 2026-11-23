@@ -21,6 +21,13 @@ type usagePayload struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// The prompt cache's share of PromptTokens (OpenAI's cached_tokens; OpenRouter adds
+	// cache_write_tokens for Anthropic models) and OpenRouter's price for the request.
+	PromptTokensDetails struct {
+		CachedTokens     int `json:"cached_tokens"`
+		CacheWriteTokens int `json:"cache_write_tokens"`
+	} `json:"prompt_tokens_details"`
+	Cost float64 `json:"cost"`
 }
 
 // requestStreamUsage asks an OpenAI-compatible endpoint to append a usage chunk to the stream.
@@ -38,6 +45,10 @@ func recordUsage(ctx context.Context, u usagePayload) {
 	orchestrator.TokenUsageFrom(ctx).Record(u.PromptTokens, u.CompletionTokens, u.TotalTokens)
 	// And into the conversation's bill (orchestrator.SessionMeter), under the category the call site set.
 	orchestrator.SessionMeterFrom(ctx).Add(orchestrator.TokenCategoryFrom(ctx), u.PromptTokens, u.CompletionTokens)
+	c := orchestrator.TokenCache{CachedTokens: u.PromptTokensDetails.CachedTokens,
+		CacheWriteTokens: u.PromptTokensDetails.CacheWriteTokens, CostUSD: u.Cost}
+	orchestrator.TokenUsageFrom(ctx).RecordCache(c)
+	orchestrator.SessionMeterFrom(ctx).AddCache(orchestrator.TokenCategoryFrom(ctx), c)
 }
 
 // recordUsageFromChunk pulls `usage` out of one streaming chunk. Call it for EVERY chunk, before

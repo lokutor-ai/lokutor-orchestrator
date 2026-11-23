@@ -28,6 +28,12 @@ type TokenCount struct {
 	Prompt     int64 `json:"prompt"`
 	Completion int64 `json:"completion"`
 	Requests   int   `json:"requests"`
+	// Of Prompt, the tokens the provider's prompt cache served and wrote, and the provider's own price
+	// for the requests (USD), where it reports them. For our cost, not the customer's bill: the bill
+	// prices Prompt whole.
+	CachedPrompt int64   `json:"cached_prompt,omitempty"`
+	CacheWrite   int64   `json:"cache_write,omitempty"`
+	CostUSD      float64 `json:"cost_usd,omitempty"`
 }
 
 // Token categories. "reply" is the default; the others are set by the call sites that make them.
@@ -60,6 +66,27 @@ func (m *SessionMeter) Add(category string, prompt, completion int) {
 	c.Prompt += int64(max(prompt, 0))
 	c.Completion += int64(max(completion, 0))
 	c.Requests++
+}
+
+// AddCache records the cache side and cost of one provider report, under the category Add used. It
+// does not count a request: Add does.
+func (m *SessionMeter) AddCache(category string, c TokenCache) {
+	if m == nil || (c.CachedTokens <= 0 && c.CacheWriteTokens <= 0 && c.CostUSD <= 0) {
+		return
+	}
+	if category == "" {
+		category = TokensReply
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t := m.byCat[category]
+	if t == nil {
+		t = &TokenCount{}
+		m.byCat[category] = t
+	}
+	t.CachedPrompt += int64(max(c.CachedTokens, 0))
+	t.CacheWrite += int64(max(c.CacheWriteTokens, 0))
+	t.CostUSD += max(c.CostUSD, 0)
 }
 
 // Snapshot returns a copy of the counts so far, by category.
