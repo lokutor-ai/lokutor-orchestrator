@@ -1141,7 +1141,7 @@ func (ms *ManagedStream) settleEchoVeto(ctx context.Context, seq, gen int, pendi
 	ms.mu.Unlock()
 	if textEcho && acoustic.score >= echoTextAcousticFloor {
 		// the agent's own words, and its sound at this delay: the call's echo path (acousticEchoCheck)
-		ms.learnEchoLag(acoustic.lagMs)
+		ms.learnEchoLag(acoustic.lagMs, acoustic.score >= echoKnownLagThresholdFor(acoustic.nearFrames))
 	}
 
 	outcome := "said_again"

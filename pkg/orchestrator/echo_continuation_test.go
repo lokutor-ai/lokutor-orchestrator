@@ -359,6 +359,7 @@ func TestEchoVeto_BromContinuationIsAnswered(t *testing.T) {
 // the match out: the veto fires, finds nothing of the reply left to play, and does not drop the turn.
 // The caller had heard next to none of the reply: their words are joined to their first half.
 func TestEchoVeto_NothingToResumeJoinsTheContinuation(t *testing.T) {
+	t.Setenv("ECHO_VETO_SOUND_ALONE", "1") // the path of a veto on sound alone, off by default since 2026-11-24
 	log := &recordingLogger{}
 	stream, llm := replayBromContinuation(t, NewRMSVAD(0.05, 50*time.Millisecond), log)
 	expectBromAnswered(t, stream, llm)

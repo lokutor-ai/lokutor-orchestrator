@@ -124,8 +124,11 @@ type ManagedStream struct {
 	// echoLagKnown / echoLagFrames: the delay at which this call's own echo was confirmed by its words and its sound
 	// (settleEchoVeto), guarded by echoMu. Speech over a later reply that matches the agent's audio at that same delay
 	// is judged against echoKnownLagThresholdFor, not the searched-delay bar (acousticEchoCheck).
-	echoLagKnown  bool
-	echoLagFrames int
+	// echoLagProven(Frames): the same, for a match strong enough to judge on its own (echoKnownLagThresholdFor).
+	echoLagProven       bool
+	echoLagProvenFrames int
+	echoLagKnown        bool
+	echoLagFrames       int
 
 	cmdChan       chan []byte
 	interruptChan chan struct{}
@@ -2572,7 +2575,13 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 				"acoustic_lag_ms", acoustic.lagMs, "acoustic_near_frames", acoustic.nearFrames, "acoustic_threshold", acoustic.threshold,
 				"acoustic_unsourced_score", acoustic.unsourcedScore,
 				"text_echo", textEcho, "transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
-			if echo, method := echoVerdict(acoustic.echo, acoustic.score, textEcho); echo {
+			soundAlone := acoustic.echo && echoSoundAloneVetoes(acoustic)
+			if acoustic.echo && !textEcho && !soundAlone {
+				ms.logger.Info("Echo check: matched on sound alone, the words are not the agent's: answered",
+					"score", acoustic.score, "lag_ms", acoustic.lagMs, "near_frames", acoustic.nearFrames,
+					"transcript", ContentForLog(ownTranscript), "bot_was_saying", ContentForLog(currentlySpeaking))
+			}
+			if echo, method := echoVerdict(soundAlone, acoustic.score, textEcho); echo {
 				if !ms.settleEchoVeto(ctx, seq, pendingGen, pendingBarge, carryBase != nil, method, acoustic, textEcho,
 					ownTranscript, currentlySpeaking) {
 					return

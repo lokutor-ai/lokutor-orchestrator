@@ -449,7 +449,7 @@ func TestAcousticEcho_KnownLagCatchesTheCallsOwnEcho(t *testing.T) {
 		t.Fatalf("set-up: want a match between the known-lag bar %.3f and the searched bar %.3f, got %+v",
 			echoKnownLagThresholdFor(n), echoThresholdFor(n), r)
 	}
-	stream.learnEchoLag(lag * 20)
+	stream.learnEchoLag(lag*20, false)
 	if r = stream.acousticEchoCheck(0); !r.echo || r.lagMs != lag*20 {
 		t.Fatalf("the call's own echo at its known delay was not taken for echo: %+v", r)
 	}

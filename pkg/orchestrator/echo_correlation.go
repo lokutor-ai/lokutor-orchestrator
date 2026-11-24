@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"math"
+	"os"
 	"time"
 )
 
@@ -118,9 +119,12 @@ func echoKnownLagThresholdFor(n int) float64 {
 }
 
 // learnEchoLag records the delay of an echo confirmed by its words and its sound (settleEchoVeto).
-func (ms *ManagedStream) learnEchoLag(lagMs int) {
+func (ms *ManagedStream) learnEchoLag(lagMs int, proven bool) {
 	ms.echoMu.Lock()
 	ms.echoLagKnown, ms.echoLagFrames = true, lagMs/20
+	if proven {
+		ms.echoLagProven, ms.echoLagProvenFrames = true, lagMs/20
+	}
 	ms.echoMu.Unlock()
 }
 
@@ -436,6 +440,8 @@ type acousticEchoReading struct {
 	score      float64
 	lagMs      int
 	nearFrames int
+	// provenLag: the match is at a delay this call proved to be its echo path (strong match by sound, words the agent's).
+	provenLag bool
 	// threshold is what score had to reach for echo (echoThresholdFor nearFrames).
 	threshold float64
 	// unsourcedScore is the best correlation at an alignment ruled out because the agent was silent
@@ -465,6 +471,10 @@ func (ms *ManagedStream) acousticEchoCheck(gen int) (r acousticEchoReading) {
 	far := make([]byte, len(farSrc))
 	copy(far, farSrc)
 	lagKnown, knownLag := ms.echoLagKnown, ms.echoLagFrames
+	provenLag := -1
+	if ms.echoLagProven {
+		provenLag = ms.echoLagProvenFrames
+	}
 	ms.echoMu.Unlock()
 
 	nearEnv := rmsEnvelope(near, echoFrameBytes)
@@ -515,5 +525,16 @@ func (ms *ManagedStream) acousticEchoCheck(gen int) (r acousticEchoReading) {
 			r.echo, r.score, r.threshold, r.lagMs = true, best, t, knownLag*20
 		}
 	}
+	r.provenLag = r.echo && provenLag >= 0 && r.lagMs/20 >= provenLag-1 && r.lagMs/20 <= provenLag+1
 	return r
+}
+
+// echoSoundAloneVetoes reports whether a match on sound alone, the words not being the agent's, may call a barge-in the
+// agent's echo. Not by default (ECHO_VETO_SOUND_ALONE=1 restores it), except at a delay this call has proven its own
+// echo to have: searched over 75 delays, a caller talking over the agent was vetoed in a Spanish web call (2026-11-24,
+// 92 frames, 0.7509 against a bar of 0.75, 420 ms) whose words had been understood. In 14 days the searched sound-only
+// matches sat at 100-1440 ms, while echoes confirmed by word and sound cluster at 140-160 ms. This decides only
+// whether the utterance is answered: the stop of the playback (stopPlayThroughIfDue) reads the check's own verdict.
+func echoSoundAloneVetoes(r acousticEchoReading) bool {
+	return r.provenLag || os.Getenv("ECHO_VETO_SOUND_ALONE") == "1"
 }
