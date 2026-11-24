@@ -547,6 +547,7 @@ func playThroughStream(t *testing.T) *ManagedStream {
 	t.Cleanup(stream.Close)
 	stream.SetPlaybackRate(16000)
 	stream.SetTransportPlaysThroughBargeIn(true)
+	stream.lastUtt = &committedUtterance{} // a reply to a caller turn, not the opening (openingGuard)
 	stream.runLLMAndTTS(context.Background(), "cuenta") // synthesis done; one second still to play
 	time.Sleep(300 * time.Millisecond)
 	drainUntil(stream, 50*time.Millisecond)

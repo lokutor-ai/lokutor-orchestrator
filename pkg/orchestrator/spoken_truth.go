@@ -363,6 +363,8 @@ type heardSnapshot struct {
 	text     string
 	dur      time.Duration
 	complete bool
+	// heardAtStart is dur as it was at the onset (dur is read again while the transport plays through).
+	heardAtStart time.Duration
 	// stopped: a transport that plays through a barge-in has been told to stop (StopPlayback), and
 	// text/dur/complete are what was heard at that moment rather than at the onset.
 	stopped bool
@@ -418,6 +420,7 @@ func (ms *ManagedStream) snapshotHeardAtOnsetLocked(now time.Time) {
 	s := heardSnapshot{gen: gen, seq: ms.utteranceSeq + 1, at: now}
 	if ms.playout.gen == gen {
 		s.text, s.dur, s.complete = ms.playout.heard(now)
+		s.heardAtStart = s.dur
 		if !ms.pausesOnBargeIn && !ms.playsThroughBargeIn {
 			// The transport discards its queue: nothing scheduled after now will ever play.
 			ms.playout.cutAt(now)
@@ -449,6 +452,39 @@ func playThroughStopAfter() time.Duration {
 	return 400 * time.Millisecond
 }
 
+// openingGuard is the start of a call's opening in which short speech over it neither stops nor answers it on a
+// play-through transport (a browser), and how long speech begun there must last to count. A browser's echo
+// canceller has not adapted in the first second of the agent's voice: the opening came back as 0.4-0.9 s of
+// "speech", playback stopped 0.9-1.1 s in and the greeting was said again (three calls on 2026-11-24; the sound
+// matched at 0.72-0.75 where a clip that short needs 0.93-0.95 to be told from chance, and the misheard words
+// matched nothing). Env OPENING_GUARD_MS, 0 = off. The owner's go, 2026-11-24.
+func openingGuard() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("OPENING_GUARD_MS")); err == nil && v >= 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return time.Second
+}
+
+// openingGuardVADOnset is how much speech the VAD hears before it reports it (192 ms): speech reported with less
+// of the opening played than that began before the opening did, so it is the caller.
+const openingGuardVADOnset = 192 * time.Millisecond
+
+// overOpeningStartLocked reports whether the speech whose onset is in ms.onset began in the first openingGuard of
+// the call's opening: the first reply, with no caller turn before it (ms.mu held).
+func (ms *ManagedStream) overOpeningStartLocked() bool {
+	return ms.playsThroughBargeIn && ms.lastUtt == nil && ms.carry == nil && ms.onset.gen == ms.payloadGen &&
+		ms.onset.heardAtStart >= openingGuardVADOnset && ms.onset.heardAtStart < openingGuard()
+}
+
+// dropOverOpening reports whether utterance seq is short speech over the opening's start that did not stop it and
+// that the opening is still playing over: the opening goes on and the utterance is not answered.
+func (ms *ManagedStream) dropOverOpening(seq int, duration time.Duration) bool {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	return ms.overOpeningStartLocked() && ms.onset.seq == seq && !ms.onset.stopped && duration < openingGuard() &&
+		ms.replyWillResumeLocked(time.Now())
+}
+
 // stopPlayThroughIfDue tells a play-through transport to stop once the caller has kept talking over
 // the reply for playThroughStopAfter (StopPlayback). The transport discards what it holds, so what
 // was heard is settled at this moment — as it is at the onset for a transport that stops outright,
@@ -459,6 +495,10 @@ func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
 	if !ms.playsThroughBargeIn || !ms.pendingBargeIn || ms.pendingBargeGen != gen ||
 		ms.onset.gen != gen || ms.onset.at.IsZero() || ms.onset.stopped ||
 		now.Sub(ms.onset.at) < playThroughStopAfter() {
+		ms.mu.Unlock()
+		return
+	}
+	if ms.overOpeningStartLocked() && now.Sub(ms.onset.at) < openingGuard() {
 		ms.mu.Unlock()
 		return
 	}

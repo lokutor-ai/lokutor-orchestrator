@@ -2486,6 +2486,12 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	pendingGen := ms.pendingBargeGen
 	turnoPeak := ms.turnoBargeinPeakScore
 	ms.mu.Unlock()
+	if pendingBarge && ms.dropOverOpening(seq, duration) {
+		ms.logger.Info("Short speech over the opening's first second: opening goes on, not answered",
+			"transcript", ContentForLog(ownTranscript), "audio_duration_ms", duration.Milliseconds())
+		ms.resolvePendingBargeInFor(true)
+		return
+	}
 	if pendingBarge {
 		minWords := ms.orch.config.MinWordsToInterrupt
 		effectiveMinWords := minWords
