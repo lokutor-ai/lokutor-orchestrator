@@ -453,7 +453,7 @@ func playThroughStopAfter() time.Duration {
 }
 
 // openingGuard is the start of a call's opening in which short speech over it neither stops nor answers it on a
-// play-through transport (a browser), and how long speech begun there must last to count. A browser's echo
+// play-through transport (a browser), and how long speech begun there, or just before it, must last to count. A browser's echo
 // canceller has not adapted in the first second of the agent's voice: the opening came back as 0.4-0.9 s of
 // "speech", playback stopped 0.9-1.1 s in and the greeting was said again (three calls on 2026-11-24; the sound
 // matched at 0.72-0.75 where a clip that short needs 0.93-0.95 to be told from chance, and the misheard words
@@ -465,15 +465,13 @@ func openingGuard() time.Duration {
 	return time.Second
 }
 
-// openingGuardVADOnset is how much speech the VAD hears before it reports it (192 ms): speech reported with less
-// of the opening played than that began before the opening did, so it is the caller.
-const openingGuardVADOnset = 192 * time.Millisecond
-
-// overOpeningStartLocked reports whether the speech whose onset is in ms.onset began in the first openingGuard of
-// the call's opening: the first reply, with no caller turn before it (ms.mu held).
+// overOpeningStartLocked reports whether the speech whose onset is in ms.onset was reported over the first openingGuard
+// of the call's opening: the first reply, with no caller turn before it (ms.mu held). The VAD reports speech 192 ms
+// after it begins, so this includes speech begun just before the opening's first audio: a word in the room cut the
+// greeting that way (2026-11-24, the owner's recorded call: heard_ms 0). The owner's go, 2026-11-24.
 func (ms *ManagedStream) overOpeningStartLocked() bool {
 	return ms.playsThroughBargeIn && ms.lastUtt == nil && ms.carry == nil && ms.onset.gen == ms.payloadGen &&
-		ms.onset.heardAtStart >= openingGuardVADOnset && ms.onset.heardAtStart < openingGuard()
+		ms.onset.heardAtStart < openingGuard()
 }
 
 // dropOverOpening reports whether utterance seq is short speech over the opening's start that did not stop it and

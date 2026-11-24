@@ -6,8 +6,7 @@ import (
 )
 
 // 2026-11-24, web: the opening's first second came back through the microphone as speech, playback stopped and the
-// greeting was said again. Short speech begun there neither stops nor answers it; longer speech, later speech, speech
-// begun before the opening, and any reply after a caller turn behave as before.
+// greeting was said again. Short speech begun there neither stops nor answers it; longer speech, later speech and any reply after a caller turn behave as before.
 func TestOpeningGuard(t *testing.T) {
 	cases := []struct {
 		name              string
@@ -18,7 +17,8 @@ func TestOpeningGuard(t *testing.T) {
 	}{
 		{"echo of the opening", 450, 800, 900, false, false, false, true},
 		{"keeps talking", 450, 1100, 1200, false, false, true, false},
-		{"began before the opening", 100, 450, 500, false, false, true, false},
+		{"a short sound begun just before the opening", 0, 450, 500, false, false, false, true},
+		{"a caller talking since before the opening", 0, 1100, 1300, false, false, true, false},
 		{"later in the opening", 1100, 450, 500, false, false, true, false},
 		{"after a caller turn", 450, 450, 500, true, false, true, false},
 		{"switched off", 450, 450, 500, false, true, true, false},
