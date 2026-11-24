@@ -151,6 +151,19 @@ func echoThresholdFor(n int) float64 {
 	return t
 }
 
+// echoReferenceNeededLocked reports whether anything will read the echo reference (echoFarEndBuf, echoNearEndBuf),
+// so whether it is worth feeding. Its only reader is acousticEchoCheck, reached from the barge-in echo check (off
+// with DisableEchoVeto) and from stopPlayThroughIfDue (only on a transport that plays through a barge-in). A phone
+// call has neither since 2026-11-19 (DisableEchoVeto, no play-through), and still resampled every frame of the
+// agent's speech to 16 kHz and kept 12 s of it, plus a mirror of the speaker advanced on every microphone frame,
+// for nobody (2026-11-23). Caller holds ms.mu (playsThroughBargeIn).
+func (ms *ManagedStream) echoReferenceNeededLocked() bool {
+	if ms.orch == nil || !ms.orch.config.DisableEchoVeto {
+		return true
+	}
+	return ms.playsThroughBargeIn
+}
+
 // echoFarChunk is outgoing audio handed to the transport, not yet played: start is when the
 // caller's playout clock (spoken_truth.go) says it starts playing.
 type echoFarChunk struct {
