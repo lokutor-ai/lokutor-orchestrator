@@ -32,12 +32,19 @@ type RemoteLLM struct {
 	noTools bool
 
 	mu      sync.Mutex
-	pending map[string]chan remoteEvent
+	pending map[string]*remoteRequest
 	seq     atomic.Int64
 
 	// FirstEventTimeout is how long a request may wait for the client's first event; IdleTimeout, between events.
 	FirstEventTimeout time.Duration
 	IdleTimeout       time.Duration
+}
+
+// remoteRequest is one request the client is answering. got is how much it has answered, bounded as any answer of a customer's
+// model is (maxCustomAnswer), whether or not the turn has read it yet.
+type remoteRequest struct {
+	ch  chan remoteEvent
+	got int
 }
 
 type remoteEvent struct {
@@ -49,7 +56,7 @@ type remoteEvent struct {
 // NewRemoteLLM returns a provider that sends requests with send (the session's socket writer). noTools never
 // offers the agent's tools to the client.
 func NewRemoteLLM(send func(map[string]interface{}) error, noTools bool) *RemoteLLM {
-	return &RemoteLLM{send: send, noTools: noTools, pending: map[string]chan remoteEvent{},
+	return &RemoteLLM{send: send, noTools: noTools, pending: map[string]*remoteRequest{},
 		FirstEventTimeout: 20 * time.Second, IdleTimeout: 30 * time.Second}
 }
 
@@ -61,9 +68,9 @@ func (l *RemoteLLM) Name() string { return "remote-llm" }
 func (l *RemoteLLM) Deliver(msg map[string]interface{}) {
 	id, _ := msg["request_id"].(string)
 	l.mu.Lock()
-	ch := l.pending[id]
+	req := l.pending[id]
 	l.mu.Unlock()
-	if ch == nil {
+	if req == nil {
 		return
 	}
 	ev := remoteEvent{}
@@ -92,6 +99,17 @@ func (l *RemoteLLM) Deliver(msg map[string]interface{}) {
 	default:
 		return
 	}
+	ch := req.ch
+	l.mu.Lock()
+	req.got += len(ev.text) + len(ev.call.CallID) + len(ev.call.Name) + len(ev.call.Arguments)
+	over := req.got > maxCustomAnswer
+	if over {
+		delete(l.pending, id) // nothing more of it is kept
+	}
+	l.mu.Unlock()
+	if over {
+		ev = remoteEvent{kind: "error", text: errCustomAnswer.Error()}
+	}
 	select {
 	case ch <- ev:
 	default:
@@ -108,7 +126,7 @@ func (l *RemoteLLM) run(ctx context.Context, messages []orchestrator.Message, to
 	id := fmt.Sprintf("r%d", l.seq.Add(1))
 	ch := make(chan remoteEvent, 512)
 	l.mu.Lock()
-	l.pending[id] = ch
+	l.pending[id] = &remoteRequest{ch: ch}
 	l.mu.Unlock()
 	defer func() {
 		l.mu.Lock()

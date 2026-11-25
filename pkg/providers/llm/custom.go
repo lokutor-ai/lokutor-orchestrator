@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
@@ -33,6 +35,12 @@ type CustomLLM struct {
 	client  *http.Client
 	noTools bool
 }
+
+// maxCustomAnswer is the most one answer of a customer's model may be, as it arrives: it is kept in memory until its turn ends,
+// and only the customer's server says when that is. Hours of speech.
+const maxCustomAnswer = 8 << 20
+
+var errCustomAnswer = fmt.Errorf("the model's answer is over %d MB", maxCustomAnswer>>20)
 
 // NewCustomLLM builds the provider. baseURL is the chat completions URL or the API base ("https://host/v1" gets
 // "/chat/completions" appended). headers are sent on every request (X-Api-Key, a tenant id ...); apiKey, when
@@ -241,9 +249,13 @@ func (l *CustomLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 			}
 		}
 	} else {
-		reader := bufio.NewReader(resp.Body)
+		body := &io.LimitedReader{R: resp.Body, N: maxCustomAnswer}
+		reader := bufio.NewReader(body)
 		for {
 			line, err := reader.ReadString('\n')
+			if err == io.EOF && body.N <= 0 {
+				return full.String(), errCustomAnswer
+			}
 			if err != nil && err != io.EOF {
 				return full.String(), err
 			}
@@ -275,14 +287,8 @@ func (l *CustomLLM) StreamComplete(ctx context.Context, messages []orchestrator.
 		}
 	}
 
-	maxIdx := -1
-	for i := range calls {
-		if i > maxIdx {
-			maxIdx = i
-		}
-	}
-	for i := 0; i <= maxIdx; i++ {
-		if st := calls[i]; st != nil && st.name != "" && onToolCall != nil {
+	for _, i := range slices.Sorted(maps.Keys(calls)) {
+		if st := calls[i]; st.name != "" && onToolCall != nil {
 			if err := onToolCall(orchestrator.ToolCallEventData{Name: st.name, Arguments: st.args.String(), CallID: st.id}); err != nil {
 				return "", err
 			}

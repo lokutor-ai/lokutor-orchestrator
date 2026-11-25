@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lokutor-ai/lokutor-orchestrator/pkg/orchestrator"
 )
@@ -131,5 +133,70 @@ func TestCustomLLMReportsTheEndpointsError(t *testing.T) {
 	_, err := l.StreamComplete(context.Background(), nil, nil, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "bad key") {
 		t.Fatalf("the status and body must reach the log: %v", err)
+	}
+}
+
+// A customer's endpoint answers for as long as it likes; what it says is kept in the worker's memory.
+func TestCustomLLMEndsAnAnswerWithoutEnd(t *testing.T) {
+	for name, write := range map[string]func(w http.ResponseWriter) error{
+		"text": func(w http.ResponseWriter) error {
+			return chunkOf(w, `{"choices":[{"delta":{"content":"`+strings.Repeat("a", 60_000)+`"}}]}`)
+		},
+		"one line": func(w http.ResponseWriter) error { _, err := w.Write([]byte(strings.Repeat("a", 60_000))); return err },
+		"arguments": func(w http.ResponseWriter) error {
+			return chunkOf(w, `{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"x","arguments":"`+strings.Repeat("a", 60_000)+`"}}]}}]}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var sent atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				for sent.Load() < 64<<20 {
+					if write(w) != nil {
+						return
+					}
+					sent.Add(60_000)
+				}
+			}))
+			defer srv.Close()
+			l := NewCustomLLM(srv.URL, "", "m", nil, srv.Client(), false)
+			calls := 0
+			out, err := l.StreamComplete(context.Background(), nil, nil, nil, func(orchestrator.ToolCallEventData) error { calls++; return nil })
+			if err == nil || calls != 0 {
+				t.Fatalf("took it whole: %d bytes, %d calls", len(out), calls)
+			}
+			if n := sent.Load(); n > 24<<20 || len(out) > maxCustomAnswer {
+				t.Errorf("read %d bytes, kept %d", n, len(out))
+			}
+		})
+	}
+}
+
+func chunkOf(w http.ResponseWriter, data string) error {
+	_, err := w.Write([]byte("data: " + data + "\n\n"))
+	return err
+}
+
+// Where a call stands among the others is the endpoint's word: an absurd one must not keep a core busy.
+func TestCustomLLMTakesToolCallsInTheirOrder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sse(w, `{"choices":[{"delta":{"tool_calls":[{"index":4000000000000,"id":"b","function":{"name":"second","arguments":"{}"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"first","arguments":"{}"}}]}}]}`)
+	}))
+	defer srv.Close()
+	l := NewCustomLLM(srv.URL, "", "m", nil, srv.Client(), false)
+	done := make(chan []string, 1)
+	go func() {
+		var got []string
+		_, _ = l.StreamComplete(context.Background(), nil, nil, nil, func(c orchestrator.ToolCallEventData) error { got = append(got, c.Name); return nil })
+		done <- got
+	}()
+	select {
+	case got := <-done:
+		if len(got) != 2 || got[0] != "first" || got[1] != "second" {
+			t.Fatal(got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("counts to the index")
 	}
 }

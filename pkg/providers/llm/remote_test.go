@@ -138,3 +138,45 @@ func TestRemoteLLMIgnoresLateAndUnknownMessages(t *testing.T) {
 	l.Deliver(map[string]interface{}{"type": "llm_chunk", "request_id": "r1", "data": "late"}) // no waiter: dropped, no panic
 	l.Deliver(map[string]interface{}{"type": "nonsense", "request_id": "r9"})
 }
+
+// A client answers for as long as it likes too, and may send faster than the turn reads.
+func TestRemoteLLMEndsAnAnswerWithoutEnd(t *testing.T) {
+	chunk := strings.Repeat("a", 1<<20)
+	for name, kind := range map[string]string{"text": "llm_chunk", "arguments": "llm_tool_call"} {
+		t.Run(name, func(t *testing.T) {
+			l, _ := newFake(false, func(c *fakeClient, req map[string]interface{}) {
+				for i := 0; i < 64; i++ {
+					c.reply(req, kind, map[string]interface{}{"data": chunk, "name": "x", "arguments": chunk})
+					time.Sleep(time.Millisecond)
+				}
+				c.reply(req, "llm_done", nil)
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			out, err := l.StreamComplete(ctx, nil, nil, nil, func(orchestrator.ToolCallEventData) error { return nil })
+			if err == nil || ctx.Err() != nil || len(out) > maxCustomAnswer {
+				t.Fatalf("took it whole: %d bytes, %v", len(out), err)
+			}
+		})
+	}
+	// Nobody reading: what waits is bounded too.
+	release := make(chan struct{})
+	l, c := newFake(false, func(c *fakeClient, req map[string]interface{}) {})
+	go func() {
+		_, _ = l.StreamComplete(context.Background(), nil, nil, func(string) error { <-release; return nil }, nil)
+	}()
+	for len(c.types()) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	l.mu.Lock()
+	ch := l.pending["r1"].ch
+	l.mu.Unlock()
+	req := map[string]interface{}{"request_id": "r1"}
+	for i := 0; i < 64; i++ {
+		c.reply(req, "llm_chunk", map[string]interface{}{"data": chunk})
+	}
+	close(release)
+	if waiting := len(ch); waiting > maxCustomAnswer>>20+1 {
+		t.Fatalf("%d MB waiting for a turn that does not read", waiting)
+	}
+}
