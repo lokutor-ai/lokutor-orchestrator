@@ -288,7 +288,7 @@ func resamplePCM16(in []byte, from, to int) []byte {
 // noteCallerText is new caller words for this turn: a pause's speculative transcript (final false) or an
 // utterance's final transcript. The pick is refreshed in the background when the words have grown enough.
 func (ms *ManagedStream) noteCallerText(text string, final bool) {
-	if !ms.backchannelsOn() || ms.orch.llm == nil {
+	if !ms.backchannelsOn() || ms.orch.GetLLMProvider() == nil {
 		return
 	}
 	text = strings.TrimSpace(text)
@@ -319,7 +319,7 @@ func (ms *ManagedStream) refreshBackchannelPick(text string) {
 	ctx, cancel := context.WithTimeout(BackchannelContext(ms.ctx), backchannelPickTimeout)
 	defer cancel()
 	_, lang := ms.backchannelVoiceLang()
-	raw, err := ms.orch.llm.Complete(ctx, BackchannelPickMessages(lang, ms.lastAgentLine(), text), nil)
+	raw, err := ms.orch.GetLLMProvider().Complete(ctx, BackchannelPickMessages(lang, ms.lastAgentLine(), text), nil)
 	pick := ParseBackchannelPick(raw)
 	ms.bc.mu.Lock()
 	ms.bc.inflight = false
@@ -588,7 +588,7 @@ func (ms *ManagedStream) pcmDuration(pcm []byte) time.Duration {
 // not touched), registers it as the agent's own audio for the echo check and Turno, opens the window in which the
 // microphone is held back, and marks where a reply's audio may start (backchannelEnd). False when closed.
 func (ms *ManagedStream) emitBackchannelAudio(pcm []byte) bool {
-	if ms.isClosed.Load() || len(pcm) == 0 {
+	if ms.isClosed.Load() || len(pcm) == 0 || ms.listeningTo() != nil { // listening: the agent makes no sound
 		return false
 	}
 	now := time.Now()

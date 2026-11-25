@@ -357,6 +357,17 @@ type ManagedStream struct {
 	// (onVADStart), so a later genuine silence still gets its own one nudge.
 	silenceNudgeSent bool
 
+	// silenceCheckIns counts the check-ins of the current idle stretch, and silenceEnded says the host was told that the
+	// last of them went unanswered (Config.SilenceCheckIns, Config.OnSilence). Cleared with silenceNudgeSent.
+	silenceCheckIns int
+	silenceEnded    bool
+
+	// listening is what the host has the stream wait for (Listen, listening.go); listeningGen the generation it was set in.
+	listening    *Listening
+	listeningGen int
+	dirRun       *directorRun  // the turn director's answer about the latest words (turn_director.go)
+	dictRun      *dictationRun // the dictation judge's answer about the latest words (dictation_judge.go)
+
 	// realUtteranceStarted is set the moment the caller's own audio produces a
 	// real utterance worth processing (onVADEnd, before the noise/empty-transcript
 	// checks) and never cleared. It exists because FirstSpeakerBot's own opening
@@ -661,6 +672,14 @@ func NewManagedStream(ctx context.Context, o *Orchestrator, session *Conversatio
 				ms.mu.Lock()
 				defer ms.mu.Unlock()
 				return ms.realUtteranceStarted
+			}
+			if wait := o.config.OpeningWait; wait > 0 && strings.TrimSpace(o.config.RecordingNotice) == "" {
+				// The person who picked up speaks first (opening_wait.go): their words are the first turn, and the opening is
+				// only said when they say nothing.
+				if ms.waitForFirstWords(wait) {
+					return
+				}
+				realTurn = ms.openingPreempted
 			}
 			if realTurn() {
 				return
@@ -1300,6 +1319,7 @@ func resampleTo16k(audio []byte, inputSampleRate int) []byte {
 func (ms *ManagedStream) onVADStart(prevState StreamState) {
 	ms.mu.Lock()
 	ms.silenceNudgeSent = false
+	ms.silenceCheckIns, ms.silenceEnded = 0, false
 	ms.mu.Unlock()
 	ms.specTriggeredForRun = false
 	ms.lastRawEnergyAt = time.Time{}
@@ -1895,7 +1915,11 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 			ms.mu.Unlock()
 		}
 	}()
-	ctx, cancel := context.WithTimeout(ms.ctx, 15*time.Second)
+	timeout := 15 * time.Second
+	if l := ms.listeningTo(); l != nil {
+		timeout += l.Patience // the wait below is part of this turn's time
+	}
+	ctx, cancel := context.WithTimeout(ms.ctx, timeout)
 	defer cancel()
 
 	// Skip STT entirely if a newer utterance already superseded this one.
@@ -2055,11 +2079,18 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	// days to 2026-10-22 on the web, among them a probe's whole "How does Lokutor compare to ElevenLabs?" spoken over
 	// the opening (2.16 s; the recogniser's greedy pass returned "", its beam the sentence). Not when the recogniser
 	// itself says no speech, nor when a false alarm puts the caller back in a reply (the old behaviour: it resumes).
+	// While listening (listening.go) a piece is never dropped for being short: "a", "punto", a lone letter.
+	listen := ms.listeningTo()
+	if listen != nil && strings.TrimSpace(result.Text) == "" && !heldTurn && ms.keepUnheardPiece(audioData, uttEndedAt, seq, result.NoSpeechProb) {
+		ms.resolvePendingBargeInFor(true)
+		return
+	}
 	ms.mu.Lock()
 	unheardSpeech := strings.TrimSpace(result.Text) == "" && result.NoSpeechProb <= 0.7 && duration >= time.Second &&
 		!ms.replyWillResumeLocked(time.Now())
 	ms.mu.Unlock()
-	if !unheardSpeech && ms.isLikelyNoise(result, duration) && !keepHeld("noise") {
+	shortPiece := listen != nil && strings.TrimSpace(result.Text) != "" && result.NoSpeechProb <= 0.7
+	if !unheardSpeech && !shortPiece && ms.isLikelyNoise(result, duration) && !keepHeld("noise") {
 		// False alarm — if this cut off a tentative barge-in, resume the bot
 		// instead of leaving the caller with dead air. Logged with the raw
 		// (possibly gibberish) transcript and the scores that drove the
@@ -2088,6 +2119,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	verdict := recogniserFillerVerdict(result.Text, lang, duration, overAgent)
 	if verdict != fillerNone && result.Text != "" && keepHeld("a filler") {
 		verdict = fillerNone
+	}
+	if listen != nil {
+		verdict = fillerNone // it is transcribed again with the pieces around it
 	}
 	switch verdict {
 	case fillerDiscard:
@@ -2291,6 +2325,10 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	}
 	adaptMs := ms.eouAdaptMs()
 	adaptOnly := false
+	listen, dictated := ms.dictationVerdict(ctx, listen, transcript, ownTranscript)
+	if listen != nil {
+		unfinished, adaptMs = true, 0 // the pieces of a dictation read as finished turns: the wait below is the listening one
+	}
 	if eouDecides && !unfinished && adaptMs > 0 && ms.orch.config.EndOfTurnAdaptAnswerNow {
 		// A caller who has shown in this call that they resume gets a pause even when the heads say finished.
 		unfinished, adaptOnly = true, true
@@ -2371,8 +2409,15 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 		} else if adaptMs > 0 {
 			waitMs += adaptMs
 		}
+		if listen != nil {
+			whole := dictated == DictationWhole || (dictated == "" && listen.done(transcript))
+			waitMs = int(listen.wait(whole).Milliseconds())
+			ms.logger.Info("Listening: waiting for more", "wait_ms", waitMs, "complete", whole, "transcript", ContentForLog(transcript))
+		}
 		eouRule := "waited"
-		if adaptOnly {
+		if listen != nil {
+			eouRule = "listening"
+		} else if adaptOnly {
 			eouRule = "adapt_wait"
 		} else if eouDecides && ms.orch.config.EndOfTurnOpenWaitMs > 0 && waitMs-adaptMs == ms.orch.config.EndOfTurnOpenWaitMs && waitMs-adaptMs > ms.orch.config.EndOfTurnWaitMs {
 			eouRule = "open_wait"
@@ -2494,6 +2539,9 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	}
 	if pendingBarge {
 		minWords := ms.orch.config.MinWordsToInterrupt
+		if listen != nil {
+			minWords = 0 // a single word over the agent's "tell me" is the first piece
+		}
 		effectiveMinWords := minWords
 		turnoAssisted := ms.turno != nil && turnoPeak >= ms.turnoBargeinAssistThr
 		if turnoAssisted {
@@ -2683,7 +2731,12 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.ckCacheMs = time.Since(ms.sttEndTime).Milliseconds()
 	ms.mu.Unlock()
 
-	if !ms.trySpeculativeResponse(ctx, transcript) {
+	if ms.directed(ctx, transcript) {
+		if ms.speculator != nil {
+			ms.speculator.Cancel() // the guess answered from where the call no longer is
+		}
+		ms.runLLMAndTTS(ctx, transcript)
+	} else if !ms.trySpeculativeResponse(ctx, transcript) {
 		ms.runLLMAndTTS(ctx, transcript)
 	}
 
@@ -2772,7 +2825,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 	ms.turnAudioBytes = 0
 	ms.segIdx, ms.segPrevTrailMs = 0, 0
 
-	if sProvider, ok := ms.orch.llm.(StreamingLLMProvider); ok {
+	if sProvider, ok := ms.orch.GetLLMProvider().(StreamingLLMProvider); ok {
 		ms.mu.Lock()
 		round := ms.specToolRound
 		ms.specToolRound = nil
@@ -2791,7 +2844,7 @@ func (ms *ManagedStream) runLLMAndTTS(ctx context.Context, transcript string) {
 		return
 	}
 
-	response, err := ms.orch.llm.Complete(rCtx, ms.llmMessages(transcript), ms.toolsOffered(transcript))
+	response, err := ms.orch.GetLLMProvider().Complete(rCtx, ms.llmMessages(transcript), ms.toolsOffered(transcript))
 	if err != nil {
 		ms.mu.Lock()
 		if ms.state != StateInterrupted {
@@ -2982,6 +3035,7 @@ func (ms *ManagedStream) speakTextWith(ctx context.Context, text string, gen int
 	ms.beginSegmentLocked(gen, text)
 	ms.mu.Unlock()
 
+	ms.endListeningOnSpeech(gen)
 	ms.emitWithGen(BotSpeaking, nil, gen)
 
 	isStreaming := ms.orch.GetProviders()["tts"] == "deepgram"
@@ -3983,8 +4037,17 @@ func (ms *ManagedStream) monitorInactivity() {
 		return
 	}
 
-	ticker := time.NewTicker(2 * time.Second)
+	every := 2 * time.Second
+	if timeout < 6*time.Second { // a check-in asked for after a few seconds is not two seconds late
+		every = max(timeout/4, 50*time.Millisecond)
+	}
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
+	checkIns := 1
+	var onSilence func()
+	if ms.orch != nil {
+		checkIns, onSilence = max(1, ms.orch.config.SilenceCheckIns), ms.orch.config.OnSilence
+	}
 
 	for {
 		select {
@@ -3996,6 +4059,10 @@ func (ms *ManagedStream) monitorInactivity() {
 			speaking := ms.state == StateSpeaking
 			userSpeaking := ms.vadSpeaking
 			lastActivity := ms.lastActivityAt
+			wait := timeout
+			if ms.listening != nil && ms.listening.Silence > 0 {
+				wait = ms.listening.Silence
+			}
 			ms.mu.Unlock()
 
 			if ms.isClosed.Load() {
@@ -4006,7 +4073,7 @@ func (ms *ManagedStream) monitorInactivity() {
 			}
 
 			if !thinking && !speaking && !userSpeaking {
-				if idle := time.Since(lastActivity); idle > timeout {
+				if idle := time.Since(lastActivity); idle > wait {
 					ms.updateActivity()
 					go func() {
 						ms.mu.Lock()
@@ -4032,11 +4099,23 @@ func (ms *ManagedStream) monitorInactivity() {
 						// producing an unbounded loop of freshly-reworded
 						// "are you there" nudges instead of one prompt
 						// followed by real silence.
+						if recoverable && !ms.vadSpeaking && ms.silenceNudgeSent && ms.silenceCheckIns < checkIns {
+							ms.silenceNudgeSent = false // asked to check in more than once
+						}
 						if !recoverable || ms.vadSpeaking || ms.silenceNudgeSent {
+							ended := recoverable && !ms.vadSpeaking && onSilence != nil && !ms.silenceEnded
+							if ended {
+								ms.silenceEnded = true
+							}
 							ms.mu.Unlock()
+							if ended {
+								ms.logger.Info("Silence: the last check-in went unanswered", "check_ins", checkIns, "idle_ms", idle.Milliseconds())
+								onSilence()
+							}
 							return
 						}
 						ms.silenceNudgeSent = true
+						ms.silenceCheckIns++
 						state := ms.state
 						ms.mu.Unlock()
 						// Said out loud, because nothing else in the log marks it: the nudge's reply

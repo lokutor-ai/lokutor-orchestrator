@@ -7,6 +7,9 @@ import (
 )
 
 // knowledgeMessage is the system message a knowledge-base retrieval becomes (SetKnowledgeContext).
+// KnowledgeMessage is how retrieved knowledge is put to the model (for hosts that play a call in text).
+func KnowledgeMessage(contextText string) string { return knowledgeMessage(contextText) }
+
 func knowledgeMessage(contextText string) string {
 	return knowledgeContextPrefix + " Use it if relevant; do not mention that you looked it up.]\n" + contextText
 }

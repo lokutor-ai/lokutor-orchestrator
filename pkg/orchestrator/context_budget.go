@@ -347,7 +347,7 @@ Keep everything already in the record unless the call has changed it. Write each
 
 // summarizeHistory is the Orchestrator's HistorySummarizer: one completion on the call's own model.
 func (o *Orchestrator) summarizeHistory(ctx context.Context, prior string, turns []Message) (string, error) {
-	if o.llm == nil {
+	if o.GetLLMProvider() == nil {
 		return "", fmt.Errorf("no LLM provider")
 	}
 	var b strings.Builder
@@ -383,7 +383,7 @@ func (o *Orchestrator) summarizeHistory(ctx context.Context, prior string, turns
 		}
 	}
 	b.WriteString("\nWrite the updated record.")
-	return o.llm.Complete(ctx, []Message{
+	return o.GetLLMProvider().Complete(ctx, []Message{
 		{Role: "system", Content: historySummaryInstructions},
 		{Role: "user", Content: b.String()},
 	}, nil)

@@ -61,6 +61,10 @@ func silenceCheckInInstruction(timeout time.Duration) string {
 		"there or would like anything else.]", secs)
 }
 
+// SilenceCheckInNote is what the model is told when the caller has said nothing for timeout (for hosts that play a call in
+// text).
+func SilenceCheckInNote(timeout time.Duration) string { return silenceCheckInInstruction(timeout) }
+
 // callerAwaitingReply reports whether the conversation ends on the caller's turn: their last words
 // have no reply in context, because it was abandoned before any of it played or its turn was
 // cancelled. System messages (the pinned call summary, injected knowledge) are not a reply.

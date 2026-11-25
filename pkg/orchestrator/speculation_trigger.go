@@ -56,7 +56,7 @@ func (ms *ManagedStream) updatePauseSpeculationTrigger(chunk []byte) {
 		return
 	}
 	// Off while the hangover seed is on: see the continuous trigger in managed_stream.go.
-	if ms.hangoverSeedActive() {
+	if ms.hangoverSeedActive() || ms.listeningTo() != nil {
 		return
 	}
 

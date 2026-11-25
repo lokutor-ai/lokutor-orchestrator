@@ -313,6 +313,13 @@ type Config struct {
 	DisableEchoVeto bool
 	FirstSpeaker    FirstSpeaker
 	SilenceTimeout  time.Duration
+	// SilenceCheckIns is how many times in a row the agent checks in on a caller who says nothing, SilenceTimeout apart
+	// (0: once). OnSilence, when set, is called once when the last of them has gone unanswered for another SilenceTimeout.
+	SilenceCheckIns int
+	OnSilence       func()
+	// OpeningWait, with FirstSpeakerBot: how long the agent waits for the other person to speak before its opening, on a
+	// call it placed. Their first words are then the first turn and no opening is said (opening_wait.go). 0: it opens at once.
+	OpeningWait time.Duration
 
 	// TurnoEarlyEndThreshold, when > 0, lets Turno's horizon head cut the VAD
 	// hangover short. The hangover (~448ms) exists to be certain a pause is

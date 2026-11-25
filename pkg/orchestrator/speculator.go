@@ -276,7 +276,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 			onPartial(partial)
 		}
 
-		if orch.llm == nil {
+		if orch.GetLLMProvider() == nil {
 			// STT-only speculation (SpeculativeLLM disabled) — still useful
 			// to callers that only want the early partial transcript.
 			finish(&SpeculativeResult{PartialTranscript: partial}, partial, "no_response")
@@ -285,7 +285,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 
 		messages := append(append([]Message{}, historySnapshot...), Message{Role: "user", Content: partial})
 		capCtx, capture := WithToolCallCapture(sCtx)
-		response, err := orch.llm.Complete(capCtx, messages, tools)
+		response, err := orch.GetLLMProvider().Complete(capCtx, messages, tools)
 		calls := capture.Calls()
 		if err != nil || sCtx.Err() != nil || (strings.TrimSpace(response) == "" && len(calls) == 0) {
 			// STT succeeded but generation didn't — still record the
@@ -347,7 +347,7 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 	tools []Tool,
 ) {
 	transcript = strings.TrimSpace(transcript)
-	if orch == nil || orch.llm == nil || len(transcript) < 2 {
+	if orch == nil || orch.GetLLMProvider() == nil || len(transcript) < 2 {
 		return
 	}
 
@@ -378,7 +378,7 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
 	sCtx = WithTokenUsage(WithTokenCategory(sCtx, TokensSpeculative), tokens)
 	se.cancel = sCancel
-	streamer, streams := orch.llm.(StreamingLLMProvider)
+	streamer, streams := orch.GetLLMProvider().(StreamingLLMProvider)
 	streams = streams && speculativeStreamEnabled()
 	var tee *specStream
 	if streams {
@@ -456,7 +456,7 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 			tee.end(err)
 		} else {
 			capCtx, capture := WithToolCallCapture(sCtx)
-			response, err = orch.llm.Complete(capCtx, messages, tools)
+			response, err = orch.GetLLMProvider().Complete(capCtx, messages, tools)
 			calls = capture.Calls()
 		}
 		if err != nil || sCtx.Err() != nil || (strings.TrimSpace(response) == "" && len(calls) == 0) {

@@ -42,6 +42,8 @@ type OpenRouterLLM struct {
 	reasoning string
 	// toolHistory is where a gpt-oss model is sent earlier tool exchanges; see forGptOss.
 	toolHistory GptOssToolHistory
+	// capTokens caps a reply whatever the reasoning (SetMaxTokens); 0 = none.
+	capTokens int
 	// defaultMaxTokens caps a reply when the caller set no cap (SetDefaultMaxTokens); 0 = none.
 	defaultMaxTokens int
 }
@@ -52,6 +54,13 @@ type OpenRouterLLM struct {
 // estimate passes the balance; the talker's replies are short (2026-11-23: 410 completion tokens the
 // longest turn in 14 days, 173 at p99).
 func (l *OpenRouterLLM) SetDefaultMaxTokens(n int) { l.defaultMaxTokens = n }
+
+// SetMaxTokens caps every reply, thinking included, for a model that cannot have its thinking switched off. Without a
+// cap OpenRouter holds the request's whole possible completion against the account's balance while it runs (64,000
+// tokens of Claude Sonnet 5.5 hold $0.64), and refuses every request on the account once the holds pass the balance.
+// It must leave room for the thinking: 4,096 for a spoken reply at "minimal" (1,333 thinking tokens over 24 replies,
+// 2026-11-25).
+func (l *OpenRouterLLM) SetMaxTokens(n int) { l.capTokens = n }
 
 func NewOpenRouterLLM(apiKey, model string, providers []string, reasoning string) *OpenRouterLLM {
 	if model == "" {
@@ -90,6 +99,9 @@ func (l *OpenRouterLLM) payload(messages []orchestrator.Message, tools []orchest
 	if isAnthropicModel(l.model) {
 		withPromptCache(p)
 	}
+	if isGoogleModel(l.model) {
+		p["messages"] = withThoughtSignatures(messages)
+	}
 	switch r := strings.ToLower(strings.TrimSpace(l.reasoning)); r {
 	case "":
 	case "none", "off":
@@ -104,9 +116,57 @@ func (l *OpenRouterLLM) payload(messages []orchestrator.Message, tools []orchest
 	return p
 }
 
+// isGoogleModel reports a Gemini model ("google/gemini-3.8-flash").
+func isGoogleModel(model string) bool { return strings.HasPrefix(strings.ToLower(model), "google/") }
+
+// withThoughtSignatures is messages with a thought signature on every message that called tools. Gemini 3 and
+// later refuse a history whose tool calls carry none ("Request contains an invalid argument", every turn after a
+// tool call; 2026-11-25). The signature is the model's own, encrypted, and the conversation's history keeps none of
+// it, nor can it when the call was made by another model earlier on the same call (a flow's step before this one).
+// Google documents this value for both cases: the validator is skipped. Measured from a worker pod that day: 12 of
+// 12 turns right after it, as with the real ones (lokutor_tts finance/measurements/agent_models_2026-11-25).
+func withThoughtSignatures(messages []orchestrator.Message) []interface{} {
+	out := make([]interface{}, 0, len(messages))
+	for _, m := range messages {
+		id := firstToolCallID(m)
+		if m.Role != "assistant" || id == "" {
+			out = append(out, m)
+			continue
+		}
+		out = append(out, map[string]interface{}{"role": m.Role, "content": m.Content, "tool_calls": m.ToolCalls,
+			"reasoning_details": []interface{}{map[string]interface{}{"type": "reasoning.encrypted",
+				"data": "skip_thought_signature_validator", "id": id, "format": "google-gemini-v1", "index": 0}}})
+	}
+	return out
+}
+
+// firstToolCallID is the id of the first tool call a message made, or "".
+func firstToolCallID(m orchestrator.Message) string {
+	if m.ToolCalls == nil {
+		return ""
+	}
+	b, err := json.Marshal(m.ToolCalls)
+	if err != nil {
+		return ""
+	}
+	var calls []struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(b, &calls) != nil || len(calls) == 0 {
+		return ""
+	}
+	return calls[0].ID
+}
+
 // withMaxTokens adds the cap a caller set with orchestrator.WithMaxTokens, only when this model does not reason
 // first (reasoning explicitly off, as the natural talker runs): a model that may reason would spend the cap thinking.
 func (l *OpenRouterLLM) withMaxTokens(ctx context.Context, p map[string]interface{}) map[string]interface{} {
+	if l.capTokens > 0 {
+		p["max_tokens"] = l.capTokens
+	}
+	if t, ok := orchestrator.TemperatureFrom(ctx); ok {
+		p["temperature"] = t
+	}
 	n := orchestrator.MaxTokensFrom(ctx)
 	if n <= 0 {
 		n = l.defaultMaxTokens
@@ -121,36 +181,52 @@ func (l *OpenRouterLLM) withMaxTokens(ctx context.Context, p map[string]interfac
 	return p
 }
 
-func (l *OpenRouterLLM) do(ctx context.Context, payload map[string]interface{}) (*http.Response, error) {
+// request is the payload of one request, as its caller asked for it.
+func (l *OpenRouterLLM) request(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, stream bool) map[string]interface{} {
+	p := l.payload(messages, tools, stream)
+	if isAnthropicModel(l.model) && orchestrator.SentOnce(ctx) {
+		p["messages"] = forGptOss(l.model, messages, l.toolHistory)
+		delete(p, "cache_control")
+	}
+	return l.withMaxTokens(ctx, p)
+}
+
+func (l *OpenRouterLLM) do(ctx context.Context, payload map[string]interface{}) (*http.Response, *sentRequest, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", l.url, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 	req.Header.Set("X-Title", "Lokutor")
-	resp, err := getSharedLLMClient().Do(req)
+	sent := startRequest(ctx, l.model, body)
+	resp, err := getSharedLLMClient().Do(sent.trace(req))
 	if err != nil {
-		return nil, err
+		sent.end()
+		return nil, nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		sent.failed = true
+		sent.end()
 		defer resp.Body.Close()
 		var errResp interface{}
 		json.NewDecoder(resp.Body).Decode(&errResp)
-		return nil, fmt.Errorf("openrouter api error (status %d): %v", resp.StatusCode, errResp)
+		return nil, nil, fmt.Errorf("openrouter api error (status %d): %v", resp.StatusCode, errResp)
 	}
-	return resp, nil
+	sent.answered = true
+	return resp, sent, nil
 }
 
 func (l *OpenRouterLLM) Complete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool) (string, error) {
-	resp, err := l.do(ctx, l.withMaxTokens(ctx, l.payload(messages, tools, false)))
+	resp, sent, err := l.do(ctx, l.request(ctx, messages, tools, false))
 	if err != nil {
 		return "", err
 	}
+	defer sent.end()
 	defer resp.Body.Close()
 	var result struct {
 		Choices []struct {
@@ -167,10 +243,11 @@ func (l *OpenRouterLLM) Complete(ctx context.Context, messages []orchestrator.Me
 		return "", err
 	}
 	if result.Error != nil {
+		sent.failed = true
 		return "", fmt.Errorf("openrouter api error: %v", result.Error)
 	}
 	orchestrator.TokenUsageFrom(ctx).SetUpstream(result.Provider)
-	recordUsage(ctx, result.Usage)
+	sent.usage(result.Usage)
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no response from openrouter")
 	}
@@ -179,7 +256,7 @@ func (l *OpenRouterLLM) Complete(ctx context.Context, messages []orchestrator.Me
 }
 
 func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestrator.Message, tools []orchestrator.Tool, onChunk func(string) error, onToolCall func(orchestrator.ToolCallEventData) error) (string, error) {
-	resp, err := l.do(ctx, l.withMaxTokens(ctx, l.payload(messages, tools, true)))
+	resp, sent, err := l.do(ctx, l.request(ctx, messages, tools, true))
 	if err != nil {
 		return "", err
 	}
@@ -188,6 +265,7 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 	defer func() {
 		if !drained {
 			resp.Body.Close()
+			sent.end()
 		}
 	}()
 
@@ -208,6 +286,7 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 			if err == io.EOF {
 				break
 			}
+			sent.broke()
 			return "", err
 		}
 		line = strings.TrimSpace(line)
@@ -238,7 +317,7 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 				} `json:"delta"`
 			} `json:"choices"`
 		}
-		recordUsageFromChunk(ctx, []byte(data))
+		sent.chunk([]byte(data))
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
 		}
@@ -249,6 +328,7 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 		// A provider failing after OpenRouter has answered 200 arrives as an error chunk. Before any
 		// output it is an ordinary failure, so the chain moves on; after output it ends the turn.
 		if chunk.Error != nil {
+			sent.failed = true
 			return fullContent.String(), fmt.Errorf("openrouter stream error: %v", chunk.Error)
 		}
 		if len(chunk.Choices) == 0 {
@@ -259,13 +339,14 @@ func (l *OpenRouterLLM) StreamComplete(ctx context.Context, messages []orchestra
 			fullContent.WriteString(text)
 			if onChunk != nil {
 				if err := onChunk(text); err != nil {
+					sent.stopped = true
 					return "", err
 				}
 			}
 		}
 		if turn.Ended() {
 			drained = true
-			drainAfterCut(ctx, reader, resp.Body, turn.Cut())
+			drainAfterCut(ctx, reader, resp.Body, turn.Cut(), sent)
 			break
 		}
 		for _, tc := range delta.ToolCalls {

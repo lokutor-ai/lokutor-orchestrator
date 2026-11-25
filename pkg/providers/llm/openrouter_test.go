@@ -244,3 +244,32 @@ func TestOpenRouterRecordsCacheAndUpstream(t *testing.T) {
 		t.Fatalf("meter = %+v", got)
 	}
 }
+
+// Gemini refuses a history whose tool calls carry no thought signature; other models are sent what they always were.
+func TestThoughtSignaturesOnGeminiToolCallsOnly(t *testing.T) {
+	msgs := []orchestrator.Message{{Role: "system", Content: "s"}, {Role: "user", Content: "u"},
+		{Role: "assistant", Content: "vale", ToolCalls: []interface{}{map[string]interface{}{"id": "call_7", "type": "function"}}},
+		{Role: "tool", ToolCallID: "call_7", Content: "{}"}}
+	body := func(model string) string {
+		b, _ := json.Marshal(NewOpenRouterLLM("k", model, []string{"h"}, "minimal").payload(msgs, nil, false))
+		return string(b)
+	}
+	if g := body("google/gemini-3.8-flash"); strings.Count(g, "skip_thought_signature_validator") != 1 || !strings.Contains(g, `"id":"call_7","index":0`) || !strings.Contains(g, `"content":"vale"`) {
+		t.Errorf("gemini: %s", g)
+	}
+	if o := body("openai/gpt-6.1-terra"); strings.Contains(o, "reasoning_details") {
+		t.Errorf("another model was sent a signature: %s", o)
+	}
+}
+
+func TestMaxTokensCapsAThinkingModel(t *testing.T) {
+	l := NewOpenRouterLLM("k", "anthropic/claude-sonnet-5.5", nil, "minimal")
+	l.SetDefaultMaxTokens(2048) // not applied while it thinks
+	if p := l.withMaxTokens(context.Background(), map[string]interface{}{}); p["max_tokens"] != nil {
+		t.Fatalf("%v", p)
+	}
+	l.SetMaxTokens(4096)
+	if p := l.withMaxTokens(context.Background(), map[string]interface{}{}); p["max_tokens"] != 4096 {
+		t.Fatalf("%v", p)
+	}
+}

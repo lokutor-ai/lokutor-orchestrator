@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"time"
 )
 
 // SessionMeter adds up every language-model token a provider reports on behalf of one conversation,
@@ -16,11 +17,16 @@ import (
 // call site that wants its tokens shown under their own heading sets a category on its context
 // (WithTokenCategory); the rest count as "reply".
 //
-// A request whose provider never reported usage (a stream cancelled before its usage chunk, such as
-// a hedge's loser or a superseded speculation) is not counted: it is absorbed, not estimated.
+// A request cancelled before its provider reported (a reply the caller talked over, a speculation thrown
+// away) was still read and partly written by the model, so it is counted as an estimate (AddEstimate,
+// providers/llm sentRequest): its prompt at the conversation's own tokens per character, its reply from
+// the text that arrived. What the platform races on its own account, a hedge's loser, is not counted.
 type SessionMeter struct {
 	mu    sync.Mutex
 	byCat map[string]*TokenCount
+	ratio map[string]float64 // prompt tokens per character of request, by model: the last one reported
+	open  int                // requests sent whose counts have not arrived (Begin)
+	idle  chan struct{}      // closed when open falls to 0, made by Settle
 }
 
 // TokenCount is the tokens of one category.
@@ -34,6 +40,9 @@ type TokenCount struct {
 	CachedPrompt int64   `json:"cached_prompt,omitempty"`
 	CacheWrite   int64   `json:"cache_write,omitempty"`
 	CostUSD      float64 `json:"cost_usd,omitempty"`
+	// Of Prompt and Completion, the tokens estimated for requests no provider reported (AddEstimate).
+	EstPrompt     int64 `json:"est_prompt,omitempty"`
+	EstCompletion int64 `json:"est_completion,omitempty"`
 }
 
 // Token categories. "reply" is the default; the others are set by the call sites that make them.
@@ -66,6 +75,93 @@ func (m *SessionMeter) Add(category string, prompt, completion int) {
 	c.Prompt += int64(max(prompt, 0))
 	c.Completion += int64(max(completion, 0))
 	c.Requests++
+}
+
+// AddEstimate records a request no provider reported, at our own count of it. The tokens are in Prompt and
+// Completion like any other, and in the Est counts so a bill can say which were estimated.
+func (m *SessionMeter) AddEstimate(category string, prompt, completion int) {
+	if m == nil || (prompt <= 0 && completion <= 0) {
+		return
+	}
+	if category == "" {
+		category = TokensReply
+	}
+	m.Add(category, prompt, completion)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.byCat[category]
+	c.EstPrompt += int64(max(prompt, 0))
+	c.EstCompletion += int64(max(completion, 0))
+}
+
+// LearnRatio remembers how many prompt tokens the model counted for a request of chars characters. A request
+// too small to say anything (a hello) is ignored.
+func (m *SessionMeter) LearnRatio(model string, tokens, chars int) {
+	if m == nil || tokens < 50 || chars < 200 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ratio == nil {
+		m.ratio = map[string]float64{}
+	}
+	m.ratio[model] = float64(tokens) / float64(chars)
+}
+
+// Ratio is the tokens per character of the last request of the model that was reported, or 0.
+func (m *SessionMeter) Ratio(model string) float64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ratio[model]
+}
+
+// Begin counts a request as sent until the returned func is called, with its counts recorded.
+func (m *SessionMeter) Begin() (done func()) {
+	if m == nil {
+		return func() {}
+	}
+	m.mu.Lock()
+	m.open++
+	m.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			m.open--
+			if m.open == 0 && m.idle != nil {
+				close(m.idle)
+				m.idle = nil
+			}
+		})
+	}
+}
+
+// Settle waits until no request is open, or for wait. A bill drawn as a call ends reads the meter after it:
+// the requests the hang-up cancelled are counted a moment later.
+func (m *SessionMeter) Settle(wait time.Duration) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.open == 0 {
+		m.mu.Unlock()
+		return
+	}
+	if m.idle == nil {
+		m.idle = make(chan struct{})
+	}
+	idle := m.idle
+	m.mu.Unlock()
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-idle:
+	case <-t.C:
+	}
 }
 
 // AddCache records the cache side and cost of one provider report, under the category Add used. It

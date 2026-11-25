@@ -65,18 +65,22 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
-	resp, err := getSharedLLMClient().Do(req)
+	sent := startRequest(ctx, l.model, body)
+	defer sent.end()
+	resp, err := getSharedLLMClient().Do(sent.trace(req))
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		sent.failed = true
 		var errResp interface{}
 		json.NewDecoder(resp.Body).Decode(&errResp)
 		return "", fmt.Errorf("groq api error (status %d): %v", resp.StatusCode, errResp)
 	}
 
+	sent.answered = true
 	var result struct {
 		Choices []struct {
 			Message struct {
@@ -89,7 +93,7 @@ func (l *GroqLLM) Complete(ctx context.Context, messages []orchestrator.Message,
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", err
 	}
-	recordUsage(ctx, result.Usage)
+	sent.usage(result.Usage)
 
 	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no response from groq")
@@ -126,8 +130,10 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+l.apiKey)
 
-	resp, err := getSharedLLMClient().Do(req)
+	sent := startRequest(ctx, l.model, body)
+	resp, err := getSharedLLMClient().Do(sent.trace(req))
 	if err != nil {
+		sent.end()
 		return "", err
 	}
 	// Closed here unless a cut reply hands the rest of the stream to drainAfterCut.
@@ -135,15 +141,18 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 	defer func() {
 		if !drained {
 			resp.Body.Close()
+			sent.end()
 		}
 	}()
 
 	if resp.StatusCode != http.StatusOK {
+		sent.failed = true
 		var errResp interface{}
 		json.NewDecoder(resp.Body).Decode(&errResp)
 		return "", fmt.Errorf("groq api error (status %d): %v", resp.StatusCode, errResp)
 	}
 
+	sent.answered = true
 	reader := bufio.NewReader(resp.Body)
 	var fullContent strings.Builder
 	turn := oneTurnFor(ctx, l.model)
@@ -161,6 +170,7 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 			if err == io.EOF {
 				break
 			}
+			sent.broke()
 			return "", err
 		}
 
@@ -193,7 +203,7 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 
 		// Before the choices check, not after: the chunk carrying `usage` has an EMPTY
 		// choices array, so the early return below is exactly what hid it.
-		recordUsageFromChunk(ctx, []byte(data))
+		sent.chunk([]byte(data))
 
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
@@ -208,13 +218,14 @@ func (l *GroqLLM) StreamComplete(ctx context.Context, messages []orchestrator.Me
 			fullContent.WriteString(text)
 			if onChunk != nil {
 				if err := onChunk(text); err != nil {
+					sent.stopped = true
 					return "", err
 				}
 			}
 		}
 		if turn.Ended() {
 			drained = true
-			drainAfterCut(ctx, reader, resp.Body, turn.Cut())
+			drainAfterCut(ctx, reader, resp.Body, turn.Cut(), sent)
 			break
 		}
 

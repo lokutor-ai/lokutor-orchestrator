@@ -260,7 +260,11 @@ var errUnspeakableReply = errors.New("reply is not speech")
 const maxChainedToolRounds = 4
 
 func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen int, userTranscript string, calls []ToolCallEventData) {
-	if fillerPhrase := ms.toolFiller(); fillerPhrase != "" {
+	allQuiet := len(calls) > 0
+	for _, c := range calls {
+		allQuiet = allQuiet && ms.orch.isQuietTool(c.Name)
+	}
+	if fillerPhrase := ms.toolFiller(); fillerPhrase != "" && !allQuiet {
 		go func(t string) {
 			sCtx, sCancel := context.WithCancel(ctx)
 			defer sCancel()
@@ -303,6 +307,11 @@ func (ms *ManagedStream) handleNonStreamingToolCalls(ctx context.Context, gen in
 			ms.emit(ToolResult, map[string]interface{}{"tool_call": r.TC, "result": r.Result})
 		}
 		ms.recordToolExchange("", results)
+		if ms.orch.endsSilently(results) {
+			ms.logger.Info("Turn ends with nothing said: the agent keeps listening", "gen", gen)
+			setIdle()
+			return
+		}
 
 		final, err := ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), ms.session.GetTools())
 		if err != nil {
@@ -454,7 +463,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		case <-firstToken:
 			return
 		case <-time.After(3 * time.Second):
-			if fillerSpoken.CompareAndSwap(false, true) {
+			if ms.listeningTo() == nil && fillerSpoken.CompareAndSwap(false, true) {
 				// In the call's language: this was English on every call, so a Spanish caller
 				// waiting on a slow model heard "Hmm, let me think about that for a second."
 				ms.speakText(ctx, thinkingFillerForLang(ms.session.GetCurrentLanguage()), gen)
@@ -487,6 +496,14 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 	// (providers/llm gptOssCallsWithoutWords): gpt-oss garbles the reply after a tool call when the
 	// message carrying the calls has words (2026-10-15).
 	var saidBeforeCalls strings.Builder
+	// heldSentence is a finished sentence not handed to the voice yet, in a conversation with steps (SetMoveTools).
+	holds, heldSentence := ms.orch.hasMoveTools(), ""
+	speakHeld := func() {
+		if heldSentence != "" {
+			ttsQueue <- heldSentence
+			heldSentence = ""
+		}
+	}
 	tryCtx := ctx
 	for attempt := 1; ; attempt++ {
 		unspeakable = ""
@@ -494,6 +511,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		saidBeforeCalls.Reset()
 		_, err = provider.StreamComplete(tryCtx, messages, ms.toolsOffered(userTranscript),
 			func(chunk string) error {
+				if strings.TrimSpace(chunk) != "" {
+					speakHeld()
+				}
 				fullText.WriteString(chunk)
 				pendingSentence.WriteString(chunk)
 
@@ -539,7 +559,11 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 						return errUnspeakableReply
 					}
 					if seg != "" {
-						ttsQueue <- seg
+						if holds {
+							heldSentence = seg
+						} else {
+							ttsQueue <- seg
+						}
 						spokenThisTry = append(spokenThisTry, seg)
 						firstChunkDone = true
 					}
@@ -561,6 +585,23 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				hasToolCalls = true
 				ms.emit(ToolCall, tc)
 
+				if holds && ms.orch.isMoveTool(tc.Name) {
+					// The next step speaks: what is not being said yet is left unsaid, and out of the conversation.
+					tail := strings.TrimSpace(pendingSentence.String())
+					pendingSentence.Reset()
+					unsaid := strings.TrimSpace(heldSentence + " " + tail)
+					if unsaid != "" {
+						ms.logger.Info("Words written with a move to another step left unsaid", "gen", gen, "text", ContentForLog(unsaid))
+						kept := strings.TrimSpace(fullText.String())
+						kept = strings.TrimSpace(strings.TrimSuffix(kept, tail))
+						kept = strings.TrimSpace(strings.TrimSuffix(kept, heldSentence))
+						fullText.Reset()
+						fullText.WriteString(kept)
+						heldSentence = ""
+					}
+				}
+				speakHeld()
+
 				if strings.TrimSpace(fullText.String()) != "" {
 					// What the model said before the call is the acknowledgment. Its finished sentences are in the
 					// TTS queue already; only the unfinished tail is left to say, through the same queue so it
@@ -573,7 +614,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					}
 					saidBeforeCalls.WriteString(" " + strings.TrimSpace(fullText.String()))
 					fullText.Reset()
-				} else if firstCall {
+				} else if firstCall && !ms.orch.isQuietTool(tc.Name) {
 					// No pending text — speak a filler so there's no dead air while the tool
 					// executes (Vapi/Pipecat pattern: platform speaks the acknowledgment, not
 					// the LLM). Once per round: parallel calls in one round used to each speak
@@ -633,6 +674,7 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 
 	toolWg.Wait()
 
+	speakHeld()
 	flushSentence()
 	close(ttsQueue)
 	ttsWg.Wait()
@@ -682,7 +724,18 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 		}
 		said := strings.TrimSpace(alreadySaid + " " + saidBeforeCalls.String() + " " + response)
 		ms.recordToolExchange(said, toolResults)
-		if said != "" && ms.orch.allFinalTools(toolResults) {
+		silent := ms.orch.endsSilently(toolResults)
+		if silent && said == "" {
+			ms.logger.Info("Turn ends with nothing said: the agent keeps listening", "gen", gen, "tools", len(toolResults))
+			ms.mu.Lock()
+			if ms.state != StateInterrupted {
+				ms.state = StateIdle
+			}
+			ms.updateActivity()
+			ms.mu.Unlock()
+			return
+		}
+		if said != "" && (silent || ms.orch.allFinalTools(toolResults)) {
 			// The model said its words with a call that ends the turn (a goodbye with end_call): they were
 			// spoken and are recorded with the call, so the turn is over (Orchestrator.SetFinalTools).
 			ms.emitBotResponseWithGen(said, gen)
@@ -756,15 +809,19 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 			// of the call failed too and the caller heard nothing for the rest of it — and never asked
 			// again, so a chained call was answered "Got it." (Full-Duplex-Bench v3, 2026-09-29).
 			tools := ms.session.GetTools()
-			sProv, streaming := ms.orch.llm.(StreamingLLMProvider)
 			// chain asks the model, makes the calls it asks for and asks again, until it answers in
 			// words or maxChainedToolRounds runs out. It is run a second time when the first reply
 			// is a tool call written out as text (below), so the second try can make the call too:
 			// it used to be Complete, which reads the reply's text and drops any tool call, so a
 			// retry that did what was asked came back empty and the turn was abandoned, 4 times in 5
 			// on 2026-10-05.
+			endedSilently := false
 			chain := func(ctx context.Context) (responseText string, made int, err error) {
 				for round := 1; ; round++ {
+					// Read again each round: a tool of the round before may have moved the conversation to
+					// a step with its own model, tools and prompt (lokutor_tts pkg/api/agent_flow.go).
+					tools = ms.session.GetTools()
+					sProv, streaming := ms.orch.GetLLMProvider().(StreamingLLMProvider)
 					if !streaming || len(tools) == 0 {
 						responseText, err = ms.orch.GetLLMProvider().Complete(ctx, ms.session.GetContextCopy(), tools)
 						return responseText, made, err
@@ -792,6 +849,9 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 					made += len(calls)
 					if err != nil {
 						return "", made, err
+					}
+					if endedSilently = ms.orch.endsSilently(calls); endedSilently {
+						return responseText, made, nil
 					}
 					if len(calls) == 0 || round >= maxChainedToolRounds {
 						return responseText, made, nil
@@ -848,6 +908,16 @@ func (ms *ManagedStream) runStreamingLLM(ctx context.Context, provider Streaming
 				text = strings.TrimSpace(retry)
 			}
 			ms.logRunOns(gen, turnTokens)
+			if text == "" && endedSilently {
+				ms.logger.Info("Turn ends with nothing said: the agent keeps listening", "gen", gen)
+				ms.mu.Lock()
+				if ms.state != StateInterrupted {
+					ms.state = StateIdle
+				}
+				ms.updateActivity()
+				ms.mu.Unlock()
+				return
+			}
 			if text == "" {
 				// In the call's language: this was "Got it." on every call, Spanish ones included.
 				text = gotItForLang(ms.session.GetCurrentLanguage())

@@ -96,6 +96,15 @@ func (f *chainFailures) err() error {
 type ChainLLM struct {
 	providers []orchestrator.LLMProvider
 	name      string
+	noHedge   bool
+}
+
+// WithoutHedge makes the chain move to the next provider only when one fails, never because its first token is
+// slow. For a model the customer chose: raced against a faster one past the hedge delay, a slower model would
+// lose most turns to a model they did not ask for.
+func (c *ChainLLM) WithoutHedge() *ChainLLM {
+	c.noHedge = true
+	return c
 }
 
 // NewChainLLM builds a ChainLLM tried in the given order. name is used for
@@ -144,7 +153,7 @@ func (c *ChainLLM) StreamComplete(
 	onChunk func(string) error,
 	onToolCall func(orchestrator.ToolCallEventData) error,
 ) (string, error) {
-	if hedge := llmHedgeDelay(); hedge > 0 && len(c.providers) >= 2 {
+	if hedge := llmHedgeDelay(); hedge > 0 && !c.noHedge && len(c.providers) >= 2 {
 		if _, ok := c.providers[1].(orchestrator.StreamingLLMProvider); ok {
 			return c.streamHedged(ctx, messages, tools, onChunk, onToolCall, hedge)
 		}
@@ -212,6 +221,7 @@ func (c *ChainLLM) streamHedged(
 	var (
 		mu      sync.Mutex
 		winner  = -1
+		payer   = -1 // the attempt a reply cancelled before any answered is counted as
 		cancels = make([]context.CancelFunc, len(c.providers))
 	)
 	results := make(chan result, len(c.providers))
@@ -232,8 +242,21 @@ func (c *ChainLLM) streamHedged(
 		}
 		return winner == i
 	}
+	// Two attempts race for the platform's sake: of the two, a cancelled reply is counted once, as the one that won or,
+	// when none had, as the first to wind down.
+	billed := func(i int) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if winner != -1 {
+			return winner == i
+		}
+		if payer == -1 {
+			payer = i
+		}
+		return payer == i
+	}
 	start := func(i int) {
-		actx, cancel := context.WithCancel(ctx)
+		actx, cancel := context.WithCancel(withCancelBilled(ctx, func() bool { return billed(i) }))
 		mu.Lock()
 		cancels[i] = cancel
 		mu.Unlock()

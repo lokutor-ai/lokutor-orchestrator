@@ -26,6 +26,15 @@ type Orchestrator struct {
 	toolHandlers map[string]ToolHandler
 	// finalTools end the agent's turn when called with words (SetFinalTools).
 	finalTools map[string]bool
+	director   TurnDirector
+	// dictation tells a piece of something dictated from any other turn (SetDictationJudge).
+	dictation DictationJudge
+	// moveTools move the conversation to another step (SetMoveTools).
+	moveTools map[string]bool
+	// silentTools end the agent's turn with nothing said (SetSilentTools, listening.go).
+	silentTools map[string]bool
+	// quietTools run without a filler (SetQuietTools).
+	quietTools map[string]bool
 }
 
 // New creates an orchestrator with STT, LLM, TTS providers and config.
@@ -63,7 +72,11 @@ func newOrchestrator(stt STTProvider, llm LLMProvider, tts TTSProvider, vad VADP
 	}
 }
 
+// GetLLMProvider is the provider of the next request. It can change during a call (SetLLMProvider: a
+// conversation flow moving to a step with its own model), so every request reads it here.
 func (o *Orchestrator) GetLLMProvider() LLMProvider {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	return o.llm
 }
 
@@ -71,7 +84,7 @@ func (o *Orchestrator) GetLLMProvider() LLMProvider {
 // Calls fold on their own (AddMessageRaw); this is for callers that want it done synchronously.
 // Nothing is removed unless it is in the summary.
 func (o *Orchestrator) SummarizeContext(ctx context.Context, session *ConversationSession) error {
-	if o.llm == nil {
+	if o.GetLLMProvider() == nil {
 		return fmt.Errorf("no LLM provider")
 	}
 	session.mu.Lock()
@@ -140,6 +153,23 @@ func (o *Orchestrator) SetFinalTools(names ...string) {
 	}
 }
 
+// SetQuietTools names the tools that answer at once and change nothing the caller should hear about (moving
+// to the next step of a conversation flow): no filler ("let me check that") is spoken while they run.
+func (o *Orchestrator) SetQuietTools(names ...string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.quietTools = map[string]bool{}
+	for _, n := range names {
+		o.quietTools[n] = true
+	}
+}
+
+func (o *Orchestrator) isQuietTool(name string) bool {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.quietTools[name] || o.silentTools[name]
+}
+
 // allFinalTools reports whether every call in calls is to a final tool (and there is at least one).
 func (o *Orchestrator) allFinalTools(calls []toolExchange) bool {
 	o.mu.RLock()
@@ -148,11 +178,22 @@ func (o *Orchestrator) allFinalTools(calls []toolExchange) bool {
 		return false
 	}
 	for _, c := range calls {
-		if !o.finalTools[c.TC.Name] {
+		// A result may say there is more to do ({"continue": true}): the model is asked again, as for any tool.
+		if !o.finalTools[c.TC.Name] || resultContinues(c.Result) {
 			return false
 		}
 	}
 	return true
+}
+
+func resultContinues(result string) bool {
+	if !strings.Contains(result, "continue") {
+		return false
+	}
+	var v struct {
+		Continue bool `json:"continue"`
+	}
+	return json.Unmarshal([]byte(result), &v) == nil && v.Continue
 }
 
 // SetRAGProvider registers an optional RAG provider for turn-time knowledge
@@ -259,7 +300,7 @@ func (o *Orchestrator) TranscribeRaw(ctx context.Context, audioData []byte, lang
 }
 
 func (o *Orchestrator) GenerateResponse(ctx context.Context, session *ConversationSession) (string, error) {
-	return o.llm.Complete(ctx, session.GetContextCopy(), session.GetTools())
+	return o.GetLLMProvider().Complete(ctx, session.GetContextCopy(), session.GetTools())
 }
 
 func (o *Orchestrator) Synthesize(ctx context.Context, text string, voice Voice, lang Language) ([]byte, error) {
@@ -369,7 +410,7 @@ func (o *Orchestrator) GetConfig() Config {
 func (o *Orchestrator) GetProviders() map[string]string {
 	return map[string]string{
 		"stt": o.stt.Name(),
-		"llm": o.llm.Name(),
+		"llm": o.GetLLMProvider().Name(),
 		"tts": o.tts.Name(),
 	}
 }

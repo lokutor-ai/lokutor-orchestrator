@@ -27,10 +27,11 @@ const drainTimeout = 15 * time.Second
 // drainAfterCut reads the rest of a stream the reply was cut from, in the background, so the turn
 // is not held until the model stops talking to itself: the tokens are still counted, and what was
 // dropped is kept for the log. The body is closed when the stream ends, ctx ends, or at drainTimeout.
-func drainAfterCut(ctx context.Context, reader *bufio.Reader, body io.Closer, cut *orchestrator.RunOnCut) {
+func drainAfterCut(ctx context.Context, reader *bufio.Reader, body io.Closer, cut *orchestrator.RunOnCut, sent *sentRequest) {
 	done := orchestrator.TokenUsageFrom(ctx).DrainStarted()
 	go func() {
 		defer done()
+		defer sent.end()
 		timer := time.AfterFunc(drainTimeout, func() { body.Close() })
 		defer timer.Stop()
 		defer body.Close()
@@ -47,7 +48,7 @@ func drainAfterCut(ctx context.Context, reader *bufio.Reader, body io.Closer, cu
 			if data == "[DONE]" {
 				return
 			}
-			recordUsageFromChunk(ctx, []byte(data))
+			sent.chunk([]byte(data))
 			var chunk struct {
 				Choices []struct {
 					Delta struct {

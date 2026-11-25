@@ -64,3 +64,35 @@ func IsBackgroundSynthesis(ctx context.Context) bool {
 	b, _ := ctx.Value(backgroundSynthesisKey{}).(bool)
 	return b
 }
+
+type temperatureKey struct{}
+
+// WithTemperature sets the sampling temperature of the requests made with the returned context, on the providers that take
+// one (OpenRouter). Without it a provider's own default applies (1 for Claude).
+func WithTemperature(ctx context.Context, t float64) context.Context {
+	return context.WithValue(ctx, temperatureKey{}, t)
+}
+
+// TemperatureFrom is the temperature set on ctx, if one is.
+func TemperatureFrom(ctx context.Context) (float64, bool) {
+	t, ok := ctx.Value(temperatureKey{}).(float64)
+	return t, ok
+}
+
+type sentOnceKey struct{}
+
+// WithSentOnce marks requests made with the returned context as prompts no later request repeats: an Anthropic
+// model's prompt is then not written to its cache (the write costs 1.25 times the input and is earned back only by
+// a second request that reads it).
+func WithSentOnce(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sentOnceKey{}, true)
+}
+
+// SentOnce reports whether ctx was marked by WithSentOnce.
+func SentOnce(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	on, _ := ctx.Value(sentOnceKey{}).(bool)
+	return on
+}

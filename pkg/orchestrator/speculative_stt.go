@@ -327,6 +327,15 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		// its normal value and nothing says why.
 		before := ms.speculator.State()
 		seed, history, continues := ms.speculationSeed(text, seq, joint)
+		if d := ms.orch.turnDirector(); d != nil && ms.listeningTo() == nil {
+			ms.directTurn(d, seed) // beside the judge and the guess below (turn_director.go)
+		}
+		if ms.holdsSpeculation(ctx, seed, text) {
+			return // the turn waits for more of what is being dictated (listening.go)
+		}
+		if d := ms.orch.turnDirector(); d != nil {
+			ms.directTurn(d, seed)
+		}
 		history, tail := ms.seedKnowledgeRequest(ms.ctx, seed, history)
 		ms.speculator.StartFromTranscriptWithTail(ms.ctx, ms.orch, seed, history, tail, ms.session.GetTools())
 		ms.logger.Info("Speculative LLM seeded from hangover transcript", "run", ms.speculator.RunID(),
