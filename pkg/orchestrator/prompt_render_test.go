@@ -23,7 +23,7 @@ func TestSystemPromptRendersCleanly(t *testing.T) {
 		t.Errorf("language named only %d times; the language rule depends on it being stated throughout", n)
 	}
 	// The two rules that a live call proved are load-bearing.
-	for _, want := range []string{"never mix languages inside one reply", "Never end a call on a short, ambiguous"} {
+	for _, want := range []string{"Speak only Spanish on this call", "Never end a call on a short, ambiguous"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing rule: %q", want)
 		}
