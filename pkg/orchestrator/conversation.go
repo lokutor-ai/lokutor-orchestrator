@@ -173,6 +173,7 @@ func (c *Conversation) Reset() {
 	c.session.mu.Lock()
 	defer c.session.mu.Unlock()
 	c.session.Context = []Message{}
+	c.session.stepPrompt = ""
 	c.session.LastUser = ""
 	c.session.LastAssistant = ""
 	c.session.CurrentVoice = VoiceF1

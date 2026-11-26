@@ -729,6 +729,8 @@ type ConversationSession struct {
 	// word you produce must be in English", "answer it in English". Faced with 8-to-1 the model
 	// drifted to English mid-call, on Spanish calls, which is exactly what callers reported.
 	basePrompt string
+	// stepPrompt is the step message's content (SetStepPrompt), "" for none.
+	stepPrompt string
 }
 
 func NewConversationSession(userID string) *ConversationSession {
@@ -809,6 +811,55 @@ func (s *ConversationSession) SetKnowledgeContext(content string) {
 	s.AddMessageRaw(Message{Role: "system", Content: content})
 }
 
+// SetStepPrompt makes content the conversation's step message, replacing the one there was ("" removes it): a system
+// message of its own right after the system prompt, for the part of an agent's instructions that changes during a call
+// (a workflow's current step, the details kept in it). Pinned like the system prompt, never trimmed.
+//
+// It was the end of the system prompt until 2026-11-26. A prompt cache matches whole prefixes, so every step change
+// rewrote the whole request into the cache: the platform's rules and the agent's prompt, unchanged, and the
+// conversation after them. Replayed from a production worker pod against Claude Haiku 5.5 (lokutor_tts
+// finance/measurements/flow_latency_2026-11-26/, 28 pairs), the request that answers a step change read 0 of 6,600
+// prompt tokens from the cache that way and 4,900 this way, at a third of the price; its first token came no sooner to
+// speak of (paired median -1 ms, mean -22): at that size a cache write costs the model little time. On its own after the
+// system prompt, the instructions stay where the model has always read them, before the conversation; after it, as the
+// caller's latest turn's neighbour, the model used tú with an usted agent more often (22 against 12 of 80 replies).
+func (s *ConversationSession) SetStepPrompt(content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	at := -1
+	if s.stepPrompt != "" {
+		for i, m := range s.Context {
+			if i > 0 && m.Role == "system" && m.Content == s.stepPrompt {
+				at = i
+				break
+			}
+		}
+	}
+	s.stepPrompt = content
+	switch {
+	case at >= 0 && content == "":
+		s.Context = append(s.Context[:at:at], s.Context[at+1:]...)
+	case at >= 0:
+		s.Context[at].Content = content
+	case content != "":
+		pos := 0
+		if len(s.Context) > 0 && s.Context[0].Role == "system" {
+			pos = 1
+		}
+		out := make([]Message, 0, len(s.Context)+1)
+		out = append(out, s.Context[:pos]...)
+		out = append(out, Message{Role: "system", Content: content})
+		s.Context = append(out, s.Context[pos:]...)
+	}
+}
+
+// StepPrompt is the step message's content (SetStepPrompt), "" for none.
+func (s *ConversationSession) StepPrompt() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stepPrompt
+}
+
 // TrimmedMessages is how many conversation messages the token budget has dropped this call.
 func (s *ConversationSession) TrimmedMessages() int {
 	s.mu.Lock()
@@ -847,6 +898,7 @@ func (s *ConversationSession) ClearContext() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Context = []Message{}
+	s.stepPrompt = ""
 	s.LastUser = ""
 	s.LastAssistant = ""
 }

@@ -90,7 +90,8 @@ func (s *ConversationSession) setSystemMessage(content string) {
 	defer s.mu.Unlock()
 	if len(s.Context) > 0 && s.Context[0].Role == "system" &&
 		!strings.HasPrefix(s.Context[0].Content, callSummaryPrefix) &&
-		!strings.HasPrefix(s.Context[0].Content, knowledgeContextPrefix) {
+		!strings.HasPrefix(s.Context[0].Content, knowledgeContextPrefix) &&
+		(s.stepPrompt == "" || s.Context[0].Content != s.stepPrompt) {
 		s.Context[0].Content = content
 		return
 	}
