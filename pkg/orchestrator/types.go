@@ -860,6 +860,48 @@ func (s *ConversationSession) StepPrompt() string {
 	return s.stepPrompt
 }
 
+// asAfter is history (a copy of this session's context) as it would read had SetSystemPrompt been given system and
+// SetStepPrompt step: what a turn director's decision would make the next request be (TurnPreview).
+func (s *ConversationSession) asAfter(history []Message, system, step string) []Message {
+	s.mu.RLock()
+	rendered := composeSystemPrompt(system, s.CurrentLanguage, s.UserMemory, s.CallerRecord)
+	was := s.stepPrompt
+	s.mu.RUnlock()
+	out := append([]Message(nil), history...)
+	if len(out) > 0 && out[0].Role == "system" && !strings.HasPrefix(out[0].Content, callSummaryPrefix) &&
+		!strings.HasPrefix(out[0].Content, knowledgeContextPrefix) && (was == "" || out[0].Content != was) {
+		out[0].Content = rendered
+	} else {
+		out = append([]Message{{Role: "system", Content: rendered}}, out...)
+	}
+	at := -1
+	if was != "" {
+		for i, m := range out {
+			if i > 0 && m.Role == "system" && m.Content == was {
+				at = i
+				break
+			}
+		}
+	}
+	switch {
+	case at >= 0 && step == "":
+		out = append(out[:at:at], out[at+1:]...)
+	case at >= 0:
+		out[at].Content = step
+	case step != "":
+		out = append(out[:1:1], append([]Message{{Role: "system", Content: step}}, out[1:]...)...)
+	}
+	return out
+}
+
+// promptIs reports whether the session's prompt is what SetSystemPrompt was last given as system and SetStepPrompt as
+// step.
+func (s *ConversationSession) promptIs(system, step string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.basePrompt == system && s.stepPrompt == step
+}
+
 // TrimmedMessages is how many conversation messages the token budget has dropped this call.
 func (s *ConversationSession) TrimmedMessages() int {
 	s.mu.Lock()

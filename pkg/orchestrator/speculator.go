@@ -346,6 +346,32 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 	tail []Message,
 	tools []Tool,
 ) {
+	se.startFromTranscript(ctx, orch, transcript, historySnapshot, tail, tools, false)
+}
+
+// RestartFromTranscriptWithTail is StartFromTranscriptWithTail that replaces a run guessing on the same words: the
+// guess is to be asked again with another conversation or other tools (a workflow's step changing under it,
+// turn_director.go). The run it replaces ends "cancelled", as any superseded run.
+func (se *SpeculativeExecutor) RestartFromTranscriptWithTail(
+	ctx context.Context,
+	orch *Orchestrator,
+	transcript string,
+	historySnapshot []Message,
+	tail []Message,
+	tools []Tool,
+) {
+	se.startFromTranscript(ctx, orch, transcript, historySnapshot, tail, tools, true)
+}
+
+func (se *SpeculativeExecutor) startFromTranscript(
+	ctx context.Context,
+	orch *Orchestrator,
+	transcript string,
+	historySnapshot []Message,
+	tail []Message,
+	tools []Tool,
+	restart bool,
+) {
 	transcript = strings.TrimSpace(transcript)
 	if orch == nil || orch.GetLLMProvider() == nil || len(transcript) < 2 {
 		return
@@ -354,7 +380,7 @@ func (se *SpeculativeExecutor) StartFromTranscriptWithTail(
 	se.mu.Lock()
 	if se.state != SpecIdle {
 		// Already guessing on these words: nothing new to ask.
-		if sameUtterance(se.runTranscript, transcript) {
+		if !restart && sameUtterance(se.runTranscript, transcript) {
 			se.mu.Unlock()
 			return
 		}

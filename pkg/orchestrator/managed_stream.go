@@ -365,7 +365,12 @@ type ManagedStream struct {
 	// listening is what the host has the stream wait for (Listen, listening.go); listeningGen the generation it was set in.
 	listening    *Listening
 	listeningGen int
-	dirRun       *directorRun  // the turn director's answer about the latest words (turn_director.go)
+	dirRun       *directorRun // the turn director's answer about the latest words (turn_director.go)
+	reaskSeed    *reaskSeed   // what the latest hangover guess was asked with, to ask it again from another step
+	// reaskKind and reaskEarlyMs are how this turn's reply was asked again after the director ("" none, "late" after
+	// the turn was committed, "early" before it and used, "early_discarded"), and how much sooner it started (turn latency).
+	reaskKind    string
+	reaskEarlyMs int64
 	dictRun      *dictationRun // the dictation judge's answer about the latest words (dictation_judge.go)
 
 	// realUtteranceStarted is set the moment the caller's own audio produces a
@@ -1130,6 +1135,7 @@ func (ms *ManagedStream) logTurnLatency() {
 	ckPreLLM, ckLock := ms.ckPreLLMMs, ms.ckLockMs
 	specMissTail := ms.specMissTailMs
 	ckEnterSpec := ms.ckEnterSpecMs
+	reaskKind, reaskEarly := ms.reaskKind, ms.reaskEarlyMs
 	turnTokens := ms.turnTokens
 	gen := ms.payloadGen
 	ms.mu.Unlock()
@@ -1158,7 +1164,7 @@ func (ms *ManagedStream) logTurnLatency() {
 		ms.logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
 			ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm,
 			turnTokens.AnsweredBy(), turnTokens.Upstream(), promptTok, completionTok, totalTok, turnTokens.Cache(), trimmed, folded,
-			llmToTTS, ttsFirst, discarded, unaccounted, ttfa, sttSpeculative, gen)
+			llmToTTS, ttsFirst, discarded, unaccounted, ttfa, sttSpeculative, gen, reaskKind, reaskEarly)
 	})
 }
 
@@ -1185,7 +1191,7 @@ func whenTokensSettled(u *TokenUsage, log func()) {
 func (ms *ManagedStream) logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, confirmWait, joinWait, specAwait, gateOther,
 	ckShadow, ckGate, ckBarge, ckCache, ckEnterSpec, ckPreLLM, ckLock, specMissTail, llm int64,
 	provider, upstream string, promptTok, completionTok, totalTok int, cache TokenCache, trimmed, folded int,
-	llmToTTS, ttsFirst, discarded, unaccounted, ttfa int64, sttSpeculative bool, gen int) {
+	llmToTTS, ttsFirst, discarded, unaccounted, ttfa int64, sttSpeculative bool, gen int, reaskKind string, reaskEarly int64) {
 	ms.logger.Info("turn latency",
 		// The turn's generation, as on "Turn tokens after tools": the token counts below are the turn's
 		// running total at first audio, and that line's the total once its tools are done, so a host that
@@ -1255,6 +1261,11 @@ func (ms *ManagedStream) logTurnLatencyLine(e2e, hangover, sttQueue, stt, gate, 
 		// Kept for continuity with earlier measurements: same clock as before,
 		// anchored after the hangover.
 		"ttfa_ms", ttfa,
+		// A workflow's director changed what the model is asked with, and the reply was asked again: "late" once the turn
+		// was committed, "early" before it (and used), "early_discarded" (asked early, not as the call ended up); "" when
+		// it was not. director_reask_early_ms is how much sooner an early one started than a late one would have.
+		"director_reask", reaskKind,
+		"director_reask_early_ms", reaskEarly,
 	)
 }
 
@@ -2731,13 +2742,16 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.ckCacheMs = time.Since(ms.sttEndTime).Milliseconds()
 	ms.mu.Unlock()
 
-	if ms.directed(ctx, transcript) {
+	switch ms.directed(ctx, transcript) {
+	case directedChanged:
 		if ms.speculator != nil {
 			ms.speculator.Cancel() // the guess answered from where the call no longer is
 		}
 		ms.runLLMAndTTS(ctx, transcript)
-	} else if !ms.trySpeculativeResponse(ctx, transcript) {
-		ms.runLLMAndTTS(ctx, transcript)
+	default: // the guess stands, or was asked again early from where the call now is (turn_director.go)
+		if !ms.trySpeculativeResponse(ctx, transcript) {
+			ms.runLLMAndTTS(ctx, transcript)
+		}
 	}
 
 	// Log latency breakdown for observability

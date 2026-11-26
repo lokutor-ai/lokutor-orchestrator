@@ -337,6 +337,9 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 			ms.directTurn(d, seed)
 		}
 		history, tail := ms.seedKnowledgeRequest(ms.ctx, seed, history)
+		ms.mu.Lock()
+		ms.reaskSeed = &reaskSeed{words: seed, history: history, tail: tail} // asked again from another step (turn_director.go)
+		ms.mu.Unlock()
 		ms.speculator.StartFromTranscriptWithTail(ms.ctx, ms.orch, seed, history, tail, ms.session.GetTools())
 		ms.logger.Info("Speculative LLM seeded from hangover transcript", "run", ms.speculator.RunID(),
 			"transcript", ContentForLog(seed), "continues", ContentForLog(continues), "state_before", before, "state_after", ms.speculator.State())
