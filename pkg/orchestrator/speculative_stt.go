@@ -343,6 +343,7 @@ func (ms *ManagedStream) maybeSpeculateSTT() {
 		ms.speculator.StartFromTranscriptWithTail(ms.ctx, ms.orch, seed, history, tail, ms.session.GetTools())
 		ms.logger.Info("Speculative LLM seeded from hangover transcript", "run", ms.speculator.RunID(),
 			"transcript", ContentForLog(seed), "continues", ContentForLog(continues), "state_before", before, "state_after", ms.speculator.State())
+		ms.askCandidates(seed, history, tail) // and from the steps a workflow's director may move it to (turn_director.go)
 	}()
 }
 

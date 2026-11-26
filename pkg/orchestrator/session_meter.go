@@ -52,6 +52,9 @@ const (
 	TokensSummary     = "summary"
 	// TokensBackchannel: the short request that picks a listener sound while the caller pauses mid-thought (backchannel.go).
 	TokensBackchannel = "backchannel"
+	// TokensCandidate: a guess asked from a step a workflow's director may move the call to (turn_director.go
+	// TurnCandidates). A host decides whether it bills them.
+	TokensCandidate = "candidate"
 )
 
 // NewSessionMeter returns an empty meter.

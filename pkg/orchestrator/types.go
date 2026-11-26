@@ -894,6 +894,11 @@ func (s *ConversationSession) asAfter(history []Message, system, step string) []
 	return out
 }
 
+// AsAfter is history as a turn director's preview would leave it (TurnPreview): what a guess asked from there is sent.
+func (s *ConversationSession) AsAfter(history []Message, p *TurnPreview) []Message {
+	return s.asAfter(history, p.SystemPrompt, p.StepPrompt)
+}
+
 // promptIs reports whether the session's prompt is what SetSystemPrompt was last given as system and SetStepPrompt as
 // step.
 func (s *ConversationSession) promptIs(system, step string) bool {

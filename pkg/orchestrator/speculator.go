@@ -80,6 +80,7 @@ type SpeculativeExecutor struct {
 	// runID numbers runs so a superseded or cancelled run finishing late cannot overwrite the state
 	// of the run that replaced it; runTranscript is what the current run is guessing on.
 	runID         int
+	cur           int // the current run's number; candidates (StartCandidate) have numbers too, and become current by Adopt
 	runTranscript string
 	// stream is the current run's reply as it streams (spec_stream.go), with the run's token sink; taken is the run whose
 	// stream a turn took over (TakeStream), so its end is logged as such.
@@ -214,6 +215,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 	se.result = nil
 	se.runID++
 	id := se.runID
+	se.cur = id
 	se.runTranscript = ""
 	tokens := &TokenUsage{}
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
@@ -236,7 +238,7 @@ func (se *SpeculativeExecutor) Start(ctx context.Context, orch *Orchestrator, au
 			result.RunID = id
 		}
 		se.mu.Lock()
-		if se.state == SpecRunning && se.runID == id {
+		if se.state == SpecRunning && se.cur == id {
 			se.result = result
 			if result != nil {
 				se.state = SpecReady
@@ -372,17 +374,107 @@ func (se *SpeculativeExecutor) startFromTranscript(
 	tools []Tool,
 	restart bool,
 ) {
+	se.launch(ctx, orch, transcript, historySnapshot, tail, tools, restart, nil)
+}
+
+// SpecCandidate is a guess asked beside the current run, as the call would be after a move it may make (a workflow's next
+// step, turn_director.go): its request runs, its result is kept, and nothing uses it unless Adopt makes it the current
+// run. One not adopted is cancelled (CancelCandidate) and logged as any cancelled run, with Source "candidate". Its tool
+// calls, as any guess's, are only made if a turn adopts and takes it.
+type SpecCandidate struct {
+	id         int
+	transcript string
+	tokens     *TokenUsage
+	tee        *specStream
+	cancel     context.CancelFunc
+	done       chan struct{}
+	started    time.Time
+	result     *SpeculativeResult // se.mu
+	finished   bool               // se.mu
+	adopted    bool               // se.mu
+}
+
+// Started is when a candidate's request was sent.
+func (c *SpecCandidate) Started() time.Time { return c.started }
+
+// CancelCandidate stops a candidate's request, unless it was adopted.
+func (se *SpeculativeExecutor) CancelCandidate(c *SpecCandidate) {
+	if c == nil {
+		return
+	}
+	se.mu.Lock()
+	adopted := c.adopted
+	se.mu.Unlock()
+	if !adopted && c.cancel != nil {
+		c.cancel()
+	}
+}
+
+// StartCandidate asks a guess on transcript with historySnapshot and tools beside the current run, without touching it.
+// nil when nothing can be asked.
+func (se *SpeculativeExecutor) StartCandidate(ctx context.Context, orch *Orchestrator, transcript string, historySnapshot, tail []Message, tools []Tool) *SpecCandidate {
+	c := &SpecCandidate{}
+	if !se.launch(ctx, orch, transcript, historySnapshot, tail, tools, false, c) {
+		return nil
+	}
+	return c
+}
+
+// Adopt makes a candidate the current run, as if it had been started in its place: the run it replaces is cancelled, and
+// the turn takes or awaits the candidate as it would any run (TakeStream, AwaitRound). False when it was already adopted.
+func (se *SpeculativeExecutor) Adopt(c *SpecCandidate) bool {
+	if c == nil {
+		return false
+	}
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if c.adopted {
+		return false
+	}
+	if se.cancel != nil && se.cur != c.id {
+		se.cancel()
+	}
+	c.adopted = true
+	se.cur = c.id
+	se.runTranscript = c.transcript
+	se.done = c.done
+	se.stream, se.streamTokens = c.tee, c.tokens
+	if c.finished {
+		se.result, se.cancel = c.result, nil
+		se.state = SpecIdle
+		if c.result != nil {
+			se.state = SpecReady
+		}
+	} else {
+		se.result, se.cancel = nil, c.cancel
+		se.state = SpecRunning
+	}
+	return true
+}
+
+// launch starts a run: the current one (cand nil), replacing a stale run or, with restart, one on the same words; or a
+// candidate beside it, filled into cand. It reports whether a request was started.
+func (se *SpeculativeExecutor) launch(
+	ctx context.Context,
+	orch *Orchestrator,
+	transcript string,
+	historySnapshot []Message,
+	tail []Message,
+	tools []Tool,
+	restart bool,
+	cand *SpecCandidate,
+) bool {
 	transcript = strings.TrimSpace(transcript)
 	if orch == nil || orch.GetLLMProvider() == nil || len(transcript) < 2 {
-		return
+		return false
 	}
 
 	se.mu.Lock()
-	if se.state != SpecIdle {
+	if cand == nil && se.state != SpecIdle {
 		// Already guessing on these words: nothing new to ask.
 		if !restart && sameUtterance(se.runTranscript, transcript) {
 			se.mu.Unlock()
-			return
+			return false
 		}
 		// A guess on other words is stale: the caller has said more since, or it was left over from
 		// an earlier utterance. It used to keep the executor, refusing this seed (the transcript the
@@ -395,26 +487,38 @@ func (se *SpeculativeExecutor) startFromTranscript(
 		se.result = nil
 		se.stream = nil
 	}
-	se.state = SpecRunning
-	se.result = nil
 	se.runID++
 	id := se.runID
-	se.runTranscript = transcript
 	tokens := &TokenUsage{}
 	sCtx, sCancel := context.WithTimeout(ctx, 8*time.Second)
-	sCtx = WithTokenUsage(WithTokenCategory(sCtx, TokensSpeculative), tokens)
-	se.cancel = sCancel
+	category := TokensSpeculative
+	if cand != nil {
+		category = TokensCandidate
+	}
+	sCtx = WithTokenUsage(WithTokenCategory(sCtx, category), tokens)
 	streamer, streams := orch.GetLLMProvider().(StreamingLLMProvider)
 	streams = streams && speculativeStreamEnabled()
 	var tee *specStream
 	if streams {
 		tee = newSpecStream()
-		se.stream, se.streamTokens = tee, tokens
-	} else {
-		se.stream, se.streamTokens = nil, nil
 	}
 	done := make(chan struct{})
-	se.done = done
+	source := "transcript"
+	if cand == nil {
+		se.state = SpecRunning
+		se.result = nil
+		se.cur = id
+		se.runTranscript = transcript
+		se.cancel = sCancel
+		se.stream, se.streamTokens = nil, nil
+		if streams {
+			se.stream, se.streamTokens = tee, tokens
+		}
+		se.done = done
+	} else {
+		source = "candidate"
+		*cand = SpecCandidate{id: id, transcript: transcript, tokens: tokens, tee: tee, cancel: sCancel, done: done, started: time.Now()}
+	}
 	onPartial := se.onPartial
 	onResponse := se.onResponse
 	onFinish := se.onFinish
@@ -422,20 +526,16 @@ func (se *SpeculativeExecutor) startFromTranscript(
 	started := time.Now()
 
 	finish := func(result *SpeculativeResult, transcript, outcome string) {
-		se.mu.Lock()
-		taken := se.taken == id
-		se.mu.Unlock()
-		if taken {
-			outcome = "taken_over"
-		} else if sCtx.Err() == context.Canceled {
-			outcome = "cancelled"
-		}
 		if result != nil {
 			result.Tokens = tokens
 			result.RunID = id
 		}
 		se.mu.Lock()
-		if se.state == SpecRunning && se.runID == id {
+		taken := se.taken == id
+		if cand != nil {
+			cand.result, cand.finished = result, true
+		}
+		if se.cur == id && se.state == SpecRunning {
 			se.result = result
 			if result != nil {
 				se.state = SpecReady
@@ -445,9 +545,14 @@ func (se *SpeculativeExecutor) startFromTranscript(
 			se.cancel = nil
 		}
 		se.mu.Unlock()
+		if taken {
+			outcome = "taken_over"
+		} else if sCtx.Err() == context.Canceled {
+			outcome = "cancelled"
+		}
 		close(done)
 		if onFinish != nil {
-			onFinish(SpeculativeRun{ID: id, Source: "transcript", Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
+			onFinish(SpeculativeRun{ID: id, Source: source, Transcript: transcript, Tokens: tokens, Ms: time.Since(started).Milliseconds(), Outcome: outcome})
 		}
 	}
 
@@ -459,7 +564,7 @@ func (se *SpeculativeExecutor) startFromTranscript(
 			}
 		}()
 
-		if onPartial != nil {
+		if onPartial != nil && cand == nil {
 			onPartial(transcript)
 		}
 
@@ -501,11 +606,12 @@ func (se *SpeculativeExecutor) startFromTranscript(
 			finish(&SpeculativeResult{PartialTranscript: transcript, Response: response, ToolCalls: calls}, transcript, "tool_calls")
 			return
 		}
-		if onResponse != nil {
+		if onResponse != nil && cand == nil {
 			onResponse(response)
 		}
 		finish(&SpeculativeResult{PartialTranscript: transcript, Response: response}, transcript, "responded")
 	}()
+	return true
 }
 
 // Await waits (bounded by ctx) for the current or most recent speculative

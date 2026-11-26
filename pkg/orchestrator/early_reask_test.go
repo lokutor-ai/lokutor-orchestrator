@@ -168,3 +168,81 @@ func TestEarlyReaskCallerResumes(t *testing.T) {
 		t.Fatalf("%q %v", reply, ok)
 	}
 }
+
+// candidateDirector moves the call to step `to` ("" for nowhere), and names S2 and S3 as its likeliest moves.
+type candidateDirector struct {
+	slow    time.Duration
+	to      string
+	session *ConversationSession
+}
+
+func (d *candidateDirector) Decide(ctx context.Context, words string) interface{} {
+	time.Sleep(d.slow)
+	return d.to
+}
+func (d *candidateDirector) Apply(x interface{}) bool {
+	if x.(string) == "" {
+		return false
+	}
+	d.session.SetStepPrompt(x.(string))
+	return true
+}
+func (d *candidateDirector) Preview(x interface{}) *TurnPreview {
+	if x.(string) == "" {
+		return nil
+	}
+	return &TurnPreview{SystemPrompt: "AGENT", StepPrompt: x.(string)}
+}
+func (d *candidateDirector) Candidates() []*TurnPreview {
+	return []*TurnPreview{{SystemPrompt: "AGENT", StepPrompt: "S2"}, {SystemPrompt: "AGENT", StepPrompt: "S3"}}
+}
+
+// The guesses from the steps the director may move to are asked at the seed, beside the guess from where the call is; the
+// one the decision matches is the turn's, before or after the turn ends, and the rest are cancelled.
+func TestDirectorCandidates(t *testing.T) {
+	cases := []struct {
+		name          string
+		commitAt      time.Duration
+		slow          time.Duration
+		to, wantReply string
+		want          directedOutcome
+		kind          string
+		asked         int // requests in all
+	}{
+		{"decided before the turn ends", 150 * time.Millisecond, 20 * time.Millisecond, "S2", "Respuesta desde S2", directedEarly, "candidate", 3},
+		{"decided after the turn ends", 10 * time.Millisecond, 150 * time.Millisecond, "S3", "Respuesta desde S3", directedEarly, "candidate", 3},
+		{"no move", 150 * time.Millisecond, 20 * time.Millisecond, "", "Respuesta desde S1", directedNone, "", 3},
+		{"a move nobody guessed", 150 * time.Millisecond, 20 * time.Millisecond, "S4", "Respuesta desde S4", directedEarly, "early", 4},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			llm := &reaskLLM{}
+			ms, orch := reaskStream(t, llm)
+			d := &candidateDirector{slow: c.slow, to: c.to, session: ms.session}
+			orch.SetTurnDirector(d)
+			history := ms.session.GetContextCopy()
+			ms.mu.Lock()
+			ms.reaskSeed = &reaskSeed{words: "sí, soy yo", history: history}
+			ms.mu.Unlock()
+			ms.directTurn(d, "sí, soy yo")
+			ms.speculator.StartFromTranscriptWithTail(ms.ctx, ms.orch, "sí, soy yo", history, nil, nil)
+			ms.askCandidates("sí, soy yo", history, nil)
+			time.Sleep(c.commitAt)
+			ms.session.AddMessage("user", "sí, soy yo")
+			got := ms.directed(context.Background(), "sí, soy yo")
+			ms.mu.Lock()
+			kind, left := ms.reaskKind, len(ms.candidates)
+			ms.mu.Unlock()
+			if got != c.want || kind != c.kind || left != 0 {
+				t.Fatalf("outcome %d %q, %d candidates left; want %d %q", got, kind, left, c.want, c.kind)
+			}
+			reply, ok := ms.speculator.Await(context.Background(), "sí, soy yo")
+			if !ok || reply != c.wantReply {
+				t.Fatalf("the turn gets %q %v", reply, ok)
+			}
+			if n := len(llm.asked()); n != c.asked {
+				t.Fatalf("%d requests: %v", n, llm.asked())
+			}
+		})
+	}
+}

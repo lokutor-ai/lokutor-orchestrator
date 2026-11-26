@@ -161,7 +161,7 @@ func (se *SpeculativeExecutor) TakeStream(finalTranscript string) (*specStreamRo
 	if round.cancel == nil {
 		round.cancel = func() {}
 	}
-	se.taken = se.runID
+	se.taken = se.cur
 	se.cancel = nil
 	se.stream = nil
 	se.streamTokens = nil

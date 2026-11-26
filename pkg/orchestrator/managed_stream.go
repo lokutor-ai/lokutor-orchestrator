@@ -365,8 +365,9 @@ type ManagedStream struct {
 	// listening is what the host has the stream wait for (Listen, listening.go); listeningGen the generation it was set in.
 	listening    *Listening
 	listeningGen int
-	dirRun       *directorRun // the turn director's answer about the latest words (turn_director.go)
-	reaskSeed    *reaskSeed   // what the latest hangover guess was asked with, to ask it again from another step
+	dirRun       *directorRun     // the turn director's answer about the latest words (turn_director.go)
+	reaskSeed    *reaskSeed       // what the latest hangover guess was asked with, to ask it again from another step
+	candidates   []*stepCandidate // guesses asked as the director's likeliest moves would leave the call (turn_director.go)
 	// reaskKind and reaskEarlyMs are how this turn's reply was asked again after the director ("" none, "late" after
 	// the turn was committed, "early" before it and used, "early_discarded"), and how much sooner it started (turn latency).
 	reaskKind    string

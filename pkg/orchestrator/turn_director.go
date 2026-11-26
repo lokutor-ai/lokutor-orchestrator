@@ -76,14 +76,91 @@ type directorRun struct {
 
 // earlyReask is a guess asked again, before commit, as a decision would leave the call.
 type earlyReask struct {
-	at      time.Time
-	preview *TurnPreview
+	at        time.Time
+	preview   *TurnPreview
+	candidate bool // asked at the seed, as a step the decision might take (TurnCandidates)
 }
 
 // reaskSeed is what the latest hangover guess was asked with, for asking it again from another step.
 type reaskSeed struct {
 	words         string
 	history, tail []Message
+}
+
+// TurnCandidates is a TurnPreviewer that can name, before deciding, the moves a turn is likeliest to make out of where the
+// call is: their previews, most likely first, as many as it wants asked. With it, the guess at the reply is asked under
+// each of them too, beside the guess from the current step and the director's own request, so that when the director
+// moves the call the reply from its new step has been coming since the seed, instead of being asked once the director
+// has answered. The ones the turn does not take are cancelled; any tool call in them is never made. Their tokens are
+// metered as TokensCandidate. Replayed from a worker pod with Claude Haiku 5.5 (lokutor_tts
+// finance/measurements/flow_latency_2026-11-26/, 24 step changes, 18 answered by a candidate), a step change first spoke
+// 674 ms after the end of the turn (p50) against 986 asked after the director, at 1.29 more requests a turn.
+type TurnCandidates interface {
+	TurnPreviewer
+	Candidates() []*TurnPreview
+}
+
+// stepCandidate is one guess asked as a candidate move would leave the call.
+type stepCandidate struct {
+	words   string
+	preview *TurnPreview
+	run     *SpecCandidate
+}
+
+// askCandidates asks the guess on words under each of the director's candidate moves (TurnCandidates), replacing those
+// asked for earlier words.
+func (ms *ManagedStream) askCandidates(words string, history, tail []Message) {
+	ms.dropCandidates()
+	d := ms.orch.turnDirector()
+	tc, ok := d.(TurnCandidates)
+	if !ok || ms.speculator == nil || !ms.orch.config.SpeculativeLLM {
+		return
+	}
+	var started []*stepCandidate
+	for _, p := range tc.Candidates() {
+		if p == nil {
+			continue
+		}
+		h := ms.session.asAfter(history, p.SystemPrompt, p.StepPrompt)
+		if run := ms.speculator.StartCandidate(ms.ctx, ms.orch, words, h, tail, p.Tools); run != nil {
+			started = append(started, &stepCandidate{words: words, preview: p, run: run})
+		}
+	}
+	if len(started) == 0 {
+		return
+	}
+	ms.mu.Lock()
+	ms.candidates = started
+	ms.mu.Unlock()
+	ms.logger.Info("Turn director: replies asked from the steps it may move to", "candidates", len(started))
+}
+
+// takeCandidate adopts the candidate asked on words as p would leave the call, and cancels the others; false when none
+// matches. With p nil every candidate is cancelled.
+func (ms *ManagedStream) takeCandidate(words string, p *TurnPreview) (*stepCandidate, bool) {
+	ms.mu.Lock()
+	cands := ms.candidates
+	ms.candidates = nil
+	ms.mu.Unlock()
+	var taken *stepCandidate
+	for _, c := range cands {
+		if taken == nil && p != nil && sameUtterance(c.words, words) && samePreview(c.preview, p) && ms.speculator.Adopt(c.run) {
+			taken = c
+			continue
+		}
+		ms.speculator.CancelCandidate(c.run)
+	}
+	return taken, taken != nil
+}
+
+// dropCandidates cancels every candidate guess.
+func (ms *ManagedStream) dropCandidates() {
+	ms.takeCandidate("", nil)
+}
+
+// samePreview reports whether two previews have the model asked with the same.
+func samePreview(a, b *TurnPreview) bool {
+	return a != nil && b != nil && a.SystemPrompt == b.SystemPrompt && a.StepPrompt == b.StepPrompt && sameTools(a.Tools, b.Tools)
 }
 
 // directTurn asks about words, unless it is being asked already.
@@ -108,7 +185,8 @@ func (ms *ManagedStream) directTurn(d TurnDirector, words string) *directorRun {
 	return r
 }
 
-// reaskEarly asks the guess again from where the decision moves the call, when it came before the turn was committed.
+// reaskEarly asks the guess again from where the decision moves the call, when it came before the turn was committed: it
+// takes the candidate asked as that move would leave the call when there is one, else asks again now.
 func (ms *ManagedStream) reaskEarly(d TurnDirector, r *directorRun) {
 	p, ok := d.(TurnPreviewer)
 	if !ok || r.decision == nil || ms.speculator == nil || ms.orch == nil || !ms.orch.config.SpeculativeLLM {
@@ -123,6 +201,7 @@ func (ms *ManagedStream) reaskEarly(d TurnDirector, r *directorRun) {
 	}
 	preview := p.Preview(r.decision)
 	if preview == nil {
+		ms.dropCandidates() // the call stays as it is: the guess from where it is stands
 		return
 	}
 	history := ms.session.asAfter(seed.history, preview.SystemPrompt, preview.StepPrompt)
@@ -131,9 +210,18 @@ func (ms *ManagedStream) reaskEarly(d TurnDirector, r *directorRun) {
 		ms.mu.Unlock()
 		return // committed meanwhile: the turn asks after Apply
 	}
-	r.early = &earlyReask{at: time.Now(), preview: preview}
 	ms.mu.Unlock()
 	ms.prerender.discard()
+	if c, ok := ms.takeCandidate(r.words, preview); ok {
+		ms.mu.Lock()
+		r.early = &earlyReask{at: c.run.Started(), preview: preview, candidate: true}
+		ms.mu.Unlock()
+		ms.logger.Info("Turn director: reply taken from the step it moves to, asked at the seed", "decide_ms", r.ms)
+		return
+	}
+	ms.mu.Lock()
+	r.early = &earlyReask{at: time.Now(), preview: preview}
+	ms.mu.Unlock()
 	ms.speculator.RestartFromTranscriptWithTail(ms.ctx, ms.orch, seed.words, history, seed.tail, preview.Tools)
 	ms.logger.Info("Turn director: reply asked again before the turn ended", "run", ms.speculator.RunID(), "decide_ms", r.ms)
 }
@@ -154,8 +242,10 @@ func (ms *ManagedStream) directed(ctx context.Context, words string) directedOut
 	ms.mu.Unlock()
 	d := ms.orch.turnDirector()
 	if d == nil || strings.TrimSpace(words) == "" {
+		ms.dropCandidates()
 		return directedNone
 	}
+	defer ms.dropCandidates() // none is left asking once the turn knows its reply
 	r := ms.directTurn(d, words)
 	ms.mu.Lock()
 	r.claimed = true
@@ -181,15 +271,35 @@ func (ms *ManagedStream) directed(ctx context.Context, words string) directedOut
 		return directedNone
 	}
 	changed := r.decision != nil && d.Apply(r.decision)
+	applied := func(p *TurnPreview) bool {
+		return ms.session.promptIs(p.SystemPrompt, p.StepPrompt) && sameTools(ms.session.GetTools(), p.Tools)
+	}
 	out, kind, earlyBy := directedNone, "", int64(0)
 	switch {
-	case early != nil && changed && ms.session.promptIs(early.preview.SystemPrompt, early.preview.StepPrompt) &&
-		sameTools(ms.session.GetTools(), early.preview.Tools):
+	case early != nil && changed && applied(early.preview):
 		out, kind, earlyBy = directedEarly, "early", time.Since(early.at).Milliseconds()
+		if early.candidate {
+			kind = "candidate"
+		}
 	case early != nil:
 		out, kind = directedChanged, "early_discarded" // asked from a step the call is not in
 	case changed:
 		out, kind = directedChanged, "late"
+		// Decided after the turn ended: a guess asked at the seed as the call now is answers it.
+		ms.mu.Lock()
+		var match *TurnPreview
+		for _, c := range ms.candidates {
+			if sameUtterance(c.words, words) && applied(c.preview) {
+				match = c.preview
+				break
+			}
+		}
+		ms.mu.Unlock()
+		if match != nil {
+			if c, ok := ms.takeCandidate(words, match); ok {
+				out, kind, earlyBy = directedEarly, "candidate", time.Since(c.run.Started()).Milliseconds()
+			}
+		}
 	}
 	ms.mu.Lock()
 	ms.reaskKind, ms.reaskEarlyMs = kind, earlyBy
