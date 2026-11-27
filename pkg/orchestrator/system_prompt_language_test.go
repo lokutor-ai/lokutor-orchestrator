@@ -78,7 +78,7 @@ func TestPromptTellsTheModelNotToMirrorAMistranscribedLanguage(t *testing.T) {
 	// as Spanish or Portuguese. Without this the model reads the transcript as the user's choice
 	// of language and follows it, which is exactly what happened on the reported call.
 	p := buildSystemPrompt("persona", "Catalan")
-	for _, want := range []string{"recogniser", "NOT the user choosing", "still reply in Catalan"} {
+	for _, want := range []string{"recognition may write them in", "whatever language their words reach you in", "answer in Catalan"} {
 		if !strings.Contains(p, want) {
 			t.Errorf("prompt is missing the mistranscription rule (%q):\n%s", want, p)
 		}
@@ -154,7 +154,7 @@ func TestSetLanguageLeavesNoTraceOfThePreviousLanguage(t *testing.T) {
 			t.Errorf("%s: after SetLanguage the prompt names %q only %d times; the section that "+
 				"holds the model on one language was not rebuilt", lang, want, n)
 		}
-		if !strings.Contains(got, "still reply in "+want) {
+		if !strings.Contains(got, "answer in "+want+" whatever language") {
 			t.Errorf("%s: the mistranscription rule still names the old language", lang)
 		}
 		if !strings.Contains(got, "You help people book appointments.") {
@@ -234,11 +234,11 @@ func TestLanguageSectionOverridesTheAgentsOwnPrompt(t *testing.T) {
 	o.SetLanguage(s, LanguageCa)
 
 	got := s.GetContextCopy()[0].Content
-	if !strings.Contains(got, "OVERRIDES the Conversation Context") {
+	if !strings.Contains(got, "If the Conversation Context names another language, use Catalan all the same") {
 		t.Error("the language section does not claim precedence over the agent's prompt, so a " +
 			"prompt that names a language still wins and the dropdown is decorative")
 	}
-	if !strings.Contains(got, "Do not tell the caller you can only speak the other language") {
+	if !strings.Contains(got, "say nothing about languages") {
 		t.Error("nothing stops the model announcing the conflict to the caller, which is the " +
 			"exact symptom reported")
 	}
