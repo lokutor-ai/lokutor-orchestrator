@@ -533,6 +533,9 @@ func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
 		return
 	}
 	talkedMs := now.Sub(ms.onset.at).Milliseconds()
+	// Whether any of the reply was still playing: the onset is also taken over a reply being made that never played (a
+	// caller who resumes during an end-of-turn hold), and then this stop stops nothing (2026-11-27, logging only).
+	playing := ms.playout.gen == gen && ms.playout.end.After(now)
 	ms.onset.stopped = true
 	var tr TruncatedResponse
 	settle := false
@@ -547,7 +550,7 @@ func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
 		}
 	}
 	ms.mu.Unlock()
-	ms.logger.Info("Caller kept talking over the agent: stopping playback", "talked_ms", talkedMs)
+	ms.logger.Info("Caller kept talking over the agent: stopping playback", "talked_ms", talkedMs, "reply_playing", playing)
 	ms.emitWithGen(StopPlayback, nil, gen)
 	if settle && !(tr.Emitted && tr.Spoken == strings.TrimSpace(tr.Full)) {
 		ms.applySpokenTruthToContext(gen, tr)
