@@ -144,6 +144,10 @@ const (
 	// stop playback now and discard what is queued. Interrupted may still follow if the barge-in is
 	// confirmed; transports that pause or stop at the onset can ignore it.
 	StopPlayback EventType = "STOP_PLAYBACK"
+	// HoldPlayback: for a transport that ducks under tentative barge-ins (SetTransportDucksOnBargeIn), the caller has
+	// kept talking over the agent long enough: stop playing now and KEEP what is queued. BotResumed plays it on from
+	// there (at full level), Interrupted discards it.
+	HoldPlayback EventType = "HOLD_PLAYBACK"
 	AudioChunk   EventType = "AUDIO_CHUNK"
 	// Visemes: []Viseme for the reply's audio, timed from its first sample (SetVisemes; only with a
 	// VisemeTTSProvider). Emitted in order with the AudioChunk events of the same generation.

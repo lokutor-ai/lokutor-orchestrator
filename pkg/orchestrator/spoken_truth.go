@@ -365,9 +365,11 @@ type heardSnapshot struct {
 	complete bool
 	// heardAtStart is dur as it was at the onset (dur is read again while the transport plays through).
 	heardAtStart time.Duration
-	// stopped: a transport that plays through a barge-in has been told to stop (StopPlayback), and
-	// text/dur/complete are what was heard at that moment rather than at the onset.
+	// stopped: a transport that plays through a barge-in has been told to stop (StopPlayback), or one that ducks has
+	// been told to hold (HoldPlayback, at heldAt), and text/dur/complete are what was heard at that moment rather than
+	// at the onset.
 	stopped bool
+	heldAt  time.Time
 }
 
 // replyRecord is the text last sent to transports as a BotResponse, and for which generation.
@@ -421,7 +423,7 @@ func (ms *ManagedStream) snapshotHeardAtOnsetLocked(now time.Time) {
 	if ms.playout.gen == gen {
 		s.text, s.dur, s.complete = ms.playout.heard(now)
 		s.heardAtStart = s.dur
-		if !ms.pausesOnBargeIn && !ms.playsThroughBargeIn {
+		if !ms.pausesOnBargeIn && !ms.playsThroughBargeIn && !ms.ducksOnBargeIn {
 			// The transport discards its queue: nothing scheduled after now will ever play.
 			ms.playout.cutAt(now)
 			ms.dropUnplayedFarEndEcho(now)
@@ -434,7 +436,7 @@ func (ms *ManagedStream) snapshotHeardAtOnsetLocked(now time.Time) {
 // a transport that kept playing through the barge-in and has not been stopped yet (ms.mu held).
 func (ms *ManagedStream) rereadHeardForPlayThroughLocked(now time.Time) {
 	gen := ms.payloadGen
-	if !ms.playsThroughBargeIn || ms.onset.gen != gen || ms.onset.at.IsZero() || ms.onset.stopped {
+	if !(ms.playsThroughBargeIn || ms.ducksOnBargeIn) || ms.onset.gen != gen || ms.onset.at.IsZero() || ms.onset.stopped {
 		return
 	}
 	if ms.playout.gen == gen {
@@ -488,6 +490,9 @@ func (ms *ManagedStream) dropOverOpening(seq int, duration time.Duration) bool {
 // was heard is settled at this moment — as it is at the onset for a transport that stops outright,
 // only later: a blip too short to reach this point never cost the caller any of the reply.
 func (ms *ManagedStream) stopPlayThroughIfDue(now time.Time) {
+	if ms.holdDuckedIfDue(now) {
+		return
+	}
 	ms.mu.Lock()
 	gen := ms.payloadGen
 	if !ms.playsThroughBargeIn || !ms.pendingBargeIn || ms.pendingBargeGen != gen ||
@@ -562,6 +567,48 @@ func (ms *ManagedStream) SetTransportPlaysThroughBargeIn(v bool) {
 	ms.mu.Lock()
 	ms.playsThroughBargeIn = v
 	ms.mu.Unlock()
+}
+
+// SetTransportDucksOnBargeIn declares that the transport keeps playing, lower, when the caller starts speaking over the
+// agent (UserSpeaking), holds its queue when the caller has kept talking for BARGE_IN_PLAYTHROUGH_MS (HoldPlayback),
+// plays on at full level on BotResumed (from where it held, if it did) and discards only on Interrupted. The phone
+// transport with phone_duck_bargein (2026-11-27): a caller's "sí" or "mhm" used to pause the agent mid-word and start it
+// again, a stutter no person makes; ducked, the agent carries on under it. What the caller heard keeps counting while it
+// plays ducked: the playout clock runs on until the hold.
+func (ms *ManagedStream) SetTransportDucksOnBargeIn(v bool) {
+	ms.mu.Lock()
+	ms.ducksOnBargeIn = v
+	ms.mu.Unlock()
+}
+
+// holdDuckedIfDue tells a ducking transport to hold its queue once the caller has kept talking over the reply for
+// playThroughStopAfter (HoldPlayback), and settles what had been heard at that moment. It reports whether the stream is
+// in ducking mode (stopPlayThroughIfDue has nothing more to do then).
+func (ms *ManagedStream) holdDuckedIfDue(now time.Time) bool {
+	ms.mu.Lock()
+	if !ms.ducksOnBargeIn {
+		ms.mu.Unlock()
+		return false
+	}
+	gen := ms.payloadGen
+	if !ms.pendingBargeIn || ms.pendingBargeGen != gen || ms.onset.gen != gen || ms.onset.at.IsZero() ||
+		ms.onset.stopped || now.Sub(ms.onset.at) < playThroughStopAfter() {
+		ms.mu.Unlock()
+		return true
+	}
+	ms.onset.stopped, ms.onset.heldAt = true, now
+	playing := false
+	if ms.playout.gen == gen {
+		ms.onset.text, ms.onset.dur, ms.onset.complete = ms.playout.heard(now)
+		playing = ms.playout.end.After(now)
+	}
+	talkedMs := now.Sub(ms.onset.at).Milliseconds()
+	heardMs := ms.onset.dur.Milliseconds()
+	ms.mu.Unlock()
+	ms.logger.Info("Caller kept talking over the agent: holding playback", "talked_ms", talkedMs, "heard_ms", heardMs,
+		"reply_playing", playing)
+	ms.emitWithGen(HoldPlayback, nil, gen)
+	return true
 }
 
 // SetTransportPausesOnBargeIn declares that the transport pauses its playback queue when the caller
@@ -1087,6 +1134,11 @@ func (ms *ManagedStream) replyResumableLocked(now time.Time) bool {
 	switch {
 	case ms.pausesOnBargeIn:
 		return !ms.onset.complete
+	case ms.ducksOnBargeIn:
+		if ms.onset.stopped {
+			return !ms.onset.complete
+		}
+		return ms.playout.gen == gen && ms.playout.end.After(now)
 	case ms.playsThroughBargeIn:
 		return !ms.onset.stopped && ms.playout.gen == gen && ms.playout.end.After(now)
 	}

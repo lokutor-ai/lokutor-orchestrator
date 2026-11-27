@@ -417,6 +417,9 @@ type ManagedStream struct {
 	// playsThroughBargeIn: the transport keeps playing through a tentative barge-in and stops only
 	// when told — StopPlayback or Interrupted (SetTransportPlaysThroughBargeIn).
 	playsThroughBargeIn bool
+	// ducksOnBargeIn: the transport keeps playing, lower, through a tentative barge-in, holds its queue when told
+	// (HoldPlayback), plays on at full level on BotResumed and discards on Interrupted (SetTransportDucksOnBargeIn).
+	ducksOnBargeIn bool
 	// inflightUtterances counts processUtterance calls running (incremented in onVADEnd, before the
 	// goroutine starts). A rejected utterance uses it to tell whether StateProcessing is its own.
 	inflightUtterances int
@@ -1434,7 +1437,7 @@ func (ms *ManagedStream) onVADStart(prevState StreamState) {
 		now := time.Now()
 		ms.mu.Lock()
 		overPlayout := ms.playout.gen == ms.payloadGen && ms.playout.end.After(now)
-		tentative := ms.pausesOnBargeIn || ms.playsThroughBargeIn
+		tentative := ms.pausesOnBargeIn || ms.playsThroughBargeIn || ms.ducksOnBargeIn
 		if overPlayout && tentative {
 			ms.pendingBargeIn = true
 			ms.pendingBargeGen = ms.payloadGen
@@ -1570,6 +1573,15 @@ func (ms *ManagedStream) resolvePendingBargeInFor(fromUtterance bool) {
 	if ms.pausesOnBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.at.IsZero() {
 		ms.playout.shiftFrom(ms.onset.at, time.Since(ms.onset.at))
 		resumePlayout = !ms.onset.complete
+	} else if ms.ducksOnBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.at.IsZero() {
+		if ms.onset.stopped {
+			// Held since heldAt: everything after it plays that much later.
+			ms.playout.shiftFrom(ms.onset.heldAt, time.Since(ms.onset.heldAt))
+			resumePlayout = !ms.onset.complete
+		} else {
+			// Ducked, never held: it kept playing, lower.
+			resumePlayout = ms.playout.gen == ms.payloadGen && ms.playout.end.After(time.Now())
+		}
 	} else if ms.playsThroughBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.stopped {
 		// It never stopped: the reply is still playing if its audio has not run out.
 		resumePlayout = ms.playout.gen == ms.payloadGen && ms.playout.end.After(time.Now())
@@ -1679,6 +1691,11 @@ func (ms *ManagedStream) replyWillResumeLocked(now time.Time) bool {
 		return true
 	case ms.pausesOnBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.at.IsZero():
 		return !ms.onset.complete
+	case ms.ducksOnBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.at.IsZero():
+		if ms.onset.stopped {
+			return !ms.onset.complete
+		}
+		return ms.playout.gen == ms.payloadGen && ms.playout.end.After(now)
 	case ms.playsThroughBargeIn && ms.onset.gen == ms.payloadGen && !ms.onset.stopped:
 		return ms.playout.gen == ms.payloadGen && ms.playout.end.After(now)
 	}
