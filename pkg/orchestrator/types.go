@@ -506,6 +506,15 @@ type Config struct {
 	// agent opts in. Replaces the pitch-triggered clips that were switched off on 2026-09-25.
 	Backchannels bool
 
+	// BackchannelInHolds times the sound the way a listener does (2026-11-27, the owner's local test: 2 sounds in 28
+	// pauses, none in his mid-thought pauses). A listener says "mhm" when they judge the speaker is not done, so the sound
+	// plays only in a pause the end-of-turn gate HOLDS (waited, open_wait) and never in one it answers at once, where the
+	// agent takes the turn instead. A barge-in still pending blocks it only while a false alarm would put the agent's
+	// reply back in the caller's ears (a reply the caller already stopped, or one never heard, leaves them the floor).
+	// The caller needs backchannelHoldMinSpeech of speech (one phrase) rather than backchannelMinSpeech, and sounds are
+	// at least backchannelHoldMinInterval apart. Off: the rule as before (backchannel.go).
+	BackchannelInHolds bool
+
 	// BackchannelPredictorPath: the learned backchannel-opportunity model (ONNX), run in SHADOW on calls with
 	// Backchannels on: it logs where it would fire beside the current rule and plays nothing (backchannel_shadow.go).
 	// Empty: not run. BackchannelPredictorThreshold: its lexical-head probability that counts as a fire (0.5 if unset).

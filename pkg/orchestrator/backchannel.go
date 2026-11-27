@@ -54,6 +54,12 @@ const (
 	backchannelHeardReset  = time.Second      // agent audio heard this long starts the caller's turn over
 	backchannelBankRetry   = 30 * time.Second // a voice whose bank was not there yet (being built) is asked again after this
 	backchannelBankTimeout = 3 * time.Minute  // a first build on the synthesis pool takes seconds; the request may wait for it
+
+	// With Config.BackchannelInHolds the gate's own judgement that the caller is mid-thought replaces most of the speech
+	// minimum: one phrase is enough (Ward & Tsukahara's listener rule asks for 700 ms of speech before a backchannel; a
+	// second covers a short clause), and sounds may come closer together, since only held pauses qualify.
+	backchannelHoldMinSpeech   = 1000 * time.Millisecond
+	backchannelHoldMinInterval = 3000 * time.Millisecond
 )
 
 // Backchannel categories: the bank's and the pick's.
@@ -137,14 +143,18 @@ type backchannelState struct {
 	turnText   string // the caller's finals since the agent last spoke
 
 	// the trigger
-	speech      time.Duration // caller speech since the agent was last heard or the last backchannel
-	agentFrom   time.Time     // the agent's audio has been playing since (zero: not playing)
-	agentTo     time.Time
-	lastAt      time.Time
-	firedPause  time.Time // the pause (its lastVoicedAt) already given a sound
-	guardUntil  time.Time
-	held        [][]byte
-	floor       float64 // the pause's level before the sound, RMS of PCM16
+	speech     time.Duration // caller speech since the agent was last heard or the last backchannel
+	agentFrom  time.Time     // the agent's audio has been playing since (zero: not playing)
+	agentTo    time.Time
+	lastAt     time.Time
+	firedPause time.Time // the pause (its lastVoicedAt) already given a sound
+	guardUntil time.Time
+	held       [][]byte
+	floor      float64 // the pause's level before the sound, RMS of PCM16
+	// the end-of-turn gate's last decision (logEOUDecision): its rule and when it was taken. With BackchannelInHolds a
+	// pause plays only when the decision taken in it held the turn.
+	ruleAt      time.Time
+	rule        string
 	replaying   bool
 	plays       int
 	stalePlays  int
@@ -398,9 +408,16 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 	// The bank is asked for from the call's first audio (built on the synthesis pool if no one has it yet), so it
 	// is usually there before the caller's first long turn; until it lands nothing plays.
 	ms.ensureBackchannelBank()
+	inHolds := ms.orch.config.BackchannelInHolds
 	ms.mu.Lock()
 	playing := ms.playout.end.After(now) // the agent's audio is playing to the caller
 	pending := ms.pendingBargeIn
+	if inHolds && pending {
+		// Pending only matters while the agent still has the floor: a false alarm now would put its reply back in the
+		// caller's ears. A reply already stopped under them, or one being made that they never heard, leaves the floor
+		// theirs: in the owner's call 9 of 28 pauses were refused here with no agent audio anywhere.
+		pending = ms.replyWillResumeLocked(now) && ms.agentHeardInBargeInLocked()
+	}
 	voiced := ms.lastVoicedAt
 	rate := int(ms.inputSampleRate)
 	ms.mu.Unlock()
@@ -434,6 +451,18 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 		ms.bc.mu.Unlock()
 		return
 	}
+	minSpeech, minInterval := backchannelMinSpeech, backchannelMinInterval
+	rule := ""
+	if inHolds {
+		minSpeech, minInterval = backchannelHoldMinSpeech, backchannelHoldMinInterval
+		if ms.bc.ruleAt.After(voiced) {
+			rule = ms.bc.rule
+		} else if pause <= backchannelLatePause {
+			// The gate has not decided this pause yet (its transcript is still coming): ask again on the next frame.
+			ms.bc.mu.Unlock()
+			return
+		}
+	}
 	// This pause is considered once: it either plays or says why not.
 	ms.bc.firedPause = voiced
 	reason := ""
@@ -444,9 +473,13 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 		reason = "caller_over_agent"
 	case pause > backchannelLatePause:
 		reason = "pause_too_long"
-	case ms.bc.speech < backchannelMinSpeech:
+	case inHolds && rule == "answer_now":
+		reason = "agent_answering"
+	case inHolds && rule != "waited" && rule != "open_wait" && rule != "adapt_wait":
+		reason = "not_held"
+	case ms.bc.speech < minSpeech:
 		reason = "too_little_speech"
-	case !ms.bc.lastAt.IsZero() && now.Sub(ms.bc.lastAt) < backchannelMinInterval:
+	case !ms.bc.lastAt.IsZero() && now.Sub(ms.bc.lastAt) < minInterval:
 		reason = "too_soon_after_last"
 	}
 	speechMs, sinceLast := ms.bc.speech.Milliseconds(), int64(-1)
@@ -457,7 +490,7 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 	ms.bc.mu.Unlock()
 	skip := func(why string) {
 		ms.logger.Info("Backchannel not played", "reason", why, "pause_ms", pause.Milliseconds(), "speech_ms", speechMs,
-			"since_last_ms", sinceLast, "pick", pick)
+			"since_last_ms", sinceLast, "pick", pick, "eou_rule", rule)
 	}
 	if reason != "" {
 		skip(reason)
@@ -515,7 +548,24 @@ func (ms *ManagedStream) backchannelAfterVAD(chunk []byte, isSpeaking bool, now 
 	}
 	ms.logger.Info("Backchannel played", "category", cat, "pick", pick, "pick_stale", stale,
 		"pick_age_ms", ageMs(ms.bc.pickAt, now, pick), "pause_ms", pause.Milliseconds(),
-		"audio_ms", ms.pcmDuration(clip).Milliseconds())
+		"audio_ms", ms.pcmDuration(clip).Milliseconds(), "speech_ms", speechMs, "eou_rule", rule)
+}
+
+// noteEOURuleForBackchannel keeps the end-of-turn gate's decision for the pause it was taken in (logEOUDecision).
+func (ms *ManagedStream) noteEOURuleForBackchannel(rule string, at time.Time) {
+	ms.bc.mu.Lock()
+	ms.bc.rule, ms.bc.ruleAt = rule, at
+	ms.bc.mu.Unlock()
+}
+
+// agentHeardInBargeInLocked reports whether the caller had heard any of the reply they are talking over: audio of the
+// current generation on the playout clock, or heard at the onset (ms.mu held).
+func (ms *ManagedStream) agentHeardInBargeInLocked() bool {
+	gen := ms.payloadGen
+	if ms.onset.gen == gen && ms.onset.heardAtStart > 0 {
+		return true
+	}
+	return ms.playout.gen == gen && len(ms.playout.segs) > 0
 }
 
 func ageMs(at, now time.Time, pick string) int64 {

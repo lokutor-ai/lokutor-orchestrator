@@ -52,6 +52,7 @@ func (ms *ManagedStream) logEOUDecision(seq int, result TranscriptionResult, tra
 	prev := ms.eou.pending
 	ms.eou.pending = &eouPending{seq: seq, at: time.Now()}
 	ms.eou.mu.Unlock()
+	ms.noteEOURuleForBackchannel(rule, time.Now())
 	if prev != nil {
 		ms.logger.Info("eou_outcome", "turn_seq", prev.seq, "resumed", false, "resume_ms", nil, "bot_state", "", "reason", "next_decision")
 	}
