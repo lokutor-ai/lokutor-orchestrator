@@ -2743,6 +2743,8 @@ func (ms *ManagedStream) processUtterance(audioData []byte, duration time.Durati
 	ms.ckCacheMs = time.Since(ms.sttEndTime).Milliseconds()
 	ms.mu.Unlock()
 
+	ms.armDeadAirGuard(seq)
+
 	switch ms.directed(ctx, transcript) {
 	case directedChanged:
 		if ms.speculator != nil {

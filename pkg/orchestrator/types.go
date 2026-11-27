@@ -515,6 +515,12 @@ type Config struct {
 	// at least backchannelHoldMinInterval apart. Off: the rule as before (backchannel.go).
 	BackchannelInHolds bool
 
+	// DeadAirGuardMs: when the reply's first audio is not out this long after the end-of-turn gate committed the turn,
+	// the agent makes one short sound from the call's own backchannel bank, in its voice ("ah", "mm"; the sound the
+	// agent's model last picked when it fits a speaker about to answer, else "ah"), as a person does while they find the
+	// words, and the reply follows it (dead_air.go). Never words: nothing is added to the reply or the conversation. 0: off.
+	DeadAirGuardMs int
+
 	// BackchannelPredictorPath: the learned backchannel-opportunity model (ONNX), run in SHADOW on calls with
 	// Backchannels on: it logs where it would fire beside the current rule and plays nothing (backchannel_shadow.go).
 	// Empty: not run. BackchannelPredictorThreshold: its lexical-head probability that counts as a fire (0.5 if unset).
